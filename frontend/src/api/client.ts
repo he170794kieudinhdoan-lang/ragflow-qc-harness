@@ -1,0 +1,98 @@
+const BASE = '';
+
+async function req<T>(path: string, options?: RequestInit): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    headers: {
+      ...(options?.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
+      ...(options?.headers || {}),
+    },
+    ...options,
+  });
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try {
+      const err = await res.json();
+      msg = err.detail || err.message || msg;
+    } catch {
+      msg = await res.text();
+    }
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+export const api = {
+  // Settings
+  getSettings: () => req<any>('/api/settings'),
+  saveSettings: (settings: Record<string, string>) =>
+    req('/api/settings', { method: 'PUT', body: JSON.stringify({ settings }) }),
+  testRagflow: () => req<any>('/api/settings/test-ragflow', { method: 'POST' }),
+
+  // Workspace
+  listDocuments: () => req<any[]>('/api/workspace/documents'),
+  uploadDocument: (formData: FormData) =>
+    req<any>('/api/workspace/documents/upload', { method: 'POST', body: formData }),
+  deleteDocument: (id: number) =>
+    req<any>(`/api/workspace/documents/${id}`, { method: 'DELETE' }),
+
+  listRuns: () => req<any[]>('/api/workspace/runs'),
+  createRun: (payload: any) =>
+    req<any>('/api/workspace/runs', { method: 'POST', body: JSON.stringify(payload) }),
+  deleteRun: (id: number) => req<any>(`/api/workspace/runs/${id}`, { method: 'DELETE' }),
+  getRunDocuments: (runId: number) => req<any[]>(`/api/workspace/runs/${runId}/documents`),
+  syncRunFromRagflow: (runId: number) =>
+    req<any>(`/api/workspace/runs/${runId}/sync-from-ragflow?pull_chunks=true`, { method: 'POST' }),
+  uploadAndParseRun: (runId: number) =>
+    req<any>(`/api/workspace/runs/${runId}/upload-and-parse`, { method: 'POST' }),
+
+  // Parsing
+  listParsingUnits: (runId: number, docId?: number) =>
+    req<any[]>(`/api/parsing/runs/${runId}/units${docId ? `?document_id=${docId}` : ''}`),
+  createParsingUnit: (runId: number, payload: any) =>
+    req<any>(`/api/parsing/runs/${runId}/units`, { method: 'POST', body: JSON.stringify(payload) }),
+  autoExtractUnits: (runId: number, docId: number) =>
+    req<any>(`/api/parsing/runs/${runId}/documents/${docId}/auto-extract`, { method: 'POST' }),
+  scoreParsingUnit: (unitId: number, payload: any) =>
+    req<any>(`/api/parsing/units/${unitId}/score`, { method: 'PUT', body: JSON.stringify(payload) }),
+  getParsingMetrics: (runId: number) => req<any>(`/api/parsing/runs/${runId}/metrics`),
+
+  // Chunking
+  sampleChunks: (runId: number, perDoc = 5) =>
+    req<any>(`/api/chunking/runs/${runId}/sample?per_doc=${perDoc}`, { method: 'POST' }),
+  listChunkEvals: (runId: number, sampledOnly = true) =>
+    req<any[]>(`/api/chunking/runs/${runId}/evaluations?sampled_only=${sampledOnly}`),
+  scoreChunk: (runId: number, chunkPk: number, payload: any) =>
+    req<any>(`/api/chunking/runs/${runId}/chunks/${chunkPk}/score`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+  getChunkingMetrics: (runId: number) => req<any>(`/api/chunking/runs/${runId}/metrics`),
+
+  // Retrieval
+  listTestcases: () => req<any[]>('/api/retrieval/testcases'),
+  createTestcase: (payload: any) =>
+    req<any>('/api/retrieval/testcases', { method: 'POST', body: JSON.stringify(payload) }),
+  deleteTestcase: (id: number) => req<any>(`/api/retrieval/testcases/${id}`, { method: 'DELETE' }),
+  listRetrievalRuns: (runId?: number) =>
+    req<any[]>(`/api/retrieval/runs${runId ? `?run_id=${runId}` : ''}`),
+  executeRetrieval: (payload: any) =>
+    req<any>('/api/retrieval/runs/execute', { method: 'POST', body: JSON.stringify(payload) }),
+  getRetrievalResults: (rrId: number) => req<any[]>(`/api/retrieval/runs/${rrId}/results`),
+  scoreRetrievalResult: (resultId: number, relevant: number, reason: string) =>
+    req<any>(`/api/retrieval/results/${resultId}/score`, {
+      method: 'PUT',
+      body: JSON.stringify({ relevant, reason }),
+    }),
+  updateTestcaseMeta: (rrId: number, tcId: number, payload: any) =>
+    req<any>(`/api/retrieval/runs/${rrId}/testcases/${tcId}/meta`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+
+  // Analytics & Demo
+  getOverview: (runId: number) => req<any>(`/api/analytics/runs/${runId}/overview`),
+  compareRuns: (baselineRrId: number, candidateRrId: number) =>
+    req<any>(`/api/analytics/compare?baseline_rr_id=${baselineRrId}&candidate_rr_id=${candidateRrId}`),
+  seedDemo: () => req<any>('/api/analytics/seed-demo', { method: 'POST' }),
+  exportXlsxUrl: (runId: number) => `/api/analytics/runs/${runId}/export-xlsx`,
+};

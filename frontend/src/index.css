@@ -1,0 +1,71 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    background-color: #ffffff;
+    color: #18181b;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+  }
+
+  ::-webkit-scrollbar {
+    width: 7px;
+    height: 7px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #fafafa;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #d4d4d8;
+    border-radius: 2px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #a1a1aa;
+  }
+}
+
+/* TypeSafe-inspired Light Architectural System */
+.ts-eyebrow {
+  @apply font-mono text-[11px] font-medium uppercase text-[#78716c];
+}
+
+.ts-tag-mauve {
+  @apply inline-flex items-center px-2 py-0.5 text-[11px] font-medium bg-[#f3e5ef] text-[#6d2e58] rounded-[3px];
+}
+
+.ts-tag-neutral {
+  @apply inline-flex items-center px-1.5 py-0.5 font-mono text-[11px] bg-[#f3f3f1] text-[#3f3f46] border border-[#e6e6e3] rounded-[3px];
+}
+
+.ts-input {
+  @apply bg-white border border-[#e4e4e2] rounded-[4px] px-2.5 py-1.5 text-[13px] text-[#18181b] placeholder:text-[#a1a1aa] focus:outline-none focus:border-[#71717a] transition-colors;
+}
+
+.ts-btn-primary {
+  @apply inline-flex items-center justify-center gap-1.5 bg-[#18181b] hover:bg-[#27272a] text-white font-medium text-[13px] px-3.5 py-1.5 rounded-[4px] transition-colors disabled:opacity-40 disabled:cursor-not-allowed;
+}
+
+.ts-btn-secondary {
+  @apply inline-flex items-center justify-center gap-1.5 bg-[#f7f7f5] hover:bg-[#eeeeec] text-[#18181b] border border-[#e4e4e2] font-medium text-[13px] px-3 py-1.5 rounded-[4px] transition-colors disabled:opacity-40 disabled:cursor-not-allowed;
+}
+
+.ts-btn-ghost {
+  @apply inline-flex items-center justify-center gap-1.5 text-[#52525b] hover:text-[#18181b] hover:bg-[#f4f4f2] text-[13px] px-2.5 py-1.5 rounded-[4px] transition-colors;
+}
+
+/* Subtle dotted editorial banner pattern like TypeSafe's release banner */
+.ts-editorial-banner {
+  background-color: #f4e8f0;
+  background-image: radial-gradient(rgba(124, 58, 102, 0.14) 1px, transparent 1px);
+  background-size: 10px 10px;
+}
