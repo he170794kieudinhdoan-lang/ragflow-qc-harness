@@ -1,10 +1,13 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
+  AlertCircle,
   ArrowRight,
   CheckCircle2,
   CloudDownload,
+  Loader2,
   Play,
   Plus,
+  RefreshCw,
   Settings,
   Trash2,
   Upload,
@@ -16,6 +19,7 @@ import { DocumentItem, RunDocumentItem, RunItem } from '../types';
 interface Props {
   activeRun: RunItem | null;
   runs: RunItem[];
+  refreshKey?: number;
   onReloadRuns: () => void;
   onSelectRun: (run: RunItem) => void;
   onOpenSettings: () => void;
@@ -32,6 +36,7 @@ const FORMAT_GROUPS = [
 
 export const WorkspacePage: React.FC<Props> = ({
   activeRun,
+  refreshKey = 0,
   onReloadRuns,
   onSelectRun,
   onOpenSettings,
@@ -42,6 +47,9 @@ export const WorkspacePage: React.FC<Props> = ({
   const [remoteDatasets, setRemoteDatasets] = useState<any[]>([]);
   const [busy, setBusy] = useState('');
   const [notice, setNotice] = useState<{ ok?: boolean; text: string } | null>(null);
+  const [polling, setPolling] = useState(false);
+  const [parseErrors, setParseErrors] = useState<Record<number, string>>({});
+  const pollBusyRef = useRef(false);
 
   const [showNewRun, setShowNewRun] = useState(false);
   const [showUpload, setShowUpload] = useState(false);
@@ -57,20 +65,81 @@ export const WorkspacePage: React.FC<Props> = ({
   const [upFile, setUpFile] = useState<File | null>(null);
 
   const loadAll = async () => {
-    const dRes = await api.listDocuments();
+    const dRes = await api.listDocuments(activeRun?.id);
     setDocs(dRes);
     setUpCode(`DOC${String(dRes.length + 1).padStart(2, '0')}`);
     if (activeRun) {
       const rd = await api.getRunDocuments(activeRun.id);
       setRunDocs(rd);
+      if (rd.some((item: RunDocumentItem) => item.parse_status === 'RUNNING')) {
+        setPolling(true);
+      }
     } else {
       setRunDocs([]);
+      setPolling(false);
     }
   };
 
   useEffect(() => {
+    setPolling(false);
+    setParseErrors({});
     loadAll();
-  }, [activeRun?.id]);
+  }, [activeRun?.id, refreshKey]);
+
+  const checkParseStatus = async (autoSyncWhenDone: boolean) => {
+    if (!activeRun || pollBusyRef.current) return;
+    pollBusyRef.current = true;
+    try {
+      const res = await api.getRunParseStatus(activeRun.id);
+      setRunDocs(res.documents || []);
+      setParseErrors(res.errors || {});
+      const dRes = await api.listDocuments(activeRun.id);
+      setDocs(dRes);
+
+      if (res.is_parsing) {
+        setPolling(true);
+      } else {
+        setPolling(false);
+        if (autoSyncWhenDone) {
+          const doneCount = res.counts?.done ?? 0;
+          const failCount = res.counts?.failed ?? 0;
+          if (doneCount > 0) {
+            setBusy('sync');
+            try {
+              const syncRes = await api.syncRunFromRagflow(activeRun.id);
+              await loadAll();
+              onReloadRuns();
+              const failSuffix = failCount > 0 ? ` (${failCount} file lỗi)` : '';
+              setNotice({
+                ok: failCount === 0,
+                text: `Parse hoàn tất! Đã tự động đồng bộ ${syncRes.synced_documents} tài liệu và ${syncRes.synced_chunks} đoạn cắt${failSuffix}.`,
+              });
+            } finally {
+              setBusy('');
+            }
+          } else if (failCount > 0) {
+            setNotice({
+              ok: false,
+              text: `Parse thất bại (${failCount} file lỗi). Xem chi tiết lỗi ở cột Trạng thái.`,
+            });
+          }
+        }
+      }
+    } catch (err: any) {
+      setPolling(false);
+      setNotice({ ok: false, text: err.message });
+    } finally {
+      pollBusyRef.current = false;
+    }
+  };
+
+  useEffect(() => {
+    if (!polling || !activeRun) return;
+    const timer = window.setInterval(() => {
+      checkParseStatus(true);
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [polling, activeRun?.id]);
 
   const openNewRunModal = async () => {
     setShowNewRun(true);
@@ -149,14 +218,34 @@ export const WorkspacePage: React.FC<Props> = ({
   const handleUploadAndParse = async () => {
     if (!activeRun) return;
     setBusy('push');
+    setParseErrors({});
     try {
       const res = await api.uploadAndParseRun(activeRun.id);
-      setNotice({
-        ok: true,
-        text: `Đã đẩy ${res.uploaded_and_triggered} tài liệu lên RAGFlow và kích hoạt đọc file.`,
-      });
+      await loadAll();
+      if (res.uploaded_and_triggered > 0) {
+        setPolling(true);
+        setNotice({
+          ok: true,
+          text: `Đã đẩy ${res.uploaded_and_triggered} tài liệu lên RAGFlow. Đang tự động theo dõi tiến độ parse (mỗi 3 giây)...`,
+        });
+      } else {
+        setNotice({
+          ok: false,
+          text: 'Chưa có file gốc nào trong kho để đẩy lên RAGFlow. Hãy bấm "Thêm file gốc" trước.',
+        });
+      }
     } catch (err: any) {
       setNotice({ ok: false, text: err.message });
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const handleCheckStatusManual = async () => {
+    if (!activeRun) return;
+    setBusy('status');
+    try {
+      await checkParseStatus(true);
     } finally {
       setBusy('');
     }
@@ -217,7 +306,8 @@ export const WorkspacePage: React.FC<Props> = ({
               onClick={async () => {
                 if (!confirm(`Xóa phiên "${activeRun.name}"?`)) return;
                 await api.deleteRun(activeRun.id);
-                onReloadRuns();
+                await onReloadRuns();
+                await loadAll();
               }}
               className="ts-btn-ghost text-xs text-rose-600 hover:text-rose-700 hover:bg-rose-50"
             >
@@ -227,6 +317,15 @@ export const WorkspacePage: React.FC<Props> = ({
             <button onClick={handleUploadAndParse} disabled={!!busy} className="ts-btn-secondary">
               <Play className="size-3.5 text-emerald-600" />
               {busy === 'push' ? 'Đang gửi...' : 'Đẩy file lên & Parse'}
+            </button>
+            <button
+              onClick={handleCheckStatusManual}
+              disabled={!!busy}
+              className="ts-btn-secondary"
+              title="Kiểm tra tiến độ parse hiện tại trên RAGFlow"
+            >
+              <RefreshCw className={`size-3.5 ${polling || busy === 'status' ? 'animate-spin text-amber-600' : ''}`} />
+              {polling ? 'Đang theo dõi...' : 'Kiểm tra tiến độ'}
             </button>
             <button onClick={handleSync} disabled={!!busy} className="ts-btn-primary">
               <CloudDownload className="size-3.5" />
@@ -240,10 +339,26 @@ export const WorkspacePage: React.FC<Props> = ({
       <div className="border border-[#e6e6e3] rounded-[4px] overflow-hidden bg-white">
         <div className="px-4 py-3 border-b border-[#e6e6e3] bg-[#fafaf9] flex items-center justify-between">
           <div className="ts-eyebrow">DANH SÁCH TÀI LIỆU ({docs.length})</div>
-          <button onClick={() => setShowUpload(true)} className="ts-btn-secondary py-1 text-xs">
-            <Upload className="size-3.5" />
-            Thêm file gốc
-          </button>
+          <div className="flex items-center gap-2">
+            {docs.length > 0 && (
+              <button
+                onClick={async () => {
+                  if (!confirm('Xóa toàn bộ tài liệu trong danh sách?')) return;
+                  await api.clearDocuments(false);
+                  await loadAll();
+                  setNotice({ ok: true, text: 'Đã xóa toàn bộ tài liệu cũ.' });
+                }}
+                className="ts-btn-ghost py-1 text-xs text-rose-600 hover:text-rose-700 hover:bg-rose-50"
+              >
+                <Trash2 className="size-3.5" />
+                Xóa tất cả
+              </button>
+            )}
+            <button onClick={() => setShowUpload(true)} className="ts-btn-secondary py-1 text-xs">
+              <Upload className="size-3.5" />
+              Thêm file gốc
+            </button>
+          </div>
         </div>
 
         <table className="w-full text-left text-[13px]">
@@ -275,8 +390,33 @@ export const WorkspacePage: React.FC<Props> = ({
                       <span className="inline-flex items-center gap-1 text-emerald-700 font-medium">
                         <CheckCircle2 className="size-3.5" /> Đã đọc xong
                       </span>
+                    ) : status === 'RUNNING' ? (
+                      <div className="space-y-1">
+                        <span className="inline-flex items-center gap-1.5 text-amber-700 font-medium">
+                          <Loader2 className="size-3.5 animate-spin" />
+                          Đang parse {Math.round((rd?.progress || 0) * 100)}%
+                        </span>
+                        <div className="w-28 h-1.5 bg-[#ededeb] rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-amber-500 transition-all duration-300"
+                            style={{ width: `${Math.max(8, Math.round((rd?.progress || 0) * 100))}%` }}
+                          />
+                        </div>
+                      </div>
                     ) : status === 'FAIL' ? (
-                      <span className="text-rose-600 font-medium">Lỗi đọc file</span>
+                      <div className="space-y-0.5 max-w-[240px]">
+                        <span className="inline-flex items-center gap-1 text-rose-600 font-medium">
+                          <AlertCircle className="size-3.5 shrink-0" /> Lỗi đọc file
+                        </span>
+                        {parseErrors[d.id] && (
+                          <div
+                            className="text-[11px] text-rose-500 truncate"
+                            title={parseErrors[d.id]}
+                          >
+                            {parseErrors[d.id]}
+                          </div>
+                        )}
+                      </div>
                     ) : (
                       <span className="text-[#a1a1aa]">Chưa đồng bộ</span>
                     )}

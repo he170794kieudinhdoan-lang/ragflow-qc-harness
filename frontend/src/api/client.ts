@@ -25,21 +25,28 @@ export const api = {
   // Settings
   getSettings: () => req<any>('/api/settings'),
   saveSettings: (settings: Record<string, string>) =>
-    req('/api/settings', { method: 'PUT', body: JSON.stringify({ settings }) }),
+    req<{ ok: boolean; workspace_cleared?: boolean }>('/api/settings', {
+      method: 'PUT',
+      body: JSON.stringify({ settings }),
+    }),
   testRagflow: () => req<any>('/api/settings/test-ragflow', { method: 'POST' }),
 
   // Workspace
-  listDocuments: () => req<any[]>('/api/workspace/documents'),
+  listDocuments: (runId?: number) =>
+    req<any[]>(`/api/workspace/documents${runId ? `?run_id=${runId}` : ''}`),
   uploadDocument: (formData: FormData) =>
     req<any>('/api/workspace/documents/upload', { method: 'POST', body: formData }),
   deleteDocument: (id: number) =>
     req<any>(`/api/workspace/documents/${id}`, { method: 'DELETE' }),
+  clearDocuments: (syncedOnly = false) =>
+    req<any>(`/api/workspace/documents?synced_only=${syncedOnly}`, { method: 'DELETE' }),
 
   listRuns: () => req<any[]>('/api/workspace/runs'),
   createRun: (payload: any) =>
     req<any>('/api/workspace/runs', { method: 'POST', body: JSON.stringify(payload) }),
   deleteRun: (id: number) => req<any>(`/api/workspace/runs/${id}`, { method: 'DELETE' }),
   getRunDocuments: (runId: number) => req<any[]>(`/api/workspace/runs/${runId}/documents`),
+  getRunParseStatus: (runId: number) => req<any>(`/api/workspace/runs/${runId}/parse-status`),
   syncRunFromRagflow: (runId: number) =>
     req<any>(`/api/workspace/runs/${runId}/sync-from-ragflow?pull_chunks=true`, { method: 'POST' }),
   uploadAndParseRun: (runId: number) =>

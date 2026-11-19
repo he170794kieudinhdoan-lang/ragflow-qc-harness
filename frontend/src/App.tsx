@@ -53,6 +53,7 @@ export default function App() {
   const [hasKey, setHasKey] = useState(false);
   const [connMsg, setConnMsg] = useState<{ ok?: boolean; text?: string }>({});
   const [testing, setTesting] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
 
   const loadRuns = async () => {
     const [rList, sRes] = await Promise.all([api.listRuns(), api.getSettings()]);
@@ -80,13 +81,28 @@ export default function App() {
     setTesting(true);
     setConnMsg({});
     try {
-      await api.saveSettings(settings);
+      const saveRes = await api.saveSettings(settings);
       setHasKey(Boolean(settings.ragflow_api_key?.trim()));
+      if (saveRes?.workspace_cleared) {
+        await loadRuns();
+        setRefreshKey((k) => k + 1);
+      }
       if (doTest) {
         const res = await api.testRagflow();
-        setConnMsg({ ok: true, text: `Kết nối thành công · Tìm thấy ${res.dataset_count} dataset` });
+        const extra = saveRes?.workspace_cleared
+          ? ' · Đã xóa dữ liệu đồng bộ từ tài khoản cũ'
+          : '';
+        setConnMsg({
+          ok: true,
+          text: `Kết nối thành công · Tìm thấy ${res.dataset_count} dataset${extra}`,
+        });
       } else {
-        setConnMsg({ ok: true, text: 'Đã lưu cấu hình kết nối.' });
+        setConnMsg({
+          ok: true,
+          text: saveRes?.workspace_cleared
+            ? 'Đã lưu cấu hình mới và xóa dữ liệu đồng bộ từ tài khoản cũ.'
+            : 'Đã lưu cấu hình kết nối.',
+        });
       }
     } catch (e: any) {
       setConnMsg({ ok: false, text: e.message });
@@ -250,6 +266,7 @@ export default function App() {
             <WorkspacePage
               activeRun={activeRun}
               runs={runs}
+              refreshKey={refreshKey}
               onReloadRuns={loadRuns}
               onSelectRun={setActiveRun}
               onOpenSettings={() => setShowSettings(true)}

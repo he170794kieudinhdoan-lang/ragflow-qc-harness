@@ -181,7 +181,7 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
                 (rr_id, tc["id"], ac),
             )
             for rank, ch in enumerate(chunks, start=1):
-                cid = ch.get("id", f"unk_{rank}")
+                cid = ch.get("id") or ch.get("chunk_id") or f"unk_{rank}"
                 cached = cache_map.get((tc["id"], cid))
                 if cached is not None:
                     rel_val, reason = cached
@@ -197,9 +197,9 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        rr_id, tc["id"], rank, cid, ch.get("document_id", ""),
-                        ch.get("document_keyword", ch.get("document_name", "")),
-                        ch.get("content", ""),
+                        rr_id, tc["id"], rank, cid, ch.get("document_id", "") or ch.get("doc_id", ""),
+                        ch.get("document_keyword") or ch.get("document_name") or ch.get("docnm_kwd", ""),
+                        ch.get("content") or ch.get("content_with_weight") or "",
                         float(ch.get("similarity", 0) or 0),
                         float(ch.get("vector_similarity", 0) or 0),
                         float(ch.get("term_similarity", 0) or 0),

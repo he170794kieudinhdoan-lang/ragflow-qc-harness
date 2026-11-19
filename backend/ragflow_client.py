@@ -62,10 +62,12 @@ class RAGFlowClient:
         parser_config: Optional[Dict[str, Any]] = None,
         description: str = "",
     ) -> Dict[str, Any]:
+        # RAGFlow Go API (v0.22+) uses parse_type (1 = BuiltIn) + parser_id
+        parser_id = chunk_method or "naive"
         body: Dict[str, Any] = {
             "name": name,
-            "description": description,
-            "chunk_method": chunk_method,
+            "parse_type": 1,
+            "parser_id": parser_id,
         }
         if embedding_model:
             body["embedding_model"] = embedding_model
@@ -77,7 +79,23 @@ class RAGFlowClient:
                 headers=self._headers(),
                 json=body,
             )
-            return self._unwrap(r)
+            try:
+                return self._unwrap(r)
+            except RAGFlowError as e:
+                # Fallback for older Python RAGFlow versions that reject parse_type/parser_id
+                if "parse_type" in str(e) or "parser_id" in str(e):
+                    legacy_body: Dict[str, Any] = {"name": name, "chunk_method": parser_id}
+                    if embedding_model:
+                        legacy_body["embedding_model"] = embedding_model
+                    if parser_config:
+                        legacy_body["parser_config"] = parser_config
+                    r2 = await client.post(
+                        f"{self.base_url}/api/v1/datasets",
+                        headers=self._headers(),
+                        json=legacy_body,
+                    )
+                    return self._unwrap(r2)
+                raise
 
     # --- Documents ---
     async def list_documents(
@@ -103,6 +121,33 @@ class RAGFlowClient:
                 files=files,
             )
             return self._unwrap(r)
+
+    async def download_document(self, dataset_id: str, document_id: str) -> bytes:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.get(
+                f"{self.base_url}/api/v1/datasets/{dataset_id}/documents/{document_id}",
+                headers=self._headers(json_content=False),
+            )
+            if r.status_code >= 400:
+                raise RAGFlowError(
+                    f"HTTP {r.status_code}: {r.text[:300]}",
+                    status_code=r.status_code,
+                )
+            ctype = (r.headers.get("content-type") or "").lower()
+            if "application/json" in ctype:
+                try:
+                    payload = r.json()
+                    if isinstance(payload, dict) and payload.get("code", 0) != 0:
+                        raise RAGFlowError(
+                            payload.get("message", f"RAGFlow API error code {payload.get('code')}"),
+                            code=payload.get("code", -1),
+                            status_code=r.status_code,
+                        )
+                except RAGFlowError:
+                    raise
+                except Exception:
+                    pass
+            return r.content
 
     async def parse_documents(self, dataset_id: str, document_ids: List[str]) -> Any:
         async with httpx.AsyncClient(timeout=self.timeout) as client:

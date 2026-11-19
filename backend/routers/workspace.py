@@ -38,9 +38,21 @@ class RunCreate(BaseModel):
 
 # ---------- Documents ----------
 @router.get("/documents")
-def list_documents():
+def list_documents(run_id: Optional[int] = None):
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM documents ORDER BY doc_code").fetchall()
+        if run_id is not None:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT d.*
+                FROM documents d
+                LEFT JOIN run_documents rd ON rd.document_id = d.id AND rd.run_id = ?
+                WHERE rd.run_id IS NOT NULL OR d.file_path != ''
+                ORDER BY d.doc_code
+                """,
+                (run_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM documents ORDER BY doc_code").fetchall()
         return [dict(r) for r in rows]
 
 
@@ -112,6 +124,16 @@ def delete_document(doc_id: int):
     return {"ok": True}
 
 
+@router.delete("/documents")
+def clear_documents(synced_only: bool = False):
+    with get_db() as conn:
+        if synced_only:
+            conn.execute("DELETE FROM documents WHERE file_path = ''")
+        else:
+            conn.execute("DELETE FROM documents")
+    return {"ok": True}
+
+
 # ---------- Runs / Experiments ----------
 @router.get("/runs")
 def list_runs():
@@ -180,6 +202,13 @@ async def create_run(payload: RunCreate):
 def delete_run(run_id: int):
     with get_db() as conn:
         conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
+        conn.execute(
+            """
+            DELETE FROM documents
+            WHERE file_path = ''
+              AND id NOT IN (SELECT DISTINCT document_id FROM run_documents)
+            """
+        )
     return {"ok": True}
 
 
@@ -202,6 +231,173 @@ def get_run_documents(run_id: int):
             item["anomaly_flags"] = json.loads(item["anomaly_flags"] or "[]")
             res.append(item)
         return res
+
+
+STATUS_MAP = {
+    "0": "UNSTART",
+    "1": "RUNNING",
+    "2": "CANCEL",
+    "3": "DONE",
+    "4": "FAIL",
+    "SUCCESS": "DONE",
+    "COMPLETED": "DONE",
+    "FAILED": "FAIL",
+    "PENDING": "RUNNING",
+    "QUEUED": "RUNNING",
+}
+
+
+def _extract_remote_doc_meta(rdoc: Dict[str, Any]) -> Dict[str, Any]:
+    raw_status = rdoc.get("ingestion_status") or rdoc.get("run") or "UNSTART"
+    r_status = STATUS_MAP.get(str(raw_status).upper(), str(raw_status).upper())
+    r_progress = float(rdoc.get("progress", 0) or 0)
+    r_chunk_cnt = int(rdoc.get("chunk_count", 0) or 0)
+    r_token_cnt = int(rdoc.get("token_count", 0) or 0)
+    r_dur = float(rdoc.get("process_duration", 0) or 0)
+    if r_chunk_cnt > 0 and r_status not in ("RUNNING", "FAIL"):
+        r_status = "DONE"
+
+    err_msg = ""
+    evt = rdoc.get("latest_ingestion_event")
+    if isinstance(evt, dict) and evt.get("message"):
+        err_msg = str(evt.get("message", "")).strip()
+    elif rdoc.get("progress_msg"):
+        err_msg = str(rdoc.get("progress_msg", "")).strip()
+
+    return {
+        "ragflow_doc_id": rdoc.get("id", ""),
+        "name": rdoc.get("name", f"doc_{str(rdoc.get('id', ''))[:6]}"),
+        "status": r_status,
+        "progress": r_progress,
+        "chunk_count": r_chunk_cnt,
+        "token_count": r_token_cnt,
+        "duration": r_dur,
+        "error_msg": err_msg if r_status == "FAIL" else "",
+    }
+
+
+@router.get("/runs/{run_id}/parse-status")
+async def get_run_parse_status(run_id: int):
+    """
+    Lightweight polling endpoint: queries RAGFlow list_documents (no chunks),
+    updates run_documents status/progress/chunk_count, and returns live progress + errors.
+    """
+    client = _get_client()
+    with get_db() as conn:
+        run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if not run:
+            raise HTTPException(status_code=404, detail="Run không tồn tại")
+        dataset_id = run["ragflow_dataset_id"]
+        if not dataset_id:
+            raise HTTPException(status_code=400, detail="Run này chưa gắn RAGFlow Dataset ID")
+
+    try:
+        remote_docs = await client.list_documents(dataset_id, page=1, page_size=200)
+    except RAGFlowError as e:
+        raise HTTPException(status_code=400, detail=f"Lỗi kiểm tra tiến độ từ RAGFlow: {e}")
+
+    errors: Dict[int, str] = {}
+    counts = {"total": 0, "done": 0, "running": 0, "failed": 0, "unstart": 0}
+
+    with get_db() as conn:
+        existing_docs = conn.execute("SELECT * FROM documents").fetchall()
+        by_filename = {d["filename"].lower(): d for d in existing_docs}
+        used_codes = {d["doc_code"] for d in existing_docs}
+        next_idx = 1
+
+        for rdoc in remote_docs:
+            meta = _extract_remote_doc_meta(rdoc)
+            r_name = meta["name"]
+            r_status = meta["status"]
+
+            local_doc = by_filename.get(r_name.lower())
+            if not local_doc:
+                ext = os.path.splitext(r_name)[1].lower()
+                fmt_group = (
+                    "PDF văn bản" if ext == ".pdf"
+                    else "DOCX có bảng" if ext in (".docx", ".doc")
+                    else "Trang web (HTML / MD)" if ext in (".html", ".htm", ".md")
+                    else "Slide / Excel" if ext in (".pptx", ".ppt", ".xlsx", ".xls", ".csv")
+                    else "PDF scan / ảnh"
+                )
+                while f"DOC{next_idx:02d}" in used_codes:
+                    next_idx += 1
+                doc_code = f"DOC{next_idx:02d}"
+                used_codes.add(doc_code)
+                next_idx += 1
+                cur = conn.execute(
+                    "INSERT INTO documents (doc_code, filename, format_group, created_at) VALUES (?, ?, ?, ?)",
+                    (doc_code, r_name, fmt_group, utc_now()),
+                )
+                local_doc_id = cur.lastrowid
+                local_doc = conn.execute("SELECT * FROM documents WHERE id = ?", (local_doc_id,)).fetchone()
+                by_filename[r_name.lower()] = local_doc
+            else:
+                local_doc_id = local_doc["id"]
+
+            anomalies = []
+            if r_status == "FAIL":
+                anomalies.append("PARSE_FAILED")
+            if r_status == "DONE" and meta["chunk_count"] == 0:
+                anomalies.append("ZERO_CHUNKS")
+            if meta["duration"] > 180:
+                anomalies.append("SLOW_PARSE")
+
+            conn.execute(
+                """
+                INSERT INTO run_documents (run_id, document_id, ragflow_doc_id, parse_status, progress, chunk_count, token_count, parse_duration_sec, anomaly_flags, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, document_id) DO UPDATE SET
+                    ragflow_doc_id=excluded.ragflow_doc_id,
+                    parse_status=excluded.parse_status,
+                    progress=excluded.progress,
+                    chunk_count=excluded.chunk_count,
+                    token_count=excluded.token_count,
+                    parse_duration_sec=excluded.parse_duration_sec,
+                    anomaly_flags=excluded.anomaly_flags,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    run_id, local_doc_id, meta["ragflow_doc_id"], r_status, meta["progress"],
+                    meta["chunk_count"], meta["token_count"], meta["duration"], json.dumps(anomalies), utc_now(),
+                ),
+            )
+
+            counts["total"] += 1
+            if r_status == "DONE":
+                counts["done"] += 1
+            elif r_status == "RUNNING":
+                counts["running"] += 1
+            elif r_status == "FAIL":
+                counts["failed"] += 1
+                if meta["error_msg"]:
+                    errors[local_doc_id] = meta["error_msg"]
+            else:
+                counts["unstart"] += 1
+
+        rows = conn.execute(
+            """
+            SELECT rd.*, d.doc_code, d.filename, d.format_group, d.page_count
+            FROM run_documents rd
+            JOIN documents d ON d.id = rd.document_id
+            WHERE rd.run_id = ?
+            ORDER BY d.doc_code
+            """,
+            (run_id,),
+        ).fetchall()
+        docs_out = []
+        for r in rows:
+            item = dict(r)
+            item["anomaly_flags"] = json.loads(item["anomaly_flags"] or "[]")
+            docs_out.append(item)
+
+    return {
+        "ok": True,
+        "is_parsing": counts["running"] > 0,
+        "counts": counts,
+        "documents": docs_out,
+        "errors": errors,
+    }
 
 
 @router.post("/runs/{run_id}/sync-from-ragflow")
@@ -233,16 +429,31 @@ async def sync_run_from_ragflow(run_id: int, pull_chunks: bool = True):
     with get_db() as conn:
         existing_docs = conn.execute("SELECT * FROM documents").fetchall()
         by_filename = {d["filename"].lower(): d for d in existing_docs}
-        next_idx = len(existing_docs) + 1
+        used_codes = {d["doc_code"] for d in existing_docs}
+        next_idx = 1
+
+        status_map = {
+            "0": "UNSTART",
+            "1": "RUNNING",
+            "2": "CANCEL",
+            "3": "DONE",
+            "4": "FAIL",
+            "SUCCESS": "DONE",
+            "COMPLETED": "DONE",
+            "FAILED": "FAIL",
+        }
 
         for rdoc in remote_docs:
             r_doc_id = rdoc.get("id", "")
             r_name = rdoc.get("name", f"doc_{r_doc_id[:6]}")
-            r_status = str(rdoc.get("run", "UNSTART")).upper()
+            raw_status = rdoc.get("ingestion_status") or rdoc.get("run") or "UNSTART"
+            r_status = status_map.get(str(raw_status).upper(), str(raw_status).upper())
             r_progress = float(rdoc.get("progress", 0) or 0)
             r_chunk_cnt = int(rdoc.get("chunk_count", 0) or 0)
             r_token_cnt = int(rdoc.get("token_count", 0) or 0)
             r_dur = float(rdoc.get("process_duration", 0) or 0)
+            if r_chunk_cnt > 0 and r_status not in ("RUNNING", "FAIL"):
+                r_status = "DONE"
 
             local_doc = by_filename.get(r_name.lower())
             if not local_doc:
@@ -255,7 +466,10 @@ async def sync_run_from_ragflow(run_id: int, pull_chunks: bool = True):
                     else "Slide / Excel" if ext in (".pptx", ".ppt", ".xlsx", ".xls", ".csv")
                     else "PDF scan / ảnh"
                 )
+                while f"DOC{next_idx:02d}" in used_codes:
+                    next_idx += 1
                 doc_code = f"DOC{next_idx:02d}"
+                used_codes.add(doc_code)
                 next_idx += 1
                 cur = conn.execute(
                     """
@@ -306,8 +520,8 @@ async def sync_run_from_ragflow(run_id: int, pull_chunks: bool = True):
                     remote_chunks = []
 
                 for idx_c, ch in enumerate(remote_chunks, start=1):
-                    cid = ch.get("id", f"{r_doc_id}_{idx_c}")
-                    content = ch.get("content", "") or ""
+                    cid = ch.get("id") or ch.get("chunk_id") or f"{r_doc_id}_{idx_c}"
+                    content = ch.get("content") or ch.get("content_with_weight") or ""
                     flags = detect_chunk_rule_flags(content, min_chars=min_chars, max_chars=max_chars)
                     positions = ch.get("positions", []) or []
                     page_num = 0
@@ -363,6 +577,7 @@ async def upload_local_docs_and_parse(run_id: int):
         docs = conn.execute("SELECT * FROM documents WHERE file_path != '' ORDER BY doc_code").fetchall()
 
     uploaded_ids: List[str] = []
+    uploaded_pairs: List[tuple] = []
     for d in docs:
         if not os.path.exists(d["file_path"]):
             continue
@@ -373,10 +588,27 @@ async def upload_local_docs_and_parse(run_id: int):
             for item in res:
                 if item.get("id"):
                     uploaded_ids.append(item["id"])
+                    uploaded_pairs.append((d["id"], item["id"]))
         elif isinstance(res, dict) and res.get("id"):
             uploaded_ids.append(res["id"])
+            uploaded_pairs.append((d["id"], res["id"]))
 
     if uploaded_ids:
         await client.parse_documents(dataset_id, uploaded_ids)
+        now = utc_now()
+        with get_db() as conn:
+            for local_doc_id, r_doc_id in uploaded_pairs:
+                conn.execute(
+                    """
+                    INSERT INTO run_documents (run_id, document_id, ragflow_doc_id, parse_status, progress, chunk_count, token_count, parse_duration_sec, anomaly_flags, updated_at)
+                    VALUES (?, ?, ?, 'RUNNING', 0, 0, 0, 0, '[]', ?)
+                    ON CONFLICT(run_id, document_id) DO UPDATE SET
+                        ragflow_doc_id=excluded.ragflow_doc_id,
+                        parse_status='RUNNING',
+                        progress=0,
+                        updated_at=excluded.updated_at
+                    """,
+                    (run_id, local_doc_id, r_doc_id, now),
+                )
 
     return {"ok": True, "uploaded_and_triggered": len(uploaded_ids), "ragflow_doc_ids": uploaded_ids}

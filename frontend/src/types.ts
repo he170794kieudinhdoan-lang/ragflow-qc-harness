@@ -72,6 +72,19 @@ export interface ParsingUnit {
     content: string;
     page_num: number;
     char_count: number;
+    alignment?: {
+      matched_excerpt: string;
+      start: number;
+      end: number;
+      raw_similarity: number;
+      text_similarity: number;
+      has_format_diff: boolean;
+      has_text_diff: boolean;
+      suggested_verdict: 'PASS' | 'PARTIAL' | 'FAIL';
+      stitched_with_chunk_index?: number | null;
+      risk_flags?: { code: string; label: string; severity: string }[];
+      suggested_error_codes?: string[];
+    };
   }[];
   match_score: number;
   verdict: 'PASS' | 'FAIL' | 'PARTIAL' | 'UNRATED';
