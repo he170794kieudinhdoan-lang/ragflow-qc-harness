@@ -1,268 +1,353 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowRight, Sparkles } from 'lucide-react';
+import {
+  ArrowRight,
+  FileSearch,
+  GitCompare,
+  Layers,
+  Search,
+} from 'lucide-react';
 import { api } from '../api/client';
 import { RunItem } from '../types';
 
+export type WorkflowModeId = 'full_pipeline' | 'retrieval_only' | 'parsing_only' | 'compare_only';
+
+export interface WorkflowModeDef {
+  id: WorkflowModeId;
+  tag: string;
+  title: string;
+  desc: string;
+  stepsLabel: string;
+  primary?: boolean;
+}
+
+export const WORKFLOW_MODES: WorkflowModeDef[] = [
+  {
+    id: 'full_pipeline',
+    tag: 'Khuyên dùng · Gated A→Z',
+    title: 'Kiểm thử toàn luồng 3 tầng (A → Z)',
+    desc: 'Quy trình chuẩn khép kín: tạo/chọn Dataset, đồng bộ chunks, chấm Parsing (bắt buộc hoàn tất trước khi mở Chunking), chấm Chunking, rồi tạo Golden Dataset & tinh chỉnh Retrieval.',
+    stepsLabel: 'Dataset → Đồng bộ → Parsing → Chunking → Retrieval → A/B',
+    primary: true,
+  },
+  {
+    id: 'retrieval_only',
+    tag: 'Chế độ nhanh',
+    title: 'Chỉ chấm Retrieval & Tinh chỉnh',
+    desc: 'Đi thẳng vào bước quản lý Golden Dataset, chạy batch /api/v1/retrieval với Smart Relevancy Cache / LLM và tinh chỉnh top-k, threshold, rerank.',
+    stepsLabel: 'Golden & Retrieval → Tinh chỉnh A/B',
+  },
+  {
+    id: 'parsing_only',
+    tag: 'Chế độ nhanh',
+    title: 'Chỉ chấm Parsing & OCR',
+    desc: 'Tập trung kiểm tra chất lượng đọc file gốc (PDF văn bản, scan, bảng biểu, DOCX) đối chiếu song song với chunks RAGFlow trích xuất.',
+    stepsLabel: 'Dataset & Đồng bộ → Chấm Parsing',
+  },
+  {
+    id: 'compare_only',
+    tag: 'A/B Lab',
+    title: 'So sánh 2 cấu hình (A/B Lab)',
+    desc: 'Đối chiếu trực tiếp Baseline với cấu hình thử nghiệm, lọc câu Pass → Fail / Fail → Pass và xác định tầng gây lỗi gốc.',
+    stepsLabel: 'Phòng so sánh A/B',
+  },
+];
+
 interface Props {
   activeRun: RunItem | null;
-  onNavigate: (tab: string) => void;
-  onReloadRuns: () => void;
+  onStartWorkflow: (mode: WorkflowModeId) => void;
 }
 
 const pct = (v?: number) => `${((v || 0) * 100).toFixed(0)}%`;
 
-export const OverviewPage: React.FC<Props> = ({ activeRun, onNavigate, onReloadRuns }) => {
+export const OverviewPage: React.FC<Props> = ({ activeRun, onStartWorkflow }) => {
   const [overview, setOverview] = useState<any>(null);
-  const [seeding, setSeeding] = useState(false);
 
   useEffect(() => {
-    if (!activeRun) return;
-    api.getOverview(activeRun.id).then(setOverview);
-  }, [activeRun?.id]);
-
-  const handleSeedDemo = async () => {
-    setSeeding(true);
-    try {
-      await api.seedDemo();
-      onReloadRuns();
-    } finally {
-      setSeeding(false);
+    if (!activeRun) {
+      setOverview(null);
+      return;
     }
-  };
+    api.getOverview(activeRun.id).then(setOverview).catch(() => {});
+  }, [activeRun?.id]);
 
   const p = overview?.parsing || {};
   const c = overview?.chunking || {};
   const r = overview?.retrieval || null;
 
+  const modeArt = (id: WorkflowModeId) => {
+    if (id === 'full_pipeline') {
+      return (
+        <svg viewBox="0 0 112 64" className="w-[104px] h-[60px] shrink-0" fill="none" strokeWidth="1.35">
+          {/* Node 1: Doc */}
+          <rect x="4" y="14" width="24" height="32" rx="2" stroke="#161616" fill="#fefefe" />
+          <line x1="9" y1="23" x2="23" y2="23" stroke="#abbab9" />
+          <line x1="9" y1="29" x2="20" y2="29" stroke="#abbab9" />
+          <rect x="9" y="34" width="14" height="7" rx="1" stroke="#03aa5c" fill="#03aa5c" fillOpacity="0.14" />
+          {/* Arrow 1 -> 2 */}
+          <path d="M31 30 L41 30" stroke="#03aa5c" strokeDasharray="2.5 2" />
+          <path d="M38 27 L41 30 L38 33" stroke="#03aa5c" />
+          {/* Node 2: Cube */}
+          <polygon points="56 15 69 22.5 69 37.5 56 45 43 37.5 43 22.5 56 15" stroke="#161616" fill="#03aa5c" fillOpacity="0.1" />
+          <line x1="56" y1="45" x2="56" y2="30" stroke="#161616" />
+          <line x1="69" y1="22.5" x2="56" y2="30" stroke="#161616" />
+          <line x1="43" y1="22.5" x2="56" y2="30" stroke="#161616" />
+          {/* Arrow 2 -> 3 */}
+          <path d="M72 30 L82 30" stroke="#03aa5c" strokeDasharray="2.5 2" />
+          <path d="M79 27 L82 30 L79 33" stroke="#03aa5c" />
+          {/* Node 3: Ranked results */}
+          <rect x="85" y="16" width="23" height="7" rx="1.5" stroke="#03aa5c" fill="#03aa5c" fillOpacity="0.15" />
+          <rect x="85" y="27" width="18" height="7" rx="1.5" stroke="#161616" />
+          <rect x="85" y="38" width="13" height="7" rx="1.5" stroke="#abbab9" />
+        </svg>
+      );
+    }
+    if (id === 'retrieval_only') {
+      return (
+        <svg viewBox="0 0 96 64" className="w-[88px] h-[60px] shrink-0" fill="none" strokeWidth="1.35">
+          <rect x="6" y="10" width="52" height="11" rx="2" stroke="#03aa5c" fill="#03aa5c" fillOpacity="0.1" />
+          <rect x="6" y="26" width="42" height="11" rx="2" stroke="#161616" fill="#fefefe" />
+          <rect x="6" y="42" width="30" height="11" rx="2" stroke="#abbab9" />
+          <circle cx="74" cy="24" r="10" stroke="#161616" fill="#fefefe" />
+          <circle cx="74" cy="24" r="4" stroke="#03aa5c" />
+          <line x1="81" y1="31" x2="89" y2="39" stroke="#161616" strokeWidth="1.7" />
+        </svg>
+      );
+    }
+    if (id === 'parsing_only') {
+      return (
+        <svg viewBox="0 0 96 64" className="w-[88px] h-[60px] shrink-0" fill="none" strokeWidth="1.35">
+          <rect x="10" y="8" width="38" height="48" rx="2.5" stroke="#161616" fill="#fefefe" />
+          <line x1="17" y1="18" x2="41" y2="18" stroke="#abbab9" />
+          <line x1="17" y1="25" x2="36" y2="25" stroke="#abbab9" />
+          <rect x="17" y="32" width="24" height="15" rx="1.5" stroke="#03aa5c" fill="#03aa5c" fillOpacity="0.14" />
+          <line x1="6" y1="32" x2="52" y2="32" stroke="#03aa5c" strokeDasharray="3 2" />
+          <path d="M58 18 L74 18 L74 46 L58 46" stroke="#abbab9" strokeDasharray="3 3" />
+          <circle cx="64" cy="32" r="5" stroke="#03aa5c" fill="#03aa5c" fillOpacity="0.15" />
+          <path d="M62 32 L63.5 33.5 L66.5 30.5" stroke="#027a42" />
+        </svg>
+      );
+    }
+    return (
+      <svg viewBox="0 0 96 64" className="w-[88px] h-[60px] shrink-0" fill="none" strokeWidth="1.35">
+        <rect x="10" y="12" width="26" height="40" rx="2" stroke="#161616" fill="#fefefe" />
+        <line x1="15" y1="22" x2="31" y2="22" stroke="#abbab9" />
+        <line x1="15" y1="29" x2="28" y2="29" stroke="#abbab9" />
+        <circle cx="23" cy="40" r="3" fill="#161616" />
+        <rect x="60" y="12" width="26" height="40" rx="2" stroke="#03aa5c" fill="#03aa5c" fillOpacity="0.12" />
+        <line x1="65" y1="22" x2="81" y2="22" stroke="#03aa5c" />
+        <line x1="65" y1="29" x2="78" y2="29" stroke="#03aa5c" />
+        <circle cx="73" cy="40" r="3" fill="#03aa5c" />
+        <path d="M40 26 L56 26 M52 22 L56 26 L52 30" stroke="#161616" />
+        <path d="M56 38 L40 38 M44 34 L40 38 L44 42" stroke="#03aa5c" />
+      </svg>
+    );
+  };
+
   return (
-    <div className="max-w-5xl mx-auto px-8 py-9 space-y-8">
-      {/* Editorial Hero Header (TypeSafe AI style) */}
-      <div className="space-y-3">
-        <div className="ts-eyebrow">
-          RAGFLOW QC HARNESS · {activeRun ? activeRun.name.toUpperCase() : 'WORKSPACE'}
-        </div>
-        <h1 className="text-3xl font-semibold text-[#18181b] text-balance">
-          Kiểm thử chất lượng hệ thống RAG
+    <div className="max-w-5xl mx-auto px-8 py-10 space-y-10">
+      {/* Editorial Hero */}
+      <div className="space-y-4">
+        <span className="ts-eyebrow">
+          RAGFLOW QC · {activeRun ? activeRun.name.toUpperCase() : 'WORKSPACE'}
+        </span>
+
+        <h1 className="text-[32px] leading-[1.15] font-semibold tracking-[-0.02em] text-[#161616]">
+          Kiểm thử chất lượng hệ thống RAG theo luồng chuẩn hóa.
         </h1>
 
-        {/* Signature Soft Mauve Editorial Banner */}
-        <div className="ts-editorial-banner border border-[#ead8e4] rounded-[4px] px-5 py-4 space-y-1.5">
-          <div className="text-[13px] font-semibold text-[#18181b]">
-            {activeRun
-              ? `Đang làm việc trên phiên "${activeRun.name}" (${overview?.doc_count ?? 0} tài liệu · ${overview?.chunk_count ?? 0} đoạn cắt)`
-              : 'Chưa có phiên kiểm thử nào được khởi tạo'}
-          </div>
-          <p className="text-[13px] text-[#3f3f46] text-pretty">
-            {activeRun
-              ? 'Toàn bộ kết quả đọc file, cắt đoạn và tìm kiếm được lưu trực tiếp trong cơ sở dữ liệu local — tự động tính điểm và giữ lại nhãn chấm khi bạn thử nghiệm cấu hình mới.'
-              : 'Bạn có thể kết nối trực tiếp tới RAGFlow API hoặc nạp nhanh bộ dữ liệu mẫu HIV/AIDS để trải nghiệm đủ 4 bước kiểm thử.'}
-          </p>
-          <div className="pt-1 flex flex-wrap items-center gap-4">
-            {!activeRun ? (
-              <button
-                onClick={handleSeedDemo}
-                disabled={seeding}
-                className="text-[13px] font-medium text-[#2563eb] hover:underline inline-flex items-center gap-1"
-              >
-                <Sparkles className="size-3.5" />
-                {seeding ? 'Đang tạo dữ liệu mẫu...' : 'Nạp ngay dữ liệu mẫu (HIV/AIDS Baseline + Exp1)'}
-              </button>
-            ) : (
-              <button
-                onClick={() => onNavigate('workspace')}
-                className="text-[13px] font-medium text-[#2563eb] hover:underline"
-              >
-                Đồng bộ thêm tài liệu từ RAGFlow →
-              </button>
-            )}
-            <button
-              onClick={() => onNavigate('compare')}
-              className="text-[13px] font-medium text-[#6d2e58] hover:underline"
-            >
-              Mở phòng so sánh cấu hình A/B
-            </button>
-          </div>
+        <p className="text-[14px] text-[#3d3d3d] max-w-2xl leading-relaxed">
+          Chọn một chế độ kiểm thử bên dưới để bắt đầu. Ở chế độ toàn luồng 3 tầng, các bước được kiểm soát tuần tự
+          (hoàn tất Parsing mới mở khóa Chunking) giúp kết quả đánh giá nhất quán từ đầu đến cuối.
+        </p>
+
+        {/* Raw Brutalist Technical Blueprint Pipeline Banner */}
+        <div
+          onClick={() => onStartWorkflow('full_pipeline')}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(e) => e.key === 'Enter' && onStartWorkflow('full_pipeline')}
+          title="Bấm để bắt đầu luồng kiểm thử 3 tầng (A → Z)"
+          className="ts-editorial-banner border-2 border-[#161616] shadow-[4px_4px_0_#161616] hover:translate-x-[1px] hover:translate-y-[1px] hover:shadow-[3px_3px_0_#03aa5c] px-5 py-4 cursor-pointer transition-all overflow-hidden"
+        >
+          <svg
+            viewBox="0 0 820 120"
+            className="w-full h-[100px] md:h-[116px] block"
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+          >
+            {/* Raw corner registration marks */}
+            <path d="M2 10 L2 2 L10 2" stroke="#161616" strokeWidth="1.5" />
+            <path d="M810 2 L818 2 L818 10" stroke="#161616" strokeWidth="1.5" />
+            <path d="M2 110 L2 118 L10 118" stroke="#161616" strokeWidth="1.5" />
+            <path d="M810 118 L818 118 L818 110" stroke="#161616" strokeWidth="1.5" />
+
+            {/* Stage 01: DOCS */}
+            <g transform="translate(22, 18)">
+              <rect x="4" y="4" width="142" height="82" fill="#161616" />
+              <rect x="0" y="0" width="142" height="82" fill="#fefefe" stroke="#161616" strokeWidth="2" />
+              <rect x="0" y="0" width="26" height="18" fill="#161616" />
+              <text x="5" y="12.5" fill="#fefefe" fontSize="9.5" fontWeight="700" fontFamily="monospace">01</text>
+              <rect x="14" y="28" width="28" height="38" fill="#f2fbf6" stroke="#161616" strokeWidth="1.75" />
+              <line x1="19" y1="38" x2="37" y2="38" stroke="#161616" strokeWidth="1.5" />
+              <line x1="19" y1="46" x2="33" y2="46" stroke="#161616" strokeWidth="1.5" />
+              <line x1="19" y1="54" x2="36" y2="54" stroke="#161616" strokeWidth="1.5" />
+              <line x1="10" y1="33" x2="46" y2="33" stroke="#03aa5c" strokeWidth="2.2" className="ts-anim-scan" />
+              <text x="54" y="44" fill="#161616" fontSize="13" fontWeight="700" fontFamily="monospace">DOCS</text>
+              <text x="54" y="60" fill="#52525b" fontSize="9.5" fontFamily="monospace">[PDF/DOCX]</text>
+            </g>
+
+            {/* Connector 1 -> 2 */}
+            <circle cx="170" cy="59" r="2.5" fill="#161616" />
+            <line x1="173" y1="59" x2="229" y2="59" stroke="#161616" strokeWidth="1.6" className="ts-anim-flow" />
+            <path d="M223 53.5 L229.5 59 L223 64.5" stroke="#03aa5c" strokeWidth="2" strokeLinecap="square" strokeLinejoin="miter" />
+
+            {/* Stage 02: PARSING */}
+            <g transform="translate(234, 18)">
+              <rect x="4" y="4" width="150" height="82" fill="#161616" />
+              <rect x="0" y="0" width="150" height="82" fill="#fefefe" stroke="#161616" strokeWidth="2" />
+              <rect x="0" y="0" width="26" height="18" fill="#03aa5c" />
+              <text x="5" y="12.5" fill="#fefefe" fontSize="9.5" fontWeight="700" fontFamily="monospace">02</text>
+              <rect x="14" y="28" width="32" height="40" fill="#fefefe" stroke="#161616" strokeWidth="1.75" />
+              <rect x="19" y="34" width="22" height="8" fill="#03aa5c" />
+              <rect x="19" y="46" width="22" height="7" fill="#161616" fillOpacity="0.2" />
+              <rect x="19" y="57" width="14" height="6" fill="#161616" />
+              <text x="58" y="44" fill="#161616" fontSize="13" fontWeight="700" fontFamily="monospace">PARSE</text>
+              <text x="58" y="60" fill="#027a42" fontSize="9.5" fontWeight="700" fontFamily="monospace">[OCR/TBL]</text>
+            </g>
+
+            {/* Connector 2 -> 3 */}
+            <circle cx="390" cy="59" r="2.5" fill="#161616" />
+            <line x1="393" y1="59" x2="449" y2="59" stroke="#161616" strokeWidth="1.6" className="ts-anim-flow" />
+            <path d="M443 53.5 L449.5 59 L443 64.5" stroke="#03aa5c" strokeWidth="2" strokeLinecap="square" strokeLinejoin="miter" />
+
+            {/* Stage 03: CHUNKS */}
+            <g transform="translate(454, 18)">
+              <rect x="4" y="4" width="150" height="82" fill="#161616" />
+              <rect x="0" y="0" width="150" height="82" fill="#fefefe" stroke="#161616" strokeWidth="2" />
+              <rect x="0" y="0" width="26" height="18" fill="#161616" />
+              <text x="5" y="12.5" fill="#fefefe" fontSize="9.5" fontWeight="700" fontFamily="monospace">03</text>
+              <polygon
+                points="32 26 48 35 48 53 32 62 16 53 16 35 32 26"
+                fill="#03aa5c"
+                fillOpacity="0.2"
+                stroke="#161616"
+                strokeWidth="1.8"
+              />
+              <line x1="32" y1="62" x2="32" y2="44" stroke="#161616" strokeWidth="1.6" />
+              <line x1="48" y1="35" x2="32" y2="44" stroke="#161616" strokeWidth="1.6" />
+              <line x1="16" y1="35" x2="32" y2="44" stroke="#161616" strokeWidth="1.6" />
+              <rect x="29.5" y="41.5" width="5" height="5" fill="#03aa5c" className="ts-anim-pulse" />
+              <text x="60" y="44" fill="#161616" fontSize="13" fontWeight="700" fontFamily="monospace">CHUNKS</text>
+              <text x="60" y="60" fill="#52525b" fontSize="9.5" fontFamily="monospace">[SPLIT/QC]</text>
+            </g>
+
+            {/* Connector 3 -> 4 */}
+            <circle cx="610" cy="59" r="2.5" fill="#161616" />
+            <line x1="613" y1="59" x2="663" y2="59" stroke="#161616" strokeWidth="1.6" className="ts-anim-flow" />
+            <path d="M657 53.5 L663.5 59 L657 64.5" stroke="#03aa5c" strokeWidth="2" strokeLinecap="square" strokeLinejoin="miter" />
+
+            {/* Stage 04: TOP-K / A-B */}
+            <g transform="translate(668, 18)">
+              <rect x="4" y="4" width="128" height="82" fill="#03aa5c" />
+              <rect x="0" y="0" width="128" height="82" fill="#161616" stroke="#161616" strokeWidth="2" />
+              <rect x="12" y="14" width="102" height="10" fill="#03aa5c" />
+              <rect x="12" y="30" width="78" height="10" fill="#fefefe" />
+              <rect x="12" y="46" width="52" height="10" fill="#71717a" />
+              <text x="12" y="72" fill="#03aa5c" fontSize="10" fontWeight="700" fontFamily="monospace">
+                &gt; TOP-K / A-B
+              </text>
+            </g>
+          </svg>
         </div>
       </div>
 
-      {/* Capabilities / 4-Step Grid with bespoke thin-line SVG illustrations (like TypeSafe's Image Model Capabilities) */}
+      {/* Workflow Mode Selector Grid */}
       <div className="space-y-3">
-        <div className="ts-eyebrow">QUY TRÌNH 3 TẦNG KIỂM THỬ</div>
-        <div className="grid grid-cols-1 md:grid-cols-2 border border-[#e6e6e3] rounded-[4px] divide-y md:divide-y-0 md:divide-x divide-[#e6e6e3] bg-[#fafaf9]">
-          {/* Tile 1: Parsing */}
-          <button
-            onClick={() => onNavigate('parsing')}
-            className="p-6 text-left hover:bg-white transition-colors relative flex flex-col justify-between min-h-[210px] border-b border-[#e6e6e3]"
-          >
-            <div className="flex items-start justify-between">
-              {/* Bespoke line-art document scan illustration */}
-              <svg viewBox="0 0 80 64" className="w-20 h-16 text-[#9e8ca0]" fill="none" stroke="currentColor" strokeWidth="1.4">
-                <rect x="10" y="8" width="38" height="48" rx="3" />
-                <line x1="17" y1="18" x2="41" y2="18" />
-                <line x1="17" y1="26" x2="36" y2="26" />
-                <rect x="17" y="33" width="24" height="14" rx="1.5" />
-                <path d="M54 18 L66 18 L66 46 L54 46" strokeDasharray="3 3" />
-                <circle cx="58" cy="32" r="5" />
-                <line x1="61.5" y1="35.5" x2="67" y2="41" />
-              </svg>
-              <span className="ts-tag-mauve">Tầng 1 · Parsing</span>
-            </div>
+        <span className="ts-eyebrow">CHỌN CHẾ ĐỘ KIỂM THỬ</span>
 
-            <div className="pt-5 space-y-1">
-              <div className="flex items-baseline justify-between">
-                <span className="text-[15px] font-semibold text-[#18181b]">Chấm đọc file & OCR</span>
-                <span className="font-mono text-sm font-semibold tabular-nums text-[#18181b]">
-                  {activeRun ? pct(p.text_completeness) : '—'}
-                </span>
-              </div>
-              <p className="text-[13px] text-[#71717a] text-pretty">
-                Đối chiếu song song tài liệu gốc với kết quả RAGFlow trích xuất.
-              </p>
-              <div className="text-xs text-[#78716c] italic pt-1">
-                Đọc đúng bảng: {activeRun ? pct(p.table_accuracy) : '—'} · Lỗi dấu/OCR: {activeRun ? pct(p.character_error_rate) : '—'}
-              </div>
-            </div>
-          </button>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-px bg-[#dedede] border border-[#dedede] rounded-[3px] overflow-hidden">
+          {WORKFLOW_MODES.map((m) => (
+            <button
+              key={m.id}
+              onClick={() => onStartWorkflow(m.id)}
+              className="group p-6 text-left bg-[#fefefe] hover:bg-[#f7f7f6] transition-colors flex flex-col justify-between min-h-[196px]"
+            >
+              <div className="space-y-3">
+                <div className="flex items-start justify-between gap-2">
+                  {modeArt(m.id)}
+                  <span className={m.primary ? 'ts-tag-teal' : 'ts-tag-mauve'}>{m.tag}</span>
+                </div>
 
-          {/* Tile 2: Chunking */}
-          <button
-            onClick={() => onNavigate('chunking')}
-            className="p-6 text-left hover:bg-white transition-colors relative flex flex-col justify-between min-h-[210px] border-b border-[#e6e6e3]"
-          >
-            <div className="flex items-start justify-between">
-              {/* Bespoke line-art segmented blocks / wireframe cube illustration */}
-              <svg viewBox="0 0 80 64" className="w-20 h-16 text-[#9e8ca0]" fill="none" stroke="currentColor" strokeWidth="1.4">
-                <path d="M12 16 L12 10 L18 10" />
-                <path d="M62 10 L68 10 L68 16" />
-                <path d="M12 48 L12 54 L18 54" />
-                <path d="M62 54 L68 54 L68 48" />
-                <polygon points="40 16 56 25 56 43 40 52 24 43 24 25 40 16" />
-                <line x1="40" y1="52" x2="40" y2="34" />
-                <line x1="56" y1="25" x2="40" y2="34" />
-                <line x1="24" y1="25" x2="40" y2="34" />
-              </svg>
-              <span className="ts-tag-mauve">Tầng 2 · Chunking</span>
-            </div>
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <h2 className="text-[15px] font-semibold text-[#161616] group-hover:text-black">
+                      {m.title}
+                    </h2>
+                    <ArrowRight className="size-4 text-[#a1a1aa] group-hover:text-[#161616] group-hover:translate-x-0.5 transition-all shrink-0" />
+                  </div>
+                  <p className="text-[13px] text-[#52525b] leading-relaxed">{m.desc}</p>
+                </div>
+              </div>
 
-            <div className="pt-5 space-y-1">
-              <div className="flex items-baseline justify-between">
-                <span className="text-[15px] font-semibold text-[#18181b]">Chấm chất lượng cắt đoạn</span>
-                <span className="font-mono text-sm font-semibold tabular-nums text-[#18181b]">
-                  {activeRun ? pct(c.chunk_integrity) : '—'}
-                </span>
+              <div className="pt-4 mt-3 border-t border-[#ededeb] font-mono text-[11px] text-[#71717a] truncate">
+                {m.stepsLabel}
               </div>
-              <p className="text-[13px] text-[#71717a] text-pretty">
-                Chọn mẫu đầu–giữa–cuối, tự bắt lỗi đoạn vụn, số trang và trùng lặp.
-              </p>
-              <div className="text-xs text-[#78716c] italic pt-1">
-                Tự đủ nghĩa: {activeRun ? pct(c.context_sufficiency) : '—'} · Dính rác: {activeRun ? pct(c.noise_rate) : '—'}
-              </div>
-            </div>
-          </button>
-
-          {/* Tile 3: Retrieval */}
-          <button
-            onClick={() => onNavigate('retrieval')}
-            className="p-6 text-left hover:bg-white transition-colors relative flex flex-col justify-between min-h-[210px]"
-          >
-            <div className="flex items-start justify-between">
-              {/* Bespoke line-art ranked retrieval illustration */}
-              <svg viewBox="0 0 80 64" className="w-20 h-16 text-[#9e8ca0]" fill="none" stroke="currentColor" strokeWidth="1.4">
-                <rect x="10" y="10" width="48" height="11" rx="2" />
-                <rect x="10" y="26" width="38" height="11" rx="2" />
-                <rect x="10" y="42" width="28" height="11" rx="2" />
-                <circle cx="64" cy="15.5" r="3" />
-                <path d="M56 32 L64 32 M60 28 L64 32 L60 36" />
-              </svg>
-              <span className="ts-tag-mauve">Tầng 3 · Retrieval</span>
-            </div>
-
-            <div className="pt-5 space-y-1">
-              <div className="flex items-baseline justify-between">
-                <span className="text-[15px] font-semibold text-[#18181b]">Chấm tìm kiếm & xếp hạng</span>
-                <span className="font-mono text-sm font-semibold tabular-nums text-[#18181b]">
-                  {r ? pct(r.avg_contextual_precision) : '—'}
-                </span>
-              </div>
-              <p className="text-[13px] text-[#71717a] text-pretty">
-                Chạy hàng loạt câu hỏi Golden Dataset, tự lưu cache nhãn chấm giữa các lần thử.
-              </p>
-              <div className="text-xs text-[#78716c] italic pt-1">
-                {r ? `${r.total_testcases} câu hỏi · Độ phủ: ${pct(r.avg_context_coverage)}` : 'Chưa chạy bộ câu hỏi test'}
-              </div>
-            </div>
-          </button>
-
-          {/* Tile 4: Compare Lab */}
-          <button
-            onClick={() => onNavigate('compare')}
-            className="p-6 text-left hover:bg-white transition-colors relative flex flex-col justify-between min-h-[210px]"
-          >
-            <div className="flex items-start justify-between">
-              {/* Bespoke line-art A/B diff illustration */}
-              <svg viewBox="0 0 80 64" className="w-20 h-16 text-[#9e8ca0]" fill="none" stroke="currentColor" strokeWidth="1.4">
-                <rect x="10" y="14" width="24" height="36" rx="2" />
-                <rect x="46" y="14" width="24" height="36" rx="2" />
-                <path d="M34 26 L46 26 M42 22 L46 26 L42 30" />
-                <path d="M46 38 L34 38 M38 34 L34 38 L38 42" />
-              </svg>
-              <span className="ts-tag-mauve">A/B Lab</span>
-            </div>
-
-            <div className="pt-5 space-y-1">
-              <div className="flex items-baseline justify-between">
-                <span className="text-[15px] font-semibold text-[#18181b]">So sánh cấu hình & tìm lỗi gốc</span>
-                <ArrowRight className="size-4 text-[#71717a]" />
-              </div>
-              <p className="text-[13px] text-[#71717a] text-pretty">
-                Đối chiếu Baseline với thử nghiệm mới, lọc ngay câu Pass → Fail và tầng gây lỗi.
-              </p>
-              <div className="text-xs text-[#78716c] italic pt-1">
-                Đổi chunk size, overlap, tỷ trọng vector/keyword, bật/tắt rerank
-              </div>
-            </div>
-          </button>
+            </button>
+          ))}
         </div>
       </div>
 
-      {/* Bottom Quick Action List (like TypeSafe's MORE EXAMPLES) */}
-      <div className="space-y-2.5">
-        <div className="ts-eyebrow">THAO TÁC NHANH</div>
-        <div className="divide-y divide-[#ededeb] border-t border-b border-[#ededeb]">
-          <QuickRow
-            title="Quản lý bộ tài liệu gốc"
-            desc="Tải file PDF, DOCX, HTML, Excel lên kho local và đẩy sang RAGFlow"
-            onClick={() => onNavigate('workspace')}
-          />
-          <QuickRow
-            title="Chấm đọc file (Parsing)"
-            desc="Mở màn hình chia đôi tài liệu gốc ↔ đoạn RAGFlow trích xuất"
-            onClick={() => onNavigate('parsing')}
-          />
-          <QuickRow
-            title="Chạy kiểm thử tìm kiếm (Retrieval)"
-            desc="Đánh giá bộ câu hỏi Local / Global / Multi-hop và tự tính điểm"
-            onClick={() => onNavigate('retrieval')}
-          />
+      {/* Compact Live Metrics Strip for Active Run */}
+      {activeRun && (
+        <div className="space-y-3">
+          <div className="ts-eyebrow">CHỈ SỐ HIỆN TẠI CỦA PHIÊN "{activeRun.name}"</div>
+          <div className="grid grid-cols-2 md:grid-cols-4 border border-[#dedede] rounded-[3px] divide-x divide-[#dedede] bg-[#fefefe]">
+            <div className="p-4 space-y-1">
+              <div className="font-mono text-[11px] text-[#71717a] flex items-center gap-1.5">
+                <FileSearch className="size-3.5" /> PARSING
+              </div>
+              <div className="font-mono text-xl font-semibold tabular-nums text-[#161616]">
+                {pct(p.text_completeness)}
+              </div>
+              <div className="text-[11px] text-[#71717a]">Đọc đủ chữ · Đã chấm {p.rated ?? 0}</div>
+            </div>
+
+            <div className="p-4 space-y-1">
+              <div className="font-mono text-[11px] text-[#71717a] flex items-center gap-1.5">
+                <Layers className="size-3.5" /> CHUNKING
+              </div>
+              <div className="font-mono text-xl font-semibold tabular-nums text-[#161616]">
+                {pct(c.chunk_integrity)}
+              </div>
+              <div className="text-[11px] text-[#71717a]">Toàn vẹn · Mẫu {c.sampled ?? 0}</div>
+            </div>
+
+            <div className="p-4 space-y-1">
+              <div className="font-mono text-[11px] text-[#71717a] flex items-center gap-1.5">
+                <Search className="size-3.5" /> RETRIEVAL
+              </div>
+              <div className="font-mono text-xl font-semibold tabular-nums text-[#161616]">
+                {r ? pct(r.avg_contextual_precision) : '—'}
+              </div>
+              <div className="text-[11px] text-[#71717a]">
+                {r ? `${r.total_testcases} TC · Phủ ${pct(r.avg_context_coverage)}` : 'Chưa chạy'}
+              </div>
+            </div>
+
+            <div className="p-4 space-y-1">
+              <div className="font-mono text-[11px] text-[#71717a] flex items-center gap-1.5">
+                <GitCompare className="size-3.5" /> DATASET
+              </div>
+              <div className="font-mono text-xl font-semibold tabular-nums text-[#161616]">
+                {overview?.chunk_count ?? activeRun.chunk_count ?? 0}
+              </div>
+              <div className="text-[11px] text-[#71717a]">
+                Chunks trong {overview?.doc_count ?? activeRun.doc_count ?? 0} tài liệu
+              </div>
+            </div>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 };
-
-const QuickRow: React.FC<{ title: string; desc: string; onClick: () => void }> = ({
-  title,
-  desc,
-  onClick,
-}) => (
-  <button
-    onClick={onClick}
-    className="w-full py-3 px-1 flex items-center justify-between gap-4 hover:bg-[#fafaf9] text-left transition-colors"
-  >
-    <div className="flex flex-wrap items-baseline gap-2.5">
-      <span className="text-[13px] font-medium text-[#18181b]">{title}</span>
-      <span className="text-[13px] text-[#71717a]">{desc}</span>
-    </div>
-    <ArrowRight className="size-3.5 text-[#a1a1aa] shrink-0" />
-  </button>
-);

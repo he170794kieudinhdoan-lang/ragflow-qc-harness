@@ -117,6 +117,8 @@ export interface ChunkEvalItem {
   error_codes: string[];
   judge_source: string | null;
   notes: string | null;
+  prev_tail?: string;
+  next_head?: string;
 }
 
 export interface GoldenTestcase {

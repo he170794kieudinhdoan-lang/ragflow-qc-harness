@@ -5,10 +5,11 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from database import UPLOAD_DIR, get_db, get_setting, utc_now
+from database import UPLOAD_DIR, get_db, get_setting, repair_chunk_document_links, utc_now
 from ragflow_client import RAGFlowClient, RAGFlowError
 from metrics import align_unit_to_chunks, extract_best_aligned_span_with_stitching, nfc
 from extractor import extract_document_units
+from unit_sync import realign_units, units_need_realign
 
 router = APIRouter(prefix="/api/parsing", tags=["parsing"])
 
@@ -32,6 +33,11 @@ class ParsingScoreUpdate(BaseModel):
 @router.get("/runs/{run_id}/units")
 def list_parsing_units(run_id: int, document_id: Optional[int] = None):
     with get_db() as conn:
+        # Heal snapshots where chunks arrived after the units were extracted (old behaviour froze
+        # matched_chunk_ids to [] and the parsing screen showed "không tìm thấy đoạn nào khớp").
+        if units_need_realign(conn, run_id):
+            realign_units(conn, run_id)
+
         q = """
             SELECT pu.*, d.doc_code, d.filename, d.format_group, d.file_path
             FROM parsing_units pu
@@ -45,19 +51,43 @@ def list_parsing_units(run_id: int, document_id: Optional[int] = None):
         q += " ORDER BY d.doc_code, pu.unit_index"
         rows = conn.execute(q, params).fetchall()
 
+        # Self-heal orphan chunk document_id links before building chunk_map
+        repair_chunk_document_links(conn)
+
         # Fetch chunks map for quick side-by-side display + neighbor lookup for cross-chunk stitching
         crows = conn.execute(
-            "SELECT document_id, ragflow_chunk_id, chunk_index, content, page_num, char_count FROM chunks WHERE run_id = ?",
+            "SELECT document_id, ragflow_chunk_id, chunk_index, content, page_num, char_count FROM chunks WHERE run_id = ? ORDER BY chunk_index",
             (run_id,),
         ).fetchall()
         chunk_map = {c["ragflow_chunk_id"]: dict(c) for c in crows}
         chunk_by_pos = {(c["document_id"], c["chunk_index"]): dict(c) for c in crows}
+        chunks_by_doc: dict = {}
+        for c in crows:
+            chunks_by_doc.setdefault(c["document_id"], []).append(dict(c))
 
         items = []
+        now = utc_now()
         for r in rows:
             d = dict(r)
             d["source_text"] = nfc(d["source_text"])
             matched_ids = json.loads(d["matched_chunk_ids"] or "[]")
+            # Auto-realign if matched_ids is empty or references missing chunks, when chunks exist for this doc
+            valid_matched = [cid for cid in matched_ids if cid in chunk_map]
+            if not valid_matched and d["document_id"] in chunks_by_doc:
+                doc_chunks = chunks_by_doc[d["document_id"]]
+                new_ids, new_score = align_unit_to_chunks(d["source_text"], doc_chunks)
+                if not new_ids and d.get("page_num"):
+                    page_matches = [c["ragflow_chunk_id"] for c in doc_chunks if c["page_num"] == d["page_num"]][:3]
+                    if page_matches:
+                        new_ids = page_matches
+                        new_score = 0.01
+                if new_ids:
+                    matched_ids = new_ids
+                    d["match_score"] = new_score
+                    conn.execute(
+                        "UPDATE parsing_units SET matched_chunk_ids = ?, match_score = ?, updated_at = ? WHERE id = ?",
+                        (json.dumps(matched_ids), new_score, now, d["id"]),
+                    )
             d["matched_chunk_ids"] = matched_ids
             d["error_codes"] = json.loads(d["error_codes"] or "[]")
             matched_chunks = []

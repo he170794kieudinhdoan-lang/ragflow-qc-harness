@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from database import init_db
+from ragflow_client import close_shared_http_client
 from routers import settings, workspace, parsing, chunking, retrieval, analytics
 
 app = FastAPI(title="RAGFlow QC Harness API", version="0.1.0")
@@ -18,6 +19,11 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     init_db()
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await close_shared_http_client()
 
 
 @app.get("/api/health")

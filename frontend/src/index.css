@@ -7,65 +7,115 @@
   body,
   #root {
     height: 100%;
-    background-color: #ffffff;
-    color: #18181b;
-    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    background-color: #fefefe;
+    color: #161616;
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  }
+
+  h1 {
+    font-family: 'Newsreader', Georgia, serif;
   }
 
   code,
   pre,
   .font-mono {
-    font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
   }
 
   ::-webkit-scrollbar {
-    width: 7px;
-    height: 7px;
+    width: 6px;
+    height: 6px;
   }
   ::-webkit-scrollbar-track {
-    background: #fafafa;
+    background: #f7f7f6;
   }
   ::-webkit-scrollbar-thumb {
-    background: #d4d4d8;
-    border-radius: 2px;
+    background: #d4d4d2;
+    border-radius: 1px;
   }
   ::-webkit-scrollbar-thumb:hover {
     background: #a1a1aa;
   }
 }
 
-/* TypeSafe-inspired Light Architectural System */
+/* Global 3-Color System: Black (#161616) · White (#fefefe) · Emerald Green (#03aa5c) */
 .ts-eyebrow {
-  @apply font-mono text-[11px] font-medium uppercase text-[#78716c];
+  @apply font-mono text-[11px] font-normal uppercase tracking-[0.08em] text-[#71717a];
 }
 
 .ts-tag-mauve {
-  @apply inline-flex items-center px-2 py-0.5 text-[11px] font-medium bg-[#f3e5ef] text-[#6d2e58] rounded-[3px];
+  @apply inline-flex items-center px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider bg-[#03aa5c]/10 text-[#027a42] border border-[#03aa5c]/30 rounded-[2px];
+}
+
+.ts-tag-teal {
+  @apply inline-flex items-center px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider bg-[#03aa5c]/15 text-[#027a42] border border-[#03aa5c]/35 rounded-[2px];
 }
 
 .ts-tag-neutral {
-  @apply inline-flex items-center px-1.5 py-0.5 font-mono text-[11px] bg-[#f3f3f1] text-[#3f3f46] border border-[#e6e6e3] rounded-[3px];
+  @apply inline-flex items-center px-1.5 py-0.5 font-mono text-[11px] bg-[#f7f7f6] text-[#3d3d3d] border border-[#dedede] rounded-[2px];
 }
 
 .ts-input {
-  @apply bg-white border border-[#e4e4e2] rounded-[4px] px-2.5 py-1.5 text-[13px] text-[#18181b] placeholder:text-[#a1a1aa] focus:outline-none focus:border-[#71717a] transition-colors;
+  @apply bg-[#fefefe] border border-[#dedede] rounded-[3px] px-2.5 py-1.5 text-[13px] text-[#161616] placeholder:text-[#a1a1aa] focus:outline-none focus:border-[#03aa5c] transition-colors;
 }
 
 .ts-btn-primary {
-  @apply inline-flex items-center justify-center gap-1.5 bg-[#18181b] hover:bg-[#27272a] text-white font-medium text-[13px] px-3.5 py-1.5 rounded-[4px] transition-colors disabled:opacity-40 disabled:cursor-not-allowed;
+  @apply inline-flex items-center justify-center gap-1.5 bg-[#161616] hover:bg-[#2c2c2c] text-[#fefefe] font-medium text-[13px] px-3.5 py-1.5 rounded-[3px] transition-colors disabled:opacity-40 disabled:cursor-not-allowed;
 }
 
 .ts-btn-secondary {
-  @apply inline-flex items-center justify-center gap-1.5 bg-[#f7f7f5] hover:bg-[#eeeeec] text-[#18181b] border border-[#e4e4e2] font-medium text-[13px] px-3 py-1.5 rounded-[4px] transition-colors disabled:opacity-40 disabled:cursor-not-allowed;
+  @apply inline-flex items-center justify-center gap-1.5 bg-[#fefefe] hover:bg-[#f7f7f6] text-[#161616] border border-[#dedede] font-medium text-[13px] px-3 py-1.5 rounded-[3px] transition-colors disabled:opacity-40 disabled:cursor-not-allowed;
 }
 
 .ts-btn-ghost {
-  @apply inline-flex items-center justify-center gap-1.5 text-[#52525b] hover:text-[#18181b] hover:bg-[#f4f4f2] text-[13px] px-2.5 py-1.5 rounded-[4px] transition-colors;
+  @apply inline-flex items-center justify-center gap-1.5 text-[#52525b] hover:text-[#161616] hover:bg-[#f4f4f2] text-[13px] px-2.5 py-1.5 rounded-[3px] transition-colors;
 }
 
-/* Subtle dotted editorial banner pattern like TypeSafe's release banner */
+/* Crisp emerald dotted editorial surface */
 .ts-editorial-banner {
-  background-color: #f4e8f0;
-  background-image: radial-gradient(rgba(124, 58, 102, 0.14) 1px, transparent 1px);
-  background-size: 10px 10px;
+  background-color: #f2fbf6;
+  background-image: radial-gradient(rgba(3, 170, 92, 0.18) 1px, transparent 1px);
+  background-size: 12px 12px;
+}
+
+@keyframes ts-flow {
+  from {
+    stroke-dashoffset: 24;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes ts-scan {
+  0%, 100% {
+    transform: translateY(0px);
+    opacity: 0.9;
+  }
+  50% {
+    transform: translateY(24px);
+    opacity: 0.45;
+  }
+}
+
+@keyframes ts-pulse-ring {
+  0%, 100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 0.75;
+  }
+}
+
+.ts-anim-flow {
+  stroke-dasharray: 4 4;
+  animation: ts-flow 1.4s linear infinite;
+}
+
+.ts-anim-scan {
+  animation: ts-scan 2.8s ease-in-out infinite;
+}
+
+.ts-anim-pulse {
+  animation: ts-pulse-ring 2.2s ease-in-out infinite;
 }

@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from typing import Any, Dict
 from database import get_all_settings, set_setting, get_setting, get_db
 from ragflow_client import RAGFlowClient, RAGFlowError
+from llm_client import LLMError, test_llm_connection
 from metrics import PARSING_ERROR_CATALOG, CHUNKING_ERROR_CATALOG, RETRIEVAL_ERROR_CATALOG
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -32,29 +33,27 @@ def read_settings():
 @router.put("")
 def update_settings(payload: SettingsPayload):
     old_api_key = get_setting("ragflow_api_key", "").strip()
-    old_base_url = get_setting("ragflow_base_url", "").strip()
+    old_base_url = get_setting("ragflow_base_url", "").strip().rstrip("/")
 
     for k, v in payload.settings.items():
         if k in ("has_ragflow_key", "has_llm_key"):
             continue
-        set_setting(k, str(v))
+        value = str(v)
+        if k == "ragflow_base_url":
+            value = value.strip().rstrip("/")
+        set_setting(k, value)
 
     new_api_key = str(payload.settings.get("ragflow_api_key", old_api_key)).strip()
-    new_base_url = str(payload.settings.get("ragflow_base_url", old_base_url)).strip()
+    new_base_url = str(payload.settings.get("ragflow_base_url", old_base_url)).strip().rstrip("/")
 
+    # Changing the connection target never deletes local snapshots implicitly: silently wiping
+    # runs was what made the selected dataset jump to another one after saving settings.
     account_changed = (
         (bool(old_api_key) and new_api_key != old_api_key)
         or (bool(old_base_url) and new_base_url != old_base_url)
     )
 
-    workspace_cleared = False
-    if account_changed:
-        with get_db() as conn:
-            conn.execute("DELETE FROM runs")
-            conn.execute("DELETE FROM documents WHERE file_path = ''")
-        workspace_cleared = True
-
-    return {"ok": True, "workspace_cleared": workspace_cleared}
+    return {"ok": True, "workspace_cleared": False, "account_changed": account_changed}
 
 
 @router.post("/test-ragflow")
@@ -71,3 +70,18 @@ async def test_ragflow_connection():
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Không kết nối được tới RAGFlow: {e}")
+
+
+@router.post("/test-llm")
+async def test_llm_endpoint():
+    base_url = get_setting("llm_base_url", "").strip()
+    api_key = get_setting("llm_api_key", "").strip()
+    model = get_setting("llm_model", "").strip()
+    if not base_url or not model:
+        raise HTTPException(status_code=400, detail="Vui lòng nhập LLM Base URL và tên Model trước.")
+    try:
+        return await test_llm_connection(base_url, api_key, model)
+    except LLMError as e:
+        raise HTTPException(status_code=400, detail=f"Lỗi kết nối LLM: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Không gọi được tới LLM: {e}")

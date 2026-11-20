@@ -19,21 +19,22 @@ PARSING_ERROR_CATALOG = [
 ]
 
 CHUNKING_ERROR_CATALOG = [
-    {"code": "C1", "name": "Cắt ngang câu / đoạn", "severity": "High", "metric": "Chunk Integrity"},
-    {"code": "C2", "name": "Cắt vỡ bảng giữa chừng", "severity": "High", "metric": "Chunk Integrity"},
-    {"code": "C3", "name": "Thiếu ngữ cảnh / mất heading chủ thể", "severity": "Medium", "metric": "Context Sufficiency"},
-    {"code": "C4", "name": "Nhiễu header / footer / số trang", "severity": "Medium", "metric": "Noise Rate"},
-    {"code": "C5", "name": "Trùng lặp nội dung giữa các chunk", "severity": "Low", "metric": "Duplicate Rate"},
-    {"code": "C6", "name": "Chunk quá khổ (> max chars)", "severity": "Medium", "metric": "Valid Size"},
-    {"code": "C7", "name": "Cắt tách danh sách khỏi tiêu đề", "severity": "Medium", "metric": "Chunk Integrity"},
-    {"code": "C8", "name": "Chunk quá vụn (< min chars / chỉ có số)", "severity": "High", "metric": "Valid Size"},
+    {"code": "C1", "group": "Vỡ bảng", "name": "Vỡ bảng khi cắt chunk", "severity": "Nghiêm trọng", "metric": "Chunk Integrity"},
+    {"code": "C2", "group": "Cắt sai ranh giới", "name": "Cắt sai ranh giới", "severity": "Trung bình", "metric": "Chunk Integrity"},
+    {"code": "C3", "group": "Thiếu ngữ cảnh", "name": "Thiếu ngữ cảnh", "severity": "Trung bình", "metric": "Context Sufficiency"},
+    {"code": "C4", "group": "Nhiễu", "name": "Chunk chứa nội dung nhiễu", "severity": "Trung bình", "metric": "Noise Rate"},
+    {"code": "C5", "group": "Nhiễu", "name": "Chunk rỗng / chunk rác", "severity": "Nhẹ", "metric": "Noise Rate"},
+    {"code": "C6", "group": "Trùng lặp", "name": "Trùng lặp do cắt chunk", "severity": "Trung bình", "metric": "Duplicate Rate"},
+    {"code": "C7", "group": "Trùng lặp", "name": "Thừa nội dung / trùng lặp", "severity": "Trung bình", "metric": "Duplicate Rate"},
+    {"code": "C8", "group": "Kích thước bất thường", "name": "Kích thước bất thường", "severity": "Nhẹ", "metric": "Size Compliance"},
 ]
 
 RETRIEVAL_ERROR_CATALOG = [
-    {"code": "R1", "name": "Miss nhánh Keyword (mã số / tên riêng)", "layer": "KEYWORD"},
-    {"code": "R2", "name": "Miss nhánh Vector (paraphrase / ngữ nghĩa)", "layer": "VECTOR"},
-    {"code": "R3", "name": "Lỗi Rerank (tụt hạng sau rerank)", "layer": "RERANK"},
-    {"code": "R4", "name": "Lỗi Ngưỡng / Top-K (bị cắt bởi threshold)", "layer": "THRESHOLD"},
+    {"code": "R1", "group": "Miss nhánh keyword", "name": "Miss nhánh keyword", "severity": "Nghiêm trọng", "layer": "KEYWORD"},
+    {"code": "R2", "group": "Miss nhánh vector", "name": "Miss nhánh vector", "severity": "Nghiêm trọng", "layer": "VECTOR"},
+    {"code": "R3", "group": "Lỗi rerank", "name": "Lỗi rerank", "severity": "Trung bình", "layer": "RERANK"},
+    {"code": "R4", "group": "Lỗi ngưỡng / top-k", "name": "Lỗi ngưỡng / top-k", "severity": "Trung bình", "layer": "THRESHOLD"},
+    {"code": "R5", "group": "Nhiễu tài liệu tương tự", "name": "Nhiễu tài liệu tương tự", "severity": "Trung bình", "layer": "SIMILAR_DOC"},
 ]
 
 
@@ -273,28 +274,153 @@ def detect_chunk_rule_flags(
     return flags
 
 
-def detect_duplicates(chunks: List[Dict[str, Any]], threshold: float = 0.85) -> Dict[int, List[int]]:
-    """Find near-duplicate chunks within a run using normalized prefix + SequenceMatcher."""
-    dup_map: Dict[int, List[int]] = {}
-    normed = [(c["id"], normalize_text(c["content"])) for c in chunks]
+def detect_duplicates_classified(
+    chunks: List[Dict[str, Any]], threshold: float = 0.85
+) -> Tuple[set, set]:
+    """
+    Returns (adjacent_dup_ids [C6], far_dup_ids [C7]) using RapidFuzz C++:
+    - C6: high similarity or heavy boundary overlap between consecutive chunks of the same doc.
+    - C7: high similarity between non-adjacent chunks (redundant content).
+    """
+    adjacent_dups = set()
+    far_dups = set()
+    normed = [
+        (c["id"], c.get("document_id"), c.get("chunk_index", 0), normalize_text(c["content"]))
+        for c in chunks
+    ]
+    cutoff = threshold * 100.0
     n = len(normed)
     for i in range(n):
-        id_i, txt_i = normed[i]
+        id_i, doc_i, idx_i, txt_i = normed[i]
         if len(txt_i) < 40:
             continue
+        pref_i = txt_i[:500]
         for j in range(i + 1, n):
-            id_j, txt_j = normed[j]
+            id_j, doc_j, idx_j, txt_j = normed[j]
             if len(txt_j) < 40:
                 continue
-            # Fast length ratio pre-filter
-            ratio_len = min(len(txt_i), len(txt_j)) / max(len(txt_i), len(txt_j))
-            if ratio_len < 0.7:
+            is_adj = doc_i == doc_j and abs(idx_i - idx_j) == 1
+            if is_adj:
+                tail_i = txt_i[-220:]
+                head_j = txt_j[:260]
+                if len(tail_i) >= 60 and fuzz.partial_ratio(tail_i, head_j, score_cutoff=88.0) >= 88.0:
+                    adjacent_dups.add(id_i)
+                    adjacent_dups.add(id_j)
+                    continue
+            if min(len(pref_i), len(txt_j[:500])) / max(len(pref_i), len(txt_j[:500])) < 0.7:
                 continue
-            sim = SequenceMatcher(None, txt_i[:500], txt_j[:500]).ratio()
-            if sim >= threshold:
-                dup_map.setdefault(id_i, []).append(id_j)
-                dup_map.setdefault(id_j, []).append(id_i)
-    return dup_map
+            sim = fuzz.ratio(pref_i, txt_j[:500], score_cutoff=cutoff)
+            if sim >= cutoff:
+                if is_adj:
+                    adjacent_dups.add(id_i)
+                    adjacent_dups.add(id_j)
+                else:
+                    far_dups.add(id_i)
+                    far_dups.add(id_j)
+    return adjacent_dups, far_dups
+
+
+_AMBIGUOUS_START_RE = re.compile(
+    r"^(?:tuy nhiên|do đó|vì vậy|ngoài ra|bên cạnh đó|theo đó|trong đó|những người này|đối tượng này|các đối tượng này|nhóm này|thuốc này|phác đồ này|điều này|họ\s|nó\s|[-•+*]\s)",
+    re.IGNORECASE,
+)
+
+
+def analyze_chunk_rules(
+    chunk: Dict[str, Any],
+    prev_content: str = "",
+    next_content: str = "",
+    repeated_lines: set | None = None,
+    is_adj_dup: bool = False,
+    is_far_dup: bool = False,
+    min_chars: int = 50,
+    max_chars: int = 2600,
+) -> Dict[str, Any]:
+    """
+    0-LLM Chunking QC rule engine aligned with Phụ lục A (6 metrics) & Phụ lục B (C1..C8).
+    """
+    raw = nfc(chunk.get("content") or "").strip()
+    n = len(raw)
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    flags: List[str] = []
+    codes: List[str] = []
+
+    def add(code: str, flag: str = ""):
+        if code not in codes:
+            codes.append(code)
+        if flag and flag not in flags:
+            flags.append(flag)
+
+    alpha_cnt = sum(1 for c in raw if c.isalpha())
+    is_junk = n == 0 or alpha_cnt < 12 or bool(re.fullmatch(r"[\d\s\-/.,|]+", raw))
+    if n == 0:
+        add("C5", "EMPTY")
+    elif is_junk:
+        add("C5", "NUMERIC_ONLY_NOISE")
+
+    lower = raw.lower()
+    has_td = "<td" in lower or "<tr" in lower
+    has_table_open = "<table" in lower
+    has_table_close = "</table" in lower
+    # Intact table exception (DOC07 #3, DOC11 #3): balanced standalone tables are exempt from C8 TOO_LONG
+    is_intact_table = has_table_open and has_table_close and (lower.count("<table") == lower.count("</table"))
+
+    if 0 < n < min_chars:
+        add("C8", "TOO_SHORT")
+    elif n > max_chars and not is_intact_table:
+        add("C8", "TOO_LONG")
+    has_rep_line = bool(repeated_lines and any(ln in repeated_lines for ln in lines))
+    if has_rep_line or any(re.search(p, lower) for p in noise_patterns):
+        add("C4", "SUSPECTED_NOISE")
+
+    if is_adj_dup:
+        add("C6", "ADJACENT_DUPLICATE")
+    if is_far_dup:
+        add("C7", "DUPLICATE")
+
+    has_td = "<td" in lower or "<tr" in lower
+    has_table_open = "<table" in lower
+    has_table_close = "</table" in lower
+    prev_has_td = "<td" in (prev_content or "").lower()
+    next_has_td = "<td" in (next_content or "").lower()
+    if has_td and ((has_table_open != has_table_close) or (not has_table_open) or prev_has_td or next_has_td):
+        add("C1", "BROKEN_TABLE")
+
+    if not is_junk and not has_td and lines:
+        first_ch = lines[0][0]
+        last_line = lines[-1]
+        last_ch = last_line[-1]
+        starts_mid = first_ch.islower() or first_ch in ",;)]"
+        ends_mid = last_ch not in ".!?:;\"')]" and not _HEADING_LINE_RE.match(last_line) and len(last_line) > 30
+        trailing_colon = last_ch == ":" and len(lines) <= 2 and bool(next_content.strip())
+        if starts_mid or ends_mid or trailing_colon:
+            add("C2", "BAD_BOUNDARY")
+
+    if not is_junk and lines:
+        first_line = lines[0]
+        has_heading = bool(
+            _HEADING_LINE_RE.match(first_line)
+            or first_line.startswith("#")
+            or (len(first_line) <= 100 and sum(1 for c in first_line if c.isupper()) >= max(6, int(0.75 * max(1, sum(1 for c in first_line if c.isalpha())))))
+        )
+        if not has_heading and (_AMBIGUOUS_START_RE.match(first_line) or first_line[0].islower()):
+            add("C3", "LOW_CONTEXT")
+
+    integrity = 0 if ("C1" in codes or "C2" in codes) else 1
+    context_sufficiency = 0 if ("C3" in codes or "C5" in codes) else 1
+    no_noise = 0 if ("C4" in codes or "C5" in codes) else 1
+    no_duplicate = 0 if ("C6" in codes or "C7" in codes) else 1
+    valid_size = 0 if ("C8" in codes or "C5" in codes) else 1
+
+    return {
+        "integrity": integrity,
+        "context_sufficiency": context_sufficiency,
+        "no_noise": no_noise,
+        "no_duplicate": no_duplicate,
+        "valid_size": valid_size,
+        "error_codes": codes,
+        "rule_flags": flags,
+    }
 
 
 def _expand_to_word_bounds(text: str, start: int, end: int) -> Tuple[int, int]:
@@ -494,3 +620,35 @@ def compute_answer_containment(reference_context: str, chunks: List[Dict[str, An
     if len(covered_union) / len(ref_tokens) >= 0.72:
         return "SPLIT"
     return "MISSING"
+
+
+def score_chunk_relevance(reference_context: str, chunk_content: str) -> Tuple[int, str]:
+    """0-LLM RapidFuzz relevance pre-scorer comparing a retrieved chunk to reference_context."""
+    ref_norm = normalize_text(reference_context)
+    chk_norm = normalize_text(chunk_content)
+    if not ref_norm or not chk_norm:
+        return 0, ""
+    if ref_norm[:100] in chk_norm:
+        return 1, "Khớp trực tiếp đoạn căn cứ"
+    pr = float(fuzz.partial_ratio(ref_norm[:600], chk_norm))
+    ref_tokens = set(re.findall(r"\w+", ref_norm))
+    chk_tokens = set(re.findall(r"\w+", chk_norm))
+    overlap = len(ref_tokens & chk_tokens) / max(len(ref_tokens), 1)
+    if pr >= 72.0 or overlap >= 0.55:
+        return 1, f"Tự động khớp (RapidFuzz {pr:.0f}%, từ khóa {overlap*100:.0f}%)"
+    return 0, ""
+
+
+def compute_context_coverage(reference_context: str, retrieved_chunks: List[Dict[str, Any]]) -> float:
+    """
+    Computes Context Coverage (Phụ lục A): fraction of essential tokens from reference_context
+    present in the union of Top-K retrieved chunks (order-independent).
+    """
+    ref_tokens = {t for t in re.findall(r"\w+", normalize_text(reference_context)) if len(t) >= 2}
+    if not ref_tokens:
+        return 0.0
+    union_tokens = set()
+    for ch in retrieved_chunks:
+        txt = ch.get("content") or ch.get("content_with_weight") or ""
+        union_tokens |= {t for t in re.findall(r"\w+", normalize_text(txt)) if len(t) >= 2}
+    return round(len(ref_tokens & union_tokens) / len(ref_tokens), 4)

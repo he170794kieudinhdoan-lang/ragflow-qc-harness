@@ -379,3 +379,14 @@ def seed_demo_data():
             )
 
     return {"ok": True, "message": "Seeded realistic demo workspace", "run_id": run_id}
+
+
+@router.post("/seed-canonical")
+def seed_canonical_endpoint():
+    """Seeds the full canonical HIV_Chuan dataset (20 docs, 695 chunks, 110 testcases, Baseline & TN2 runs)."""
+    try:
+        from canonical_seeder import seed_full_canonical_dataset
+        return seed_full_canonical_dataset()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi nạp dữ liệu chuẩn: {e}")
+

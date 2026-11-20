@@ -186,7 +186,18 @@ def _extract_pdf(fp: str) -> List[ExtractedUnit]:
 
             units.extend(_merge_blocks_into_paragraphs(page_texts, p_idx))
     finally:
+        total_pages = len(pdf)
         pdf.close()
+
+    # If PDF is 100% scanned without digital text, generate per-page units so QC can inspect OCR
+    if not units and total_pages > 0:
+        for pno in range(1, min(total_pages + 1, 26)):
+            units.append((
+                "text",
+                pno,
+                f"Trang {pno} (Bản scan / Cần OCR)",
+                f"[Trang {pno}/{total_pages} - Tài liệu ảnh quét scan, không có digital text. Cần kiểm tra chất lượng OCR của RAGFlow.]",
+            ))
 
     # Keep natural page order (text/sections then tables per page)
     units.sort(key=lambda u: (u[1], 0 if u[0] != "table" else 1))

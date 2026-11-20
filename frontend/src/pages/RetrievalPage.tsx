@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { Check, Play, Plus, Sparkles, X } from 'lucide-react';
+import { toast } from 'sonner';
+import { Check, Loader2, Play, Plus, Sparkles, Wand2, X } from 'lucide-react';
 import { api } from '../api/client';
 import { RetrievalResultGroup, RetrievalRun, RunItem } from '../types';
 
@@ -22,6 +23,10 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
   const [showAddTc, setShowAddTc] = useState(false);
   const [showRunModal, setShowRunModal] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [genPerDoc, setGenPerDoc] = useState(3);
+  const [useLlmGen, setUseLlmGen] = useState(false);
+  const [useLlmJudge, setUseLlmJudge] = useState(false);
 
   const [tcCode, setTcCode] = useState('TC04');
   const [tcClass, setTcClass] = useState('Local');
@@ -97,15 +102,16 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
         vector_similarity_weight: vecWeight,
         rerank_id: rerankId,
         keyword_enabled: true,
+        use_llm: useLlmJudge,
       });
       setShowRunModal(false);
       await loadRuns();
       setSelectedRrId(res.retrieval_run_id);
-      alert(
-        `Chạy xong ${res.testcases_executed} câu hỏi. Tự động giữ lại ${res.smart_cache_hits} nhãn đã chấm từ các lần trước!`
+      toast.success(
+        `Chạy xong ${res.testcases_executed} câu hỏi · Giữ lại ${res.smart_cache_hits} nhãn đã chấm.`
       );
     } catch (err: any) {
-      alert(err.message);
+      toast.error(err.message);
     } finally {
       setBusy(false);
     }
@@ -125,13 +131,38 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
     await loadResults(selectedRrId);
   };
 
+  const handleAutoGenerate = async () => {
+    if (!activeRun || generating) return;
+    setGenerating(true);
+    try {
+      const res = await api.autoGenerateTestcases(activeRun.id, genPerDoc, false, useLlmGen);
+      const modeNote = res.llm_used_count ? ` (${res.llm_used_count} câu bằng LLM)` : ' (0-LLM)';
+      toast.success(`Đã sinh ${res.generated_count} câu hỏi Golden Dataset${modeNote}.`);
+      await loadRuns();
+      if (selectedRrId) await loadResults(selectedRrId);
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const avgPrecision =
+    groups.length > 0
+      ? groups.reduce((s, g) => s + (g.contextual_precision || 0), 0) / groups.length
+      : 0;
+  const avgCoverage =
+    groups.length > 0
+      ? groups.reduce((s, g) => s + (g.meta?.context_coverage || 0), 0) / groups.length
+      : 0;
+
   return (
     <div className="h-[calc(100dvh-48px)] flex flex-col bg-white">
       {/* Toolbar */}
-      <div className="px-5 py-2.5 border-b border-[#e8e8e6] bg-[#fafaf9] flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
+      <div className="px-5 py-2.5 border-b border-[#e8e8e6] bg-[#fafaf9] flex flex-wrap items-center justify-between gap-3 shrink-0">
+        <div className="flex flex-wrap items-center gap-2">
           <select
-            className="ts-input py-1 text-xs min-w-[240px]"
+            className="ts-input py-1 text-xs min-w-[200px]"
             value={selectedRrId ?? ''}
             onChange={(e) => setSelectedRrId(Number(e.target.value))}
           >
@@ -143,17 +174,49 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
             {rrList.length === 0 && <option value="">Chưa có lần chạy tìm kiếm nào</option>}
           </select>
 
-          <button onClick={() => setShowRunModal(true)} className="ts-btn-primary py-1 text-xs">
+          <div className="inline-flex items-center gap-1.5 text-xs text-[#71717a]">
+            <input
+              type="number"
+              min={1}
+              max={15}
+              className="ts-input py-1 w-12 font-mono text-center text-xs"
+              value={genPerDoc}
+              onChange={(e) => setGenPerDoc(Number(e.target.value))}
+              title="Số câu hỏi sinh ra trên mỗi tài liệu"
+            />
+            <label className="inline-flex items-center gap-1 text-[11px] text-[#52525b] cursor-pointer select-none" title="Bật để dùng LLM trong Cài đặt API (tắt = 0 LLM miễn phí)">
+              <input type="checkbox" checked={useLlmGen} onChange={(e) => setUseLlmGen(e.target.checked)} />
+              LLM
+            </label>
+            <button
+              onClick={handleAutoGenerate}
+              disabled={generating || busy}
+              className="ts-btn-secondary py-1 text-xs disabled:opacity-45"
+              title="Tự động sinh Golden Dataset từ các tài liệu trong phiên hiện tại"
+            >
+              {generating ? <Loader2 className="size-3.5 animate-spin" /> : <Wand2 className="size-3.5" />}
+              {generating ? 'Đang sinh...' : 'Tự sinh Golden'}
+            </button>
+          </div>
+
+          <button onClick={() => setShowRunModal(true)} disabled={busy || generating} className="ts-btn-primary py-1 text-xs disabled:opacity-45">
             <Play className="size-3.5" /> Chạy test tìm kiếm
           </button>
           <button onClick={() => setShowAddTc(true)} className="ts-btn-secondary py-1 text-xs">
-            <Plus className="size-3.5" /> Thêm câu hỏi
+            <Plus className="size-3.5" /> Thêm tay
           </button>
         </div>
 
-        <span className="text-xs text-[#78716c] italic">
-          Tự động giữ lại nhãn đã chấm khi chạy lại cấu hình mới
-        </span>
+        <div className="flex items-center gap-4 text-xs text-[#52525b]">
+          <span title="Contextual Precision trung bình (Phụ lục A — 0..1)">
+            Contextual Precision:{' '}
+            <strong className="font-mono tabular-nums text-[#18181b]">{avgPrecision.toFixed(2)}</strong>
+          </span>
+          <span title="Context Coverage trung bình (Phụ lục A — %)">
+            Context Coverage:{' '}
+            <strong className="font-mono tabular-nums text-[#18181b]">{(avgCoverage * 100).toFixed(0)}%</strong>
+          </span>
+        </div>
       </div>
 
       {/* Split Workspace */}
@@ -245,12 +308,13 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
                       onChange={(e) => handleMetaUpdate({ root_cause_layer: e.target.value })}
                     >
                       <option value="NONE">Không lỗi (Pass)</option>
-                      <option value="PARSING">Lỗi đọc file / OCR (Parsing)</option>
-                      <option value="CHUNKING">Lỗi cắt đoạn (Chunking)</option>
-                      <option value="KEYWORD">Miss nhánh từ khóa (Keyword)</option>
-                      <option value="VECTOR">Miss nhánh ngữ nghĩa (Vector)</option>
-                      <option value="RERANK">Rerank đẩy tụt hạng</option>
-                      <option value="THRESHOLD">Bị lọc bởi ngưỡng / Top-K</option>
+                      <option value="KEYWORD">R1 · Miss nhánh keyword (Nghiêm trọng)</option>
+                      <option value="VECTOR">R2 · Miss nhánh vector (Nghiêm trọng)</option>
+                      <option value="RERANK">R3 · Lỗi rerank (Trung bình)</option>
+                      <option value="THRESHOLD">R4 · Lỗi ngưỡng / top-k (Trung bình)</option>
+                      <option value="SIMILAR_DOC">R5 · Nhiễu tài liệu tương tự (Trung bình)</option>
+                      <option value="PARSING">Tầng 1 · Lỗi đọc file (Parsing)</option>
+                      <option value="CHUNKING">Tầng 2 · Lỗi cắt đoạn (Chunking)</option>
                     </select>
                   </label>
                 </div>
@@ -355,6 +419,10 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
                 <label className="block text-xs text-[#52525b] mb-1">Model Rerank (để trống nếu tắt)</label>
                 <input className="ts-input w-full font-mono text-xs" placeholder="BAAI/bge-reranker-v2-m3" value={rerankId} onChange={(e) => setRerankId(e.target.value)} />
               </div>
+              <label className="flex items-center gap-2 text-xs text-[#3f3f46] cursor-pointer pt-1">
+                <input type="checkbox" checked={useLlmJudge} onChange={(e) => setUseLlmJudge(e.target.checked)} />
+                <span>Chấm nháp độ liên quan bằng LLM-as-a-Judge (tắt = RapidFuzz 0 đồng)</span>
+              </label>
             </div>
             <div className="flex justify-end gap-2 pt-2 border-t border-[#ededeb]">
               <button type="button" onClick={() => setShowRunModal(false)} className="ts-btn-secondary">Hủy</button>

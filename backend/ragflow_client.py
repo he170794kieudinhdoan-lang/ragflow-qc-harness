@@ -1,6 +1,30 @@
 import httpx
 from typing import Any, Dict, List, Optional
 
+_SHARED_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
+
+
+def get_shared_http_client() -> httpx.AsyncClient:
+    """Shared bounded connection pool to prevent TCP socket buildup across requests."""
+    global _SHARED_HTTP_CLIENT
+    if _SHARED_HTTP_CLIENT is None or _SHARED_HTTP_CLIENT.is_closed:
+        _SHARED_HTTP_CLIENT = httpx.AsyncClient(
+            timeout=60.0,
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10,
+                keepalive_expiry=30.0,
+            ),
+        )
+    return _SHARED_HTTP_CLIENT
+
+
+async def close_shared_http_client() -> None:
+    global _SHARED_HTTP_CLIENT
+    if _SHARED_HTTP_CLIENT is not None and not _SHARED_HTTP_CLIENT.is_closed:
+        await _SHARED_HTTP_CLIENT.aclose()
+    _SHARED_HTTP_CLIENT = None
+
 
 class RAGFlowError(Exception):
     def __init__(self, message: str, code: int = -1, status_code: int = 0):
@@ -45,14 +69,15 @@ class RAGFlowClient:
 
     # --- Datasets ---
     async def list_datasets(self, page: int = 1, page_size: int = 100) -> List[Dict[str, Any]]:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.get(
-                f"{self.base_url}/api/v1/datasets",
-                headers=self._headers(),
-                params={"page": page, "page_size": page_size},
-            )
-            data = self._unwrap(r)
-            return data if isinstance(data, list) else []
+        client = get_shared_http_client()
+        r = await client.get(
+            f"{self.base_url}/api/v1/datasets",
+            headers=self._headers(),
+            params={"page": page, "page_size": page_size},
+            timeout=self.timeout,
+        )
+        data = self._unwrap(r)
+        return data if isinstance(data, list) else []
 
     async def create_dataset(
         self,
@@ -73,100 +98,144 @@ class RAGFlowClient:
             body["embedding_model"] = embedding_model
         if parser_config:
             body["parser_config"] = parser_config
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.post(
-                f"{self.base_url}/api/v1/datasets",
-                headers=self._headers(),
-                json=body,
-            )
-            try:
-                return self._unwrap(r)
-            except RAGFlowError as e:
-                # Fallback for older Python RAGFlow versions that reject parse_type/parser_id
-                if "parse_type" in str(e) or "parser_id" in str(e):
-                    legacy_body: Dict[str, Any] = {"name": name, "chunk_method": parser_id}
-                    if embedding_model:
-                        legacy_body["embedding_model"] = embedding_model
-                    if parser_config:
-                        legacy_body["parser_config"] = parser_config
-                    r2 = await client.post(
-                        f"{self.base_url}/api/v1/datasets",
-                        headers=self._headers(),
-                        json=legacy_body,
-                    )
-                    return self._unwrap(r2)
-                raise
+        client = get_shared_http_client()
+        r = await client.post(
+            f"{self.base_url}/api/v1/datasets",
+            headers=self._headers(),
+            json=body,
+            timeout=self.timeout,
+        )
+        try:
+            return self._unwrap(r)
+        except RAGFlowError as e:
+            # Fallback for older Python RAGFlow versions that reject parse_type/parser_id
+            if "parse_type" in str(e) or "parser_id" in str(e):
+                legacy_body: Dict[str, Any] = {"name": name, "chunk_method": parser_id}
+                if embedding_model:
+                    legacy_body["embedding_model"] = embedding_model
+                if parser_config:
+                    legacy_body["parser_config"] = parser_config
+                r2 = await client.post(
+                    f"{self.base_url}/api/v1/datasets",
+                    headers=self._headers(),
+                    json=legacy_body,
+                    timeout=self.timeout,
+                )
+                return self._unwrap(r2)
+            raise
+
+    async def update_dataset(
+        self,
+        dataset_id: str,
+        chunk_method: Optional[str] = None,
+        parser_config: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        body: Dict[str, Any] = {}
+        if chunk_method:
+            body["parser_id"] = chunk_method
+            body["chunk_method"] = chunk_method
+        if parser_config is not None:
+            body["parser_config"] = parser_config
+        client = get_shared_http_client()
+        r = await client.put(
+            f"{self.base_url}/api/v1/datasets/{dataset_id}",
+            headers=self._headers(),
+            json=body,
+            timeout=self.timeout,
+        )
+        try:
+            return self._unwrap(r)
+        except RAGFlowError as e:
+            if "parser_id" in str(e) or "chunk_method" in str(e):
+                fallback: Dict[str, Any] = {}
+                if chunk_method:
+                    fallback["chunk_method" if "parser_id" in str(e) else "parser_id"] = chunk_method
+                if parser_config is not None:
+                    fallback["parser_config"] = parser_config
+                r2 = await client.put(
+                    f"{self.base_url}/api/v1/datasets/{dataset_id}",
+                    headers=self._headers(),
+                    json=fallback,
+                    timeout=self.timeout,
+                )
+                return self._unwrap(r2)
+            raise
 
     # --- Documents ---
     async def list_documents(
         self, dataset_id: str, page: int = 1, page_size: int = 100
     ) -> List[Dict[str, Any]]:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.get(
-                f"{self.base_url}/api/v1/datasets/{dataset_id}/documents",
-                headers=self._headers(),
-                params={"page": page, "page_size": page_size},
-            )
-            data = self._unwrap(r)
-            if isinstance(data, dict) and "docs" in data:
-                return data["docs"]
-            return data if isinstance(data, list) else []
+        client = get_shared_http_client()
+        r = await client.get(
+            f"{self.base_url}/api/v1/datasets/{dataset_id}/documents",
+            headers=self._headers(),
+            params={"page": page, "page_size": page_size},
+            timeout=self.timeout,
+        )
+        data = self._unwrap(r)
+        if isinstance(data, dict) and "docs" in data:
+            return data["docs"]
+        return data if isinstance(data, list) else []
 
     async def upload_document(self, dataset_id: str, filename: str, file_bytes: bytes) -> Any:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            files = [("file", (filename, file_bytes))]
-            r = await client.post(
-                f"{self.base_url}/api/v1/datasets/{dataset_id}/documents",
-                headers=self._headers(json_content=False),
-                files=files,
-            )
-            return self._unwrap(r)
+        client = get_shared_http_client()
+        files = [("file", (filename, file_bytes))]
+        r = await client.post(
+            f"{self.base_url}/api/v1/datasets/{dataset_id}/documents",
+            headers=self._headers(json_content=False),
+            files=files,
+            timeout=120.0,
+        )
+        return self._unwrap(r)
 
     async def download_document(self, dataset_id: str, document_id: str) -> bytes:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            r = await client.get(
-                f"{self.base_url}/api/v1/datasets/{dataset_id}/documents/{document_id}",
-                headers=self._headers(json_content=False),
+        client = get_shared_http_client()
+        r = await client.get(
+            f"{self.base_url}/api/v1/datasets/{dataset_id}/documents/{document_id}",
+            headers=self._headers(json_content=False),
+            timeout=120.0,
+        )
+        if r.status_code >= 400:
+            raise RAGFlowError(
+                f"HTTP {r.status_code}: {r.text[:300]}",
+                status_code=r.status_code,
             )
-            if r.status_code >= 400:
-                raise RAGFlowError(
-                    f"HTTP {r.status_code}: {r.text[:300]}",
-                    status_code=r.status_code,
-                )
-            ctype = (r.headers.get("content-type") or "").lower()
-            if "application/json" in ctype:
-                try:
-                    payload = r.json()
-                    if isinstance(payload, dict) and payload.get("code", 0) != 0:
-                        raise RAGFlowError(
-                            payload.get("message", f"RAGFlow API error code {payload.get('code')}"),
-                            code=payload.get("code", -1),
-                            status_code=r.status_code,
-                        )
-                except RAGFlowError:
-                    raise
-                except Exception:
-                    pass
-            return r.content
+        ctype = (r.headers.get("content-type") or "").lower()
+        if "application/json" in ctype:
+            try:
+                payload = r.json()
+                if isinstance(payload, dict) and payload.get("code", 0) != 0:
+                    raise RAGFlowError(
+                        payload.get("message", f"RAGFlow API error code {payload.get('code')}"),
+                        code=payload.get("code", -1),
+                        status_code=r.status_code,
+                    )
+            except RAGFlowError:
+                raise
+            except Exception:
+                pass
+        return r.content
 
     async def parse_documents(self, dataset_id: str, document_ids: List[str]) -> Any:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.post(
-                f"{self.base_url}/api/v1/datasets/{dataset_id}/chunks",
-                headers=self._headers(),
-                json={"document_ids": document_ids},
-            )
-            return self._unwrap(r)
+        client = get_shared_http_client()
+        r = await client.post(
+            f"{self.base_url}/api/v1/datasets/{dataset_id}/chunks",
+            headers=self._headers(),
+            json={"document_ids": document_ids},
+            timeout=self.timeout,
+        )
+        return self._unwrap(r)
 
     async def stop_parsing(self, dataset_id: str, document_ids: List[str]) -> Any:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.request(
-                "DELETE",
-                f"{self.base_url}/api/v1/datasets/{dataset_id}/chunks",
-                headers=self._headers(),
-                json={"document_ids": document_ids},
-            )
-            return self._unwrap(r)
+        client = get_shared_http_client()
+        r = await client.request(
+            "DELETE",
+            f"{self.base_url}/api/v1/datasets/{dataset_id}/chunks",
+            headers=self._headers(),
+            json={"document_ids": document_ids},
+            timeout=self.timeout,
+        )
+        return self._unwrap(r)
 
     # --- Chunks ---
     async def list_chunks(
@@ -176,16 +245,17 @@ class RAGFlowClient:
         page: int = 1,
         page_size: int = 100,
     ) -> Dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.get(
-                f"{self.base_url}/api/v1/datasets/{dataset_id}/documents/{document_id}/chunks",
-                headers=self._headers(),
-                params={"page": page, "page_size": page_size},
-            )
-            data = self._unwrap(r)
-            if isinstance(data, dict):
-                return data
-            return {"chunks": data if isinstance(data, list) else [], "total": len(data or [])}
+        client = get_shared_http_client()
+        r = await client.get(
+            f"{self.base_url}/api/v1/datasets/{dataset_id}/documents/{document_id}/chunks",
+            headers=self._headers(),
+            params={"page": page, "page_size": page_size},
+            timeout=self.timeout,
+        )
+        data = self._unwrap(r)
+        if isinstance(data, dict):
+            return data
+        return {"chunks": data if isinstance(data, list) else [], "total": len(data or [])}
 
     async def list_all_chunks(self, dataset_id: str, document_id: str) -> List[Dict[str, Any]]:
         all_chunks: List[Dict[str, Any]] = []
@@ -228,11 +298,12 @@ class RAGFlowClient:
         }
         if rerank_id:
             body["rerank_id"] = rerank_id
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.post(
-                f"{self.base_url}/api/v1/retrieval",
-                headers=self._headers(),
-                json=body,
-            )
-            data = self._unwrap(r)
-            return data if isinstance(data, dict) else {"chunks": []}
+        client = get_shared_http_client()
+        r = await client.post(
+            f"{self.base_url}/api/v1/retrieval",
+            headers=self._headers(),
+            json=body,
+            timeout=self.timeout,
+        )
+        data = self._unwrap(r)
+        return data if isinstance(data, dict) else {"chunks": []}

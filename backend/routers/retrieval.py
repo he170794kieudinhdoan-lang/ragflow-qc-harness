@@ -1,11 +1,19 @@
 import json
+import re
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from database import get_db, get_setting, utc_now
 from ragflow_client import RAGFlowClient, RAGFlowError
-from metrics import compute_contextual_precision, compute_answer_containment
+from llm_client import llm_generate_question, llm_judge_relevance
+from metrics import (
+    compute_answer_containment,
+    compute_context_coverage,
+    compute_contextual_precision,
+    nfc,
+    score_chunk_relevance,
+)
 
 router = APIRouter(prefix="/api/retrieval", tags=["retrieval"])
 
@@ -29,6 +37,7 @@ class RetrievalRunCreate(BaseModel):
     vector_similarity_weight: float = 0.3
     rerank_id: str = ""
     keyword_enabled: bool = True
+    use_llm: bool = False
 
 
 class ResultScoreUpdate(BaseModel):
@@ -84,6 +93,165 @@ def delete_testcase(tc_id: int):
     return {"ok": True}
 
 
+class AutoGenRequest(BaseModel):
+    run_id: int
+    per_doc: int = 3
+    replace_existing: bool = False
+    use_llm: bool = False
+
+
+def _build_question_from_text(text: str, filename: str) -> tuple:
+    """0-LLM Vietnamese question generator from document headings, tables, numbers, or paragraphs."""
+    clean = nfc(text).strip()
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in clean.splitlines() if ln.strip()]
+    first = lines[0] if lines else clean[:100]
+    short_doc = re.sub(r"\.(pdf|docx|html|md|pptx)$", "", filename or "", flags=re.IGNORECASE)
+    short_doc = re.sub(r"^DOC\d+_", "", short_doc).replace("_", " ").replace("-", " ")[:48].strip()
+
+    m_tbl = re.search(r"(Bảng\s*\d+[^<\n]{0,80})", clean, flags=re.IGNORECASE)
+    if m_tbl or "<table" in clean.lower():
+        tbl_title = re.sub(r"<[^>]+>", "", m_tbl.group(1)).strip() if m_tbl else first[:80]
+        q = f"Nội dung chi tiết trong {tbl_title} (tài liệu {short_doc}) quy định những gì?"
+        return q, "Local", "Table"
+
+    m_art = re.search(r"(Điều\s+\d+\.?[^\n]{0,90})", clean)
+    if m_art:
+        art = m_art.group(1).strip().rstrip(".:")
+        q = f"Theo tài liệu {short_doc}, {art} quy định những nội dung nào?"
+        return q, "Local", "Keyword"
+
+    m_sec = re.match(r"^(?:\d+(?:\.\d+)*\.?|[IVXLC]+\.)\s+(.{8,95})$", first)
+    if m_sec:
+        topic = m_sec.group(1).strip().rstrip(".:")
+        q = f"{topic} trong {short_doc} được trình bày như thế nào?"
+        return q, "Local", "Factoid"
+
+    m_code = re.search(r"\b(\d+/[A-ZĐ0-9\-]+|\d+[.,]\d+\s*(?:%|mg|ml|người|trường hợp)|CD4\s*[<>≤≥]?\s*\d+)\b", clean)
+    if m_code:
+        kw = m_code.group(1)
+        q = f"Thông tin liên quan đến '{kw}' trong tài liệu {short_doc} là gì?"
+        return q, "Local", "Keyword"
+
+    sent = re.split(r"[.!?]", first)[0].strip()[:95]
+    q = f"Tài liệu {short_doc} nêu những thông tin gì về: \"{sent}\"?"
+    return q, "Global", "Factoid"
+
+
+@router.post("/testcases/auto-generate")
+async def auto_generate_golden_testcases(payload: AutoGenRequest):
+    """
+    Automatically generates a Golden Dataset from the documents/chunks already synced
+    in `run_id`. Supports both 0-LLM (fast, free regex) and optional LLM mode.
+    """
+    llm_base = get_setting("llm_base_url", "").strip()
+    llm_key = get_setting("llm_api_key", "").strip()
+    llm_model = get_setting("llm_model", "").strip()
+    if payload.use_llm and (not llm_base or not llm_model or (not llm_key and "localhost" not in llm_base and "127.0.0.1" not in llm_base)):
+        raise HTTPException(
+            status_code=400,
+            detail="Chưa cấu hình LLM API Key / Model trong Cài đặt API. Hãy nhập key (vd: Gemini Free / OpenAI) hoặc tắt tùy chọn Dùng LLM.",
+        )
+
+    per_doc = max(1, min(payload.per_doc, 15))
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT c.document_id, c.chunk_index, c.content, d.doc_code, d.filename
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            WHERE c.run_id = ? AND LENGTH(TRIM(c.content)) >= 120
+            ORDER BY d.doc_code, c.chunk_index
+            """,
+            (payload.run_id,),
+        ).fetchall()
+        if not rows:
+            raise HTTPException(
+                status_code=400,
+                detail="Phiên này chưa có chunks nào để sinh bộ câu hỏi. Hãy Đồng bộ RAGFlow ở Bước 1 trước.",
+            )
+
+        if payload.replace_existing:
+            conn.execute("DELETE FROM golden_testcases")
+
+        existing_codes = {r["tc_code"] for r in conn.execute("SELECT tc_code FROM golden_testcases").fetchall()}
+
+    next_idx = 1
+    by_doc: dict = {}
+    for r in rows:
+        by_doc.setdefault(r["document_id"], []).append(dict(r))
+
+    to_insert = []
+    created = []
+    llm_used_count = 0
+    now = utc_now()
+
+    for doc_id, clist in by_doc.items():
+        n = len(clist)
+        if n <= per_doc:
+            chosen = clist
+        elif per_doc == 1:
+            chosen = [clist[0]]
+        else:
+            idxs = sorted(set(round(i * (n - 1) / (per_doc - 1)) for i in range(per_doc)))
+            chosen = [clist[i] for i in idxs]
+
+        for ch in chosen:
+            while f"TC{next_idx:02d}" in existing_codes:
+                next_idx += 1
+            tc_code = f"TC{next_idx:02d}"
+            existing_codes.add(tc_code)
+            next_idx += 1
+
+            raw_txt = nfc(ch["content"]).strip()
+            clean_ref = re.sub(r"<[^>]+>", " ", raw_txt)
+            clean_ref = re.sub(r"[ \t]+", " ", clean_ref).strip()[:500]
+            note_prefix = "Auto-gen"
+
+            if payload.use_llm:
+                try:
+                    question, q_class, intent, ref_ctx = await llm_generate_question(
+                        llm_base, llm_key, llm_model, clean_ref, ch["filename"]
+                    )
+                    clean_ref = ref_ctx[:500]
+                    note_prefix = f"LLM ({llm_model})"
+                    llm_used_count += 1
+                except Exception:
+                    question, q_class, intent = _build_question_from_text(raw_txt, ch["filename"])
+            else:
+                question, q_class, intent = _build_question_from_text(raw_txt, ch["filename"])
+
+            to_insert.append(
+                (
+                    tc_code,
+                    question,
+                    clean_ref,
+                    ch["filename"],
+                    q_class,
+                    intent,
+                    f"{note_prefix} từ {ch['doc_code']} #{ch['chunk_index']}",
+                    now,
+                )
+            )
+            created.append({"tc_code": tc_code, "input_question": question, "source_file": ch["filename"]})
+
+    with get_db() as conn:
+        for row_vals in to_insert:
+            conn.execute(
+                """
+                INSERT INTO golden_testcases (tc_code, input_question, expected_outcome, reference_context, source_file, question_class, intent_type, notes, created_at)
+                VALUES (?, ?, '', ?, ?, ?, ?, ?, ?)
+                """,
+                row_vals,
+            )
+
+    return {
+        "ok": True,
+        "generated_count": len(created),
+        "llm_used_count": llm_used_count,
+        "testcases": created,
+    }
+
+
 # ---------- Retrieval Benchmark Runs ----------
 @router.get("/runs")
 def list_retrieval_runs(run_id: Optional[int] = None):
@@ -113,6 +281,15 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
     api_key = get_setting("ragflow_api_key", "")
     if not base_url or not api_key:
         raise HTTPException(status_code=400, detail="Chưa cấu hình RAGFlow URL/API Key trong Settings.")
+
+    llm_base = get_setting("llm_base_url", "").strip()
+    llm_key = get_setting("llm_api_key", "").strip()
+    llm_model = get_setting("llm_model", "").strip()
+    if payload.use_llm and (not llm_base or not llm_model or (not llm_key and "localhost" not in llm_base and "127.0.0.1" not in llm_base)):
+        raise HTTPException(
+            status_code=400,
+            detail="Chưa cấu hình LLM API Key / Model trong Cài đặt API để dùng LLM-as-a-Judge.",
+        )
 
     with get_db() as conn:
         run = conn.execute("SELECT * FROM runs WHERE id = ?", (payload.run_id,)).fetchone()
@@ -171,25 +348,56 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
             raise HTTPException(status_code=400, detail=f"Lỗi Retrieval tại {tc['tc_code']}: {e}")
 
         ac = compute_answer_containment(tc["reference_context"], snap_chunks) if snap_chunks else "UNCHECKED"
+        cov = compute_context_coverage(tc["reference_context"], chunks)
+
+        scored_hits = []
+        for rank, ch in enumerate(chunks, start=1):
+            cid = ch.get("id") or ch.get("chunk_id") or f"unk_{rank}"
+            ch_content = ch.get("content") or ch.get("content_with_weight") or ""
+            ch_doc_name = ch.get("document_keyword") or ch.get("document_name") or ch.get("docnm_kwd", "")
+            cached = cache_map.get((tc["id"], cid))
+            if cached is not None:
+                rel_val, reason = cached
+                src = "CACHED"
+                cache_hits += 1
+            elif payload.use_llm:
+                try:
+                    rel_val, reason = await llm_judge_relevance(
+                        llm_base, llm_key, llm_model, tc["input_question"], tc["reference_context"], ch_content
+                    )
+                    src = "LLM_DRAFT"
+                except Exception:
+                    rel_val, reason = score_chunk_relevance(tc["reference_context"], ch_content)
+                    src = "RULE"
+            else:
+                rel_val, reason = score_chunk_relevance(tc["reference_context"], ch_content)
+                src = "RULE"
+            scored_hits.append((rank, cid, ch, ch_content, ch_doc_name, rel_val, src, reason))
+
+        rel_ranks = [h[0] for h in scored_hits if h[5] == 1]
+        src_file = (tc["source_file"] or "").lower()
+        suggested_layer = "NONE"
+        if not rel_ranks:
+            if ac == "FULL":
+                suggested_layer = "THRESHOLD"
+            elif ac == "SPLIT":
+                suggested_layer = "CHUNKING"
+            else:
+                suggested_layer = "KEYWORD" if tc["intent_type"] == "Keyword" else "VECTOR"
+        elif rel_ranks[0] > 1 and src_file:
+            top_wrong_docs = [h[4].lower() for h in scored_hits if h[0] < rel_ranks[0] and h[5] == 0]
+            if any(d and d != src_file for d in top_wrong_docs):
+                suggested_layer = "SIMILAR_DOC"
 
         with get_db() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO testcase_eval_meta (retrieval_run_id, testcase_id, answer_containment, context_coverage, root_cause_layer, root_cause_notes)
-                VALUES (?, ?, ?, 0.0, '', '')
+                VALUES (?, ?, ?, ?, ?, '')
                 """,
-                (rr_id, tc["id"], ac),
+                (rr_id, tc["id"], ac, cov, suggested_layer),
             )
-            for rank, ch in enumerate(chunks, start=1):
-                cid = ch.get("id") or ch.get("chunk_id") or f"unk_{rank}"
-                cached = cache_map.get((tc["id"], cid))
-                if cached is not None:
-                    rel_val, reason = cached
-                    src = "CACHED"
-                    cache_hits += 1
-                else:
-                    rel_val, reason, src = None, "", "UNRATED"
-
+            for rank, cid, ch, ch_content, ch_doc_name, rel_val, src, reason in scored_hits:
                 conn.execute(
                     """
                     INSERT INTO retrieval_results
@@ -198,8 +406,8 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
                     """,
                     (
                         rr_id, tc["id"], rank, cid, ch.get("document_id", "") or ch.get("doc_id", ""),
-                        ch.get("document_keyword") or ch.get("document_name") or ch.get("docnm_kwd", ""),
-                        ch.get("content") or ch.get("content_with_weight") or "",
+                        ch_doc_name,
+                        ch_content,
                         float(ch.get("similarity", 0) or 0),
                         float(ch.get("vector_similarity", 0) or 0),
                         float(ch.get("term_similarity", 0) or 0),

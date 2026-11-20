@@ -25,17 +25,20 @@ export const api = {
   // Settings
   getSettings: () => req<any>('/api/settings'),
   saveSettings: (settings: Record<string, string>) =>
-    req<{ ok: boolean; workspace_cleared?: boolean }>('/api/settings', {
+    req<{ ok: boolean; workspace_cleared?: boolean; account_changed?: boolean }>('/api/settings', {
       method: 'PUT',
       body: JSON.stringify({ settings }),
     }),
   testRagflow: () => req<any>('/api/settings/test-ragflow', { method: 'POST' }),
+  testLlm: () => req<any>('/api/settings/test-llm', { method: 'POST' }),
 
   // Workspace
   listDocuments: (runId?: number) =>
     req<any[]>(`/api/workspace/documents${runId ? `?run_id=${runId}` : ''}`),
   uploadDocument: (formData: FormData) =>
     req<any>('/api/workspace/documents/upload', { method: 'POST', body: formData }),
+  uploadDocumentsBatch: (formData: FormData) =>
+    req<any>('/api/workspace/documents/upload-batch', { method: 'POST', body: formData }),
   deleteDocument: (id: number) =>
     req<any>(`/api/workspace/documents/${id}`, { method: 'DELETE' }),
   clearDocuments: (syncedOnly = false) =>
@@ -44,6 +47,8 @@ export const api = {
   listRuns: () => req<any[]>('/api/workspace/runs'),
   createRun: (payload: any) =>
     req<any>('/api/workspace/runs', { method: 'POST', body: JSON.stringify(payload) }),
+  updateRunParserConfig: (runId: number, payload: any) =>
+    req<any>(`/api/workspace/runs/${runId}/parser-config`, { method: 'PUT', body: JSON.stringify(payload) }),
   deleteRun: (id: number) => req<any>(`/api/workspace/runs/${id}`, { method: 'DELETE' }),
   getRunDocuments: (runId: number) => req<any[]>(`/api/workspace/runs/${runId}/documents`),
   getRunParseStatus: (runId: number) => req<any>(`/api/workspace/runs/${runId}/parse-status`),
@@ -79,6 +84,11 @@ export const api = {
   listTestcases: () => req<any[]>('/api/retrieval/testcases'),
   createTestcase: (payload: any) =>
     req<any>('/api/retrieval/testcases', { method: 'POST', body: JSON.stringify(payload) }),
+  autoGenerateTestcases: (runId: number, perDoc = 3, replaceExisting = false, useLlm = false) =>
+    req<any>('/api/retrieval/testcases/auto-generate', {
+      method: 'POST',
+      body: JSON.stringify({ run_id: runId, per_doc: perDoc, replace_existing: replaceExisting, use_llm: useLlm }),
+    }),
   deleteTestcase: (id: number) => req<any>(`/api/retrieval/testcases/${id}`, { method: 'DELETE' }),
   listRetrievalRuns: (runId?: number) =>
     req<any[]>(`/api/retrieval/runs${runId ? `?run_id=${runId}` : ''}`),
@@ -101,5 +111,6 @@ export const api = {
   compareRuns: (baselineRrId: number, candidateRrId: number) =>
     req<any>(`/api/analytics/compare?baseline_rr_id=${baselineRrId}&candidate_rr_id=${candidateRrId}`),
   seedDemo: () => req<any>('/api/analytics/seed-demo', { method: 'POST' }),
+  seedCanonical: () => req<any>('/api/analytics/seed-canonical', { method: 'POST' }),
   exportXlsxUrl: (runId: number) => `/api/analytics/runs/${runId}/export-xlsx`,
 };

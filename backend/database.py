@@ -18,9 +18,10 @@ def utc_now() -> str:
 
 @contextmanager
 def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, timeout=10.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA busy_timeout = 5000;")
     try:
         yield conn
         conn.commit()
@@ -31,8 +32,37 @@ def get_db():
         conn.close()
 
 
+def repair_chunk_document_links(conn) -> int:
+    """
+    Chunks are keyed by (run_id, ragflow_chunk_id) and keep their ragflow_doc_id even when the
+    local document row is removed (ON DELETE SET NULL). Re-link them through run_documents so
+    parsing/chunking can find them again instead of silently losing every matched chunk.
+    """
+    cur = conn.execute(
+        """
+        UPDATE chunks
+           SET document_id = (
+               SELECT rd.document_id
+                 FROM run_documents rd
+                WHERE rd.run_id = chunks.run_id
+                  AND rd.ragflow_doc_id = chunks.ragflow_doc_id
+                LIMIT 1
+           )
+         WHERE (document_id IS NULL OR document_id NOT IN (SELECT id FROM documents))
+           AND ragflow_doc_id != ''
+           AND EXISTS (
+               SELECT 1 FROM run_documents rd
+                WHERE rd.run_id = chunks.run_id
+                  AND rd.ragflow_doc_id = chunks.ragflow_doc_id
+           )
+        """
+    )
+    return cur.rowcount
+
+
 def init_db():
     with get_db() as conn:
+        conn.execute("PRAGMA journal_mode = WAL;")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS settings (
@@ -218,6 +248,9 @@ def init_db():
                 "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
                 (k, v, now),
             )
+
+        # Self-heal snapshots produced by older versions (orphan chunks -> parsing/chunking empty).
+        repair_chunk_document_links(conn)
 
 
 def get_setting(key: str, default: str = "") -> str:
