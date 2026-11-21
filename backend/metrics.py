@@ -6,16 +6,10 @@ from rapidfuzz import fuzz
 
 
 PARSING_ERROR_CATALOG = [
-    {"code": "P1", "group": "Mất nội dung", "name": "Mất đoạn nội dung", "severity": "Nghiêm trọng", "metric": "Text Completeness"},
-    {"code": "P2", "group": "Mất nội dung", "name": "Nội dung trong ảnh không được đọc", "severity": "Nghiêm trọng", "metric": "Layout Accuracy"},
-    {"code": "P3", "group": "Sai thứ tự", "name": "Sai nội dung / sai thứ tự", "severity": "Nghiêm trọng", "metric": "Reading Order Accuracy"},
-    {"code": "P4", "group": "Lỗi ký tự", "name": "Mất dấu / lỗi ký tự", "severity": "Trung bình", "metric": "Character Error"},
-    {"code": "P5", "group": "Lỗi ký tự", "name": "Ký tự rác", "severity": "Trung bình", "metric": "Character Error"},
-    {"code": "P6", "group": "Lỗi ký tự", "name": "Lỗi OCR", "severity": "Trung bình", "metric": "Character Error"},
-    {"code": "P7", "group": "Mất cấu trúc", "name": "Heading bị dính vào đoạn văn", "severity": "Trung bình", "metric": "Text Completeness"},
-    {"code": "P8", "group": "Mất cấu trúc", "name": "Danh sách bị gộp", "severity": "Trung bình", "metric": "Text Completeness"},
-    {"code": "P9", "group": "Mất cấu trúc", "name": "Bảng bị vỡ cấu trúc", "severity": "Trung bình", "metric": "Table Accuracy"},
-    {"code": "P10", "group": "Mất nội dung", "name": "Mất số liệu trong bảng", "severity": "Nghiêm trọng", "metric": "Table Accuracy"},
+    {"code": "TEXT", "group": "Text Extraction", "name": "Thiếu chữ / Lỗi dấu & OCR", "severity": "Nghiêm trọng", "metric": "Text Extraction"},
+    {"code": "TABLE", "group": "Tabular Data", "name": "Vỡ cấu trúc bảng / Sai số liệu", "severity": "Nghiêm trọng", "metric": "Table Accuracy"},
+    {"code": "ORDER", "group": "Reading Order", "name": "Sai thứ tự đọc / Đảo cột", "severity": "Trung bình", "metric": "Reading Order"},
+    {"code": "LAYOUT", "group": "Layout & Media", "name": "Mất nội dung ảnh / Sơ đồ / Scan", "severity": "Nghiêm trọng", "metric": "Layout Accuracy"},
 ]
 
 CHUNKING_ERROR_CATALOG = [
@@ -134,16 +128,16 @@ def analyze_parsing_risks(
     exc_c = collapse_whitespace(excerpt)
 
     if not exc_c:
-        code = "P2" if unit_type in ("image", "diagram") else "P1"
+        code = "LAYOUT" if unit_type in ("image", "diagram") or "scan" in (format_group or "").lower() else "TEXT"
         flags.append({"code": "MISSING_CONTENT", "label": f"Không tìm thấy nội dung khớp ({code})", "severity": "Nghiêm trọng"})
         return flags, [code]
 
-    # P5: Garbage / corrupted characters
+    # Garbage / corrupted characters -> TEXT
     if re.search(r"[\ufffd\x00-\x08\x0b\x0c\x0e-\x1f]", exc_c):
-        flags.append({"code": "GARBAGE_CHAR", "label": "Phát hiện ký tự rác / lỗi mã hóa (P5)", "severity": "Trung bình"})
-        add_code("P5")
+        flags.append({"code": "GARBAGE_CHAR", "label": "Phát hiện ký tự rác / lỗi mã hóa (TEXT)", "severity": "Trung bình"})
+        add_code("TEXT")
 
-    # P4: Vietnamese diacritic loss/corruption
+    # Vietnamese diacritic loss/corruption -> TEXT
     has_diacritic_issue = False
     if src_c.lower() != exc_c.lower():
         acc_sim = float(fuzz.ratio(src_c.lower(), exc_c.lower()))
@@ -152,36 +146,36 @@ def analyze_parsing_risks(
             has_diacritic_issue = True
             flags.append({
                 "code": "DIACRITIC_LOSS",
-                "label": "Nghi mất dấu / sai dấu tiếng Việt (P4)",
+                "label": "Nghi mất dấu / sai dấu tiếng Việt (TEXT)",
                 "severity": "Trung bình",
             })
-            add_code("P4")
+            add_code("TEXT")
 
     # P6: OCR error for scan/image format group
     if ("scan" in (format_group or "").lower() or "ảnh" in (format_group or "").lower()) and (
         has_diacritic_issue or text_sim < 90.0
     ):
-        add_code("P6")
+        add_code("LAYOUT")
 
-    # P3: Scrambled reading order (high bag-of-words overlap, low sequential ratio)
+    # ORDER: Scrambled reading order (high bag-of-words overlap, low sequential ratio)
     if text_sim < 78.0:
         tok_set = float(fuzz.token_set_ratio(src_c.lower(), exc_c.lower()))
         if tok_set >= 85.0 and (tok_set - text_sim) >= 12.0:
             flags.append({
                 "code": "READING_ORDER_SCRAMBLED",
-                "label": "Nghi đảo thứ tự dòng / trộn cột (P3)",
+                "label": "Nghi đảo thứ tự dòng / trộn cột (ORDER)",
                 "severity": "Nghiêm trọng",
             })
-            add_code("P3")
+            add_code("ORDER")
 
-    # P10 (table) / P3 (text): Critical numeric / operator mismatch
+    # TABLE / TEXT: Critical numeric / operator mismatch
     src_nums = _extract_num_multiset(src_c)
     exc_nums = _extract_num_multiset(exc_c)
     if src_nums and src_nums != exc_nums:
         missing_nums = [k for k, v in src_nums.items() if exc_nums.get(k, 0) < v]
         if missing_nums:
             sample = ", ".join(missing_nums[:4])
-            err_code = "P10" if unit_type == "table" else "P3"
+            err_code = "TABLE" if unit_type == "table" else "TEXT"
             flags.append({
                 "code": "CRITICAL_NUM_DIFF",
                 "label": f"Lệch / mất số liệu: {sample} ({err_code})",
@@ -189,19 +183,19 @@ def analyze_parsing_risks(
             })
             add_code(err_code)
 
-    # P3: Critical negation / polarity flip
+    # TEXT: Critical negation / polarity flip
     src_low = src_c.lower()
     exc_low = exc_c.lower()
     diff_terms = [term for term in _NEGATION_TERMS if src_low.count(term) != exc_low.count(term)]
     if diff_terms:
         flags.append({
             "code": "CRITICAL_NEGATION_DIFF",
-            "label": f"Lệch từ phủ định/đối lập: {', '.join(diff_terms[:3])} (P3)",
+            "label": f"Lệch từ phủ định/đối lập: {', '.join(diff_terms[:3])} (TEXT)",
             "severity": "Nghiêm trọng",
         })
-        add_code("P3")
+        add_code("TEXT")
 
-    # P9: Table structure broken
+    # TABLE: Table structure broken
     if unit_type == "table":
         src_rows = [ln for ln in nfc(source_text).splitlines() if ln.strip()]
         exc_rows = [ln for ln in nfc(excerpt).splitlines() if ln.strip()]
@@ -212,29 +206,29 @@ def analyze_parsing_risks(
         if text_sim < 85.0 or row_mismatch or pipe_mismatch:
             flags.append({
                 "code": "TABLE_BROKEN",
-                "label": "Bảng nghi bị vỡ hàng/cột (P9)",
+                "label": "Bảng nghi bị vỡ hàng/cột (TABLE)",
                 "severity": "Trung bình",
             })
-            add_code("P9")
+            add_code("TABLE")
     else:
         src_lines = [ln.strip() for ln in nfc(source_text).splitlines() if ln.strip()]
         exc_lines = [ln.strip() for ln in nfc(excerpt).splitlines() if ln.strip()]
-        # P7: Heading merged into body paragraph
+        # Heading merged into body paragraph -> ORDER
         if len(src_lines) >= 2 and _HEADING_LINE_RE.match(src_lines[0]) and len(src_lines[0]) <= 110:
             if len(exc_lines) == 1 and len(exc_lines[0]) > len(src_lines[0]) + 25:
-                add_code("P7")
-        # P8: List merged
+                add_code("ORDER")
+        # List merged -> ORDER
         src_list_cnt = sum(1 for ln in src_lines if _LIST_LINE_RE.match(ln))
         exc_list_cnt = sum(1 for ln in exc_lines if _LIST_LINE_RE.match(ln))
         if src_list_cnt >= 2 and exc_list_cnt < src_list_cnt:
-            add_code("P8")
+            add_code("ORDER")
 
-    # P1 / P2: Severe missing content
+    # Severe missing content -> LAYOUT / TEXT
     if text_sim < 72.0:
-        if unit_type in ("image", "diagram"):
-            add_code("P2")
+        if unit_type in ("image", "diagram") or "scan" in (format_group or "").lower():
+            add_code("LAYOUT")
         elif unit_type != "table":
-            add_code("P1")
+            add_code("TEXT")
 
     return flags, suggested_codes
 
@@ -369,6 +363,12 @@ def analyze_chunk_rules(
         add("C8", "TOO_SHORT")
     elif n > max_chars and not is_intact_table:
         add("C8", "TOO_LONG")
+    noise_patterns = [
+        r"\btrang\s+\d+\s*/\s*\d+\b",
+        r"\bpage\s+\d+\s+of\s+\d+\b",
+        r"bản quyền|copyright|all rights reserved",
+        r"mục lục|table of contents",
+    ]
     has_rep_line = bool(repeated_lines and any(ln in repeated_lines for ln in lines))
     if has_rep_line or any(re.search(p, lower) for p in noise_patterns):
         add("C4", "SUSPECTED_NOISE")
@@ -557,17 +557,35 @@ def align_unit_to_chunks(
     if not src_tokens:
         return [], 0.0
 
+    # Cap string length passed to partial_ratio so huge tables (e.g. 50k-char Excel sheets)
+    # cannot hang O(N*M) DP alignment.
+    src_fuzzy = src_norm[:2000]
+    src_prefix = src_norm[:120]
+
     scored = []
     for ch in chunks:
-        c_norm = normalize_text(ch.get("content", ""))
+        c_norm = ch.get("_norm")
+        if c_norm is None:
+            c_norm = normalize_text(ch.get("content", ""))
+            ch["_norm"] = c_norm
         if not c_norm:
             continue
-        if src_norm[:120] in c_norm:
+        if src_prefix and src_prefix in c_norm:
             score = 0.99
         else:
-            pr = fuzz.partial_ratio(src_norm, c_norm) / 100.0
-            c_tokens = set(re.findall(r"\w+", c_norm))
-            overlap = len(src_tokens & c_tokens) / max(len(src_tokens), 1)
+            c_tokens = ch.get("_tokens")
+            if c_tokens is None:
+                c_tokens = set(re.findall(r"\w+", c_norm))
+                ch["_tokens"] = c_tokens
+            if not c_tokens:
+                continue
+            shared = len(src_tokens & c_tokens)
+            overlap = shared / max(len(src_tokens), 1)
+            contain = shared / max(min(len(src_tokens), len(c_tokens)), 1)
+            # Fast pre-filter: skip expensive partial_ratio when almost no tokens overlap
+            if contain < 0.15:
+                continue
+            pr = fuzz.partial_ratio(src_fuzzy, c_norm[:4000]) / 100.0
             score = round(max(pr * 0.7 + overlap * 0.3, overlap), 4)
         if score >= 0.45:
             scored.append((score, ch.get("ragflow_chunk_id", "")))

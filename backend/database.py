@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 import json
 import os
@@ -251,6 +252,19 @@ def init_db():
 
         # Self-heal snapshots produced by older versions (orphan chunks -> parsing/chunking empty).
         repair_chunk_document_links(conn)
+
+        # Ensure runs.account_key column exists so datasets are cleanly scoped per RAGFlow (base_url + api_key)
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+        if "account_key" not in cols:
+            conn.execute("ALTER TABLE runs ADD COLUMN account_key TEXT DEFAULT ''")
+
+
+def get_current_account_key() -> str:
+    base_url = get_setting("ragflow_base_url", "").strip().rstrip("/").lower()
+    api_key = get_setting("ragflow_api_key", "").strip()
+    if not base_url and not api_key:
+        return ""
+    return hashlib.sha256(f"{base_url}|{api_key}".encode("utf-8")).hexdigest()[:16]
 
 
 def get_setting(key: str, default: str = "") -> str:

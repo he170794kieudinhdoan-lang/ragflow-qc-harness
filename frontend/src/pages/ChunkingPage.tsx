@@ -251,7 +251,7 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextS
       <div className="px-5 py-2.5 border-b border-[#e8e8e6] bg-[#fafaf9] flex flex-wrap items-center justify-between gap-3 shrink-0">
         <div className="flex flex-wrap items-center gap-2">
           <select
-            className="ts-input py-1 text-xs"
+            className="ts-input py-1.5 px-2.5 text-xs rounded-md bg-white min-w-[200px]"
             value={docFilter}
             onChange={(e) => {
               setDocFilter(e.target.value);
@@ -265,13 +265,14 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextS
               </option>
             ))}
           </select>
+          <div className="h-4 w-px bg-[#e4e4e2] mx-0.5 hidden sm:block" />
           <div className="inline-flex items-center gap-1.5 text-xs text-[#71717a]">
             <span>Mẫu/file:</span>
             <input
               type="number"
               min={1}
               max={100}
-              className="ts-input py-1 w-14 font-mono text-center text-xs"
+              className="ts-input py-1.5 w-14 font-mono text-center text-xs rounded-md bg-white"
               value={perDoc}
               onChange={(e) => setPerDoc(Number(e.target.value))}
             />
@@ -279,52 +280,52 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextS
           <button
             onClick={handleAutoSample}
             disabled={sampling}
-            className="ts-btn-secondary py-1 text-xs disabled:opacity-45"
+            className="ts-btn-secondary py-1.5 px-2.5 text-xs rounded-md disabled:opacity-45"
           >
             {sampling ? <Loader2 className="size-3.5 animate-spin" /> : <Shuffle className="size-3.5" />}
             {sampling ? 'Đang quét...' : 'Lấy mẫu & Quét'}
           </button>
         </div>
 
-        <div className="flex flex-wrap items-center gap-3 text-xs text-[#52525b]">
-          <span title="Chunk Integrity (Phụ lục A)">
+        <div className="flex flex-wrap items-center gap-1.5 text-xs text-[#52525b]">
+          <span className="px-2 py-1 rounded-md bg-white border border-[#e4e4e2]" title="Chunk Integrity (Phụ lục A)">
             Trọn ý:{' '}
             <strong className="font-mono tabular-nums text-[#18181b]">
               {((metrics?.chunk_integrity || 0) * 100).toFixed(0)}%
             </strong>
           </span>
-          <span title="Context Sufficiency (Phụ lục A)">
+          <span className="px-2 py-1 rounded-md bg-white border border-[#e4e4e2]" title="Context Sufficiency (Phụ lục A)">
             Đủ nghĩa:{' '}
             <strong className="font-mono tabular-nums text-[#18181b]">
               {((metrics?.context_sufficiency || 0) * 100).toFixed(0)}%
             </strong>
           </span>
-          <span title="Noise Rate (Phụ lục A — càng thấp càng tốt)">
+          <span className="px-2 py-1 rounded-md bg-white border border-[#e4e4e2]" title="Noise Rate (Phụ lục A — càng thấp càng tốt)">
             Nhiễu:{' '}
             <strong className="font-mono tabular-nums text-[#b45309]">
               {((metrics?.noise_rate || 0) * 100).toFixed(0)}%
             </strong>
           </span>
-          <span title="Duplicate Rate (Phụ lục A — càng thấp càng tốt)">
+          <span className="px-2 py-1 rounded-md bg-white border border-[#e4e4e2]" title="Duplicate Rate (Phụ lục A — càng thấp càng tốt)">
             Trùng:{' '}
             <strong className="font-mono tabular-nums text-[#b45309]">
               {((metrics?.duplicate_rate || 0) * 100).toFixed(0)}%
             </strong>
           </span>
-          <span title="Size Compliance (Phụ lục A)">
+          <span className="px-2 py-1 rounded-md bg-white border border-[#e4e4e2]" title="Size Compliance (Phụ lục A)">
             Độ dài:{' '}
             <strong className="font-mono tabular-nums text-[#18181b]">
               {((metrics?.size_compliance ?? metrics?.valid_size_rate ?? 0) * 100).toFixed(0)}%
             </strong>
           </span>
-          <span title="Answer Containment (Phụ lục A — theo Golden Testcases)">
+          <span className="px-2 py-1 rounded-md bg-white border border-[#e4e4e2]" title="Answer Containment (Phụ lục A — theo Golden Testcases)">
             Trọn đáp án:{' '}
             <strong className="font-mono tabular-nums text-[#18181b]">
               {metrics?.testcase_count ? `${((metrics.answer_containment || 0) * 100).toFixed(0)}%` : '—'}
             </strong>
           </span>
           {onNextStep && (
-            <button onClick={onNextStep} className="ts-btn-primary py-1 text-xs ml-1">
+            <button onClick={onNextStep} className="ts-btn-primary py-1.5 px-3 text-xs rounded-md ml-1">
               Bước 4: Tìm kiếm
               <ArrowRight className="size-3.5" />
             </button>

@@ -47,6 +47,8 @@ export const api = {
   listRuns: () => req<any[]>('/api/workspace/runs'),
   createRun: (payload: any) =>
     req<any>('/api/workspace/runs', { method: 'POST', body: JSON.stringify(payload) }),
+  getRunParserConfig: (runId: number) =>
+    req<any>(`/api/workspace/runs/${runId}/parser-config`),
   updateRunParserConfig: (runId: number, payload: any) =>
     req<any>(`/api/workspace/runs/${runId}/parser-config`, { method: 'PUT', body: JSON.stringify(payload) }),
   deleteRun: (id: number) => req<any>(`/api/workspace/runs/${id}`, { method: 'DELETE' }),
@@ -56,6 +58,8 @@ export const api = {
     req<any>(`/api/workspace/runs/${runId}/sync-from-ragflow?pull_chunks=true`, { method: 'POST' }),
   uploadAndParseRun: (runId: number) =>
     req<any>(`/api/workspace/runs/${runId}/upload-and-parse`, { method: 'POST' }),
+  parseSingleDocument: (runId: number, docId: number) =>
+    req<any>(`/api/workspace/runs/${runId}/documents/${docId}/parse`, { method: 'POST' }),
 
   // Parsing
   listParsingUnits: (runId: number, docId?: number) =>
@@ -64,8 +68,17 @@ export const api = {
     req<any>(`/api/parsing/runs/${runId}/units`, { method: 'POST', body: JSON.stringify(payload) }),
   autoExtractUnits: (runId: number, docId: number) =>
     req<any>(`/api/parsing/runs/${runId}/documents/${docId}/auto-extract`, { method: 'POST' }),
+  reExtractRunUnits: (runId: number, maxUnits = 25) =>
+    req<any>(`/api/parsing/runs/${runId}/re-extract?max_units=${maxUnits}`, { method: 'POST' }),
   scoreParsingUnit: (unitId: number, payload: any) =>
     req<any>(`/api/parsing/units/${unitId}/score`, { method: 'PUT', body: JSON.stringify(payload) }),
+  bulkApproveParsingUnits: (runId: number, unitIds: number[]) =>
+    req<any>(`/api/parsing/runs/${runId}/bulk-approve-pass`, {
+      method: 'POST',
+      body: JSON.stringify({ unit_ids: unitIds }),
+    }),
+  visionOcrUnit: (unitId: number) =>
+    req<any>(`/api/parsing/units/${unitId}/vision-ocr`, { method: 'POST' }),
   getParsingMetrics: (runId: number) => req<any>(`/api/parsing/runs/${runId}/metrics`),
 
   // Chunking
@@ -108,6 +121,7 @@ export const api = {
 
   // Analytics & Demo
   getOverview: (runId: number) => req<any>(`/api/analytics/runs/${runId}/overview`),
+  getDiagnostics: (runId: number) => req<any>(`/api/analytics/runs/${runId}/diagnostics`),
   compareRuns: (baselineRrId: number, candidateRrId: number) =>
     req<any>(`/api/analytics/compare?baseline_rr_id=${baselineRrId}&candidate_rr_id=${candidateRrId}`),
   seedDemo: () => req<any>('/api/analytics/seed-demo', { method: 'POST' }),

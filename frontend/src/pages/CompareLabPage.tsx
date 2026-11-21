@@ -1,15 +1,28 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowDownRight, ArrowUpRight, GitCompare } from 'lucide-react';
+import { AlertTriangle, ArrowDownRight, ArrowUpRight, CheckCircle2, GitCompare } from 'lucide-react';
 import { api } from '../api/client';
-import { RetrievalRun } from '../types';
+import { RetrievalRun, RunItem } from '../types';
 
 const pct = (v: number) => `${(v * 100).toFixed(0)}%`;
 
-export const CompareLabPage: React.FC = () => {
+interface Props {
+  activeRun?: RunItem | null;
+}
+
+export const CompareLabPage: React.FC<Props> = ({ activeRun }) => {
   const [rrList, setRrList] = useState<RetrievalRun[]>([]);
   const [baseId, setBaseId] = useState<number | ''>('');
   const [candId, setCandId] = useState<number | ''>('');
   const [diff, setDiff] = useState<any>(null);
+  const [diag, setDiag] = useState<any>(null);
+
+  useEffect(() => {
+    if (!activeRun) {
+      setDiag(null);
+      return;
+    }
+    api.getDiagnostics(activeRun.id).then(setDiag).catch(() => setDiag(null));
+  }, [activeRun?.id]);
 
   useEffect(() => {
     api.listRetrievalRuns().then((list) => {
@@ -33,7 +46,67 @@ export const CompareLabPage: React.FC = () => {
   const deltaCc = bSum && cSum ? cSum.avg_context_coverage - bSum.avg_context_coverage : 0;
 
   return (
+    <div className="min-h-[calc(100dvh-48px)] bg-[#fefefe]">
     <div className="max-w-5xl mx-auto px-8 py-8 space-y-6">
+      {/* 3-Layer Diagnostic Summary & Auto-Recommendations */}
+      {diag && (
+        <div className="border border-[#e6e4de] rounded-xl shadow-xs bg-white p-5 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-[#dedede]">
+            <div>
+              <div className="ts-eyebrow">BÁO CÁO TỔNG KẾT & CHẨN ĐOÁN 3 TẦNG</div>
+              <h2 className="text-base font-semibold text-[#161616] mt-0.5">
+                Phiên: {diag.run_name}
+              </h2>
+            </div>
+            <div className="flex flex-wrap items-center gap-3 font-mono text-xs">
+              <span className="px-2 py-0.5 border border-[#dedede] bg-[#f7f7f6]">
+                Parsing: <strong>{pct(diag.parsing?.text_completeness || 0)}</strong>
+              </span>
+              <span className="px-2 py-0.5 border border-[#dedede] bg-[#f7f7f6]">
+                Chunking: <strong>{pct(diag.chunking?.chunk_integrity || 0)}</strong>
+              </span>
+              <span className="px-2 py-0.5 border border-[#dedede] bg-[#f7f7f6]">
+                Retrieval: <strong>{diag.retrieval ? pct(diag.retrieval.avg_contextual_precision || 0) : '—'}</strong>
+              </span>
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            {(diag.recommendations || []).map((rec: any, idx: number) => (
+              <div
+                key={idx}
+                className={`p-3 border text-xs flex items-start gap-2.5 ${
+                  rec.severity === 'high'
+                    ? 'bg-[#fef2f2] border-[#fecaca]'
+                    : rec.severity === 'medium'
+                    ? 'bg-[#fffbeb] border-[#fde68a]'
+                    : 'bg-[#f2fbf6] border-[#03aa5c]/35'
+                }`}
+              >
+                {rec.severity === 'ok' ? (
+                  <CheckCircle2 className="size-4 text-[#03aa5c] shrink-0 mt-0.5" />
+                ) : (
+                  <AlertTriangle
+                    className={`size-4 shrink-0 mt-0.5 ${
+                      rec.severity === 'high' ? 'text-[#cf222e]' : 'text-[#b45309]'
+                    }`}
+                  />
+                )}
+                <div className="space-y-0.5 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-[10px] font-semibold px-1.5 py-0.5 bg-white border border-[#dedede] text-[#161616]">
+                      {rec.layer}
+                    </span>
+                    <span className="font-semibold text-[#161616]">{rec.title}</span>
+                  </div>
+                  <p className="text-[#3d3d3d] leading-relaxed">{rec.action}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <div className="ts-eyebrow">A/B EXPERIMENT LAB</div>
@@ -76,7 +149,7 @@ export const CompareLabPage: React.FC = () => {
       ) : (
         <>
           {/* Architectural 4-Column Metric Strip */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 border border-[#e6e6e3] rounded-[4px] divide-y sm:divide-y-0 sm:divide-x divide-[#e6e6e3] bg-[#fafaf9]">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 border border-[#e4e4e2] rounded-lg overflow-hidden divide-y sm:divide-y-0 sm:divide-x divide-[#e4e4e2] bg-white shadow-2xs">
             <div className="p-5">
               <div className="ts-eyebrow">XẾP ĐÚNG LÊN ĐẦU</div>
               <div className="mt-2 flex items-baseline gap-2 font-mono tabular-nums">
@@ -84,8 +157,14 @@ export const CompareLabPage: React.FC = () => {
                 <span className="text-[#a1a1aa]">→</span>
                 <span className="text-2xl font-semibold text-[#18181b]">{pct(cSum.avg_contextual_precision)}</span>
               </div>
-              <div className={`text-xs font-mono mt-1 ${deltaCp >= 0 ? 'text-emerald-700' : 'text-rose-600'}`}>
-                {deltaCp >= 0 ? `+${pct(deltaCp)} tốt hơn` : `${pct(deltaCp)} thấp hơn`}
+              <div className="mt-1.5">
+                <span
+                  className={`inline-block text-[11px] font-mono font-medium px-2 py-0.5 rounded-full ${
+                    deltaCp >= 0 ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'
+                  }`}
+                >
+                  {deltaCp >= 0 ? `+${pct(deltaCp)} tốt hơn` : `${pct(deltaCp)} thấp hơn`}
+                </span>
               </div>
             </div>
 
@@ -96,8 +175,14 @@ export const CompareLabPage: React.FC = () => {
                 <span className="text-[#a1a1aa]">→</span>
                 <span className="text-2xl font-semibold text-[#18181b]">{pct(cSum.avg_context_coverage)}</span>
               </div>
-              <div className={`text-xs font-mono mt-1 ${deltaCc >= 0 ? 'text-emerald-700' : 'text-rose-600'}`}>
-                {deltaCc >= 0 ? `+${pct(deltaCc)}` : pct(deltaCc)}
+              <div className="mt-1.5">
+                <span
+                  className={`inline-block text-[11px] font-mono font-medium px-2 py-0.5 rounded-full ${
+                    deltaCc >= 0 ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'
+                  }`}
+                >
+                  {deltaCc >= 0 ? `+${pct(deltaCc)}` : pct(deltaCc)}
+                </span>
               </div>
             </div>
 
@@ -107,7 +192,7 @@ export const CompareLabPage: React.FC = () => {
                 <ArrowUpRight className="size-5" />
                 {diff.improvements_fail_to_pass.length}
               </div>
-              <div className="text-xs text-[#71717a] italic mt-1">Câu được cứu ở bản mới</div>
+              <div className="text-xs text-[#71717a] mt-1">Câu được cứu ở bản mới</div>
             </div>
 
             <div className="p-5">
@@ -116,28 +201,35 @@ export const CompareLabPage: React.FC = () => {
                 <ArrowDownRight className="size-5" />
                 {diff.regressions_pass_to_fail.length}
               </div>
-              <div className="text-xs text-[#71717a] italic mt-1">Câu bị tụt hạng</div>
+              <div className="text-xs text-[#71717a] mt-1">Câu bị tụt hạng</div>
             </div>
           </div>
 
           {/* Diff Lists */}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-            <div className="border border-[#e6e6e3] rounded-[4px] bg-white overflow-hidden">
-              <div className="px-4 py-3 border-b border-[#e6e6e3] bg-[#fafaf9] ts-eyebrow text-emerald-800">
-                CÁC CÂU CẢI THIỆN (FAIL → PASS)
+            <div className="border border-[#e4e4e2] rounded-lg bg-white overflow-hidden shadow-2xs">
+              <div className="px-4 py-3 border-b border-[#e4e4e2] bg-[#fafaf9] flex items-center justify-between">
+                <span className="ts-eyebrow text-emerald-800">CÁC CÂU CẢI THIỆN (FAIL → PASS)</span>
+                <span className="font-mono text-[11px] px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 font-semibold">
+                  {diff.improvements_fail_to_pass.length}
+                </span>
               </div>
               <DiffList rows={diff.improvements_fail_to_pass} />
             </div>
 
-            <div className="border border-[#e6e6e3] rounded-[4px] bg-white overflow-hidden">
-              <div className="px-4 py-3 border-b border-[#e6e6e3] bg-[#fafaf9] ts-eyebrow text-rose-800">
-                CÁC CÂU BỊ TỤT (PASS → FAIL)
+            <div className="border border-[#e4e4e2] rounded-lg bg-white overflow-hidden shadow-2xs">
+              <div className="px-4 py-3 border-b border-[#e4e4e2] bg-[#fafaf9] flex items-center justify-between">
+                <span className="ts-eyebrow text-rose-800">CÁC CÂU BỊ TỤT (PASS → FAIL)</span>
+                <span className="font-mono text-[11px] px-2 py-0.5 rounded-full bg-rose-50 text-rose-700 font-semibold">
+                  {diff.regressions_pass_to_fail.length}
+                </span>
               </div>
               <DiffList rows={diff.regressions_pass_to_fail} />
             </div>
           </div>
         </>
       )}
+    </div>
     </div>
   );
 };

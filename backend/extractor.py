@@ -150,7 +150,7 @@ def _extract_pdf(fp: str) -> List[ExtractedUnit]:
                     boxes.append(tbl.bbox)
                     rows = tbl.extract() or []
                     clean_rows = []
-                    for r in rows[:20]:
+                    for r in rows:
                         cells = [re.sub(r"\s+", " ", nfc(c or "")).strip() for c in r]
                         if any(cells):
                             clean_rows.append(" | ".join(cells))
@@ -219,7 +219,7 @@ def _extract_docx(fp: str) -> List[ExtractedUnit]:
     for t_idx, tbl in enumerate(d.tables, start=1):
         rows_txt = [
             " | ".join(re.sub(r"\s+", " ", nfc(c.text)).strip() for c in r.cells)
-            for r in tbl.rows[:20]
+            for r in tbl.rows
         ]
         rows_txt = [r for r in rows_txt if r.replace("|", "").strip()]
         if rows_txt:
@@ -244,7 +244,7 @@ def _extract_html(fp: str) -> List[ExtractedUnit]:
         if el.name == "table":
             tbl_idx += 1
             rows_txt = []
-            for tr in el.find_all("tr")[:20]:
+            for tr in el.find_all("tr"):
                 cells = [re.sub(r"\s+", " ", nfc(td.get_text(" ", strip=True))).strip() for td in tr.find_all(["th", "td"])]
                 if any(cells):
                     rows_txt.append(" | ".join(cells))
@@ -317,16 +317,54 @@ def _extract_markdown_or_text(fp: str) -> List[ExtractedUnit]:
     return units
 
 
+def _extract_excel(fp: str) -> List[ExtractedUnit]:
+    import openpyxl
+
+    wb = openpyxl.load_workbook(fp, data_only=True, read_only=True)
+    units: List[ExtractedUnit] = []
+    try:
+        for s_idx, sheet_name in enumerate(wb.sheetnames, start=1):
+            ws = wb[sheet_name]
+            rows_txt = []
+            for row in ws.iter_rows(values_only=True):
+                cells = [re.sub(r"\s+", " ", nfc(str(c if c is not None else ""))).strip() for c in row]
+                if any(cells):
+                    rows_txt.append(" | ".join(cells))
+            if len(rows_txt) >= 2:
+                units.append(("table", s_idx, f"Sheet {s_idx} · {sheet_name}", "\n".join(rows_txt)))
+    finally:
+        wb.close()
+    return units
+
+
+def _extract_csv(fp: str) -> List[ExtractedUnit]:
+    import csv
+
+    rows_txt = []
+    with open(fp, "r", encoding="utf-8-sig", errors="replace", newline="") as f:
+        for row in csv.reader(f):
+            cells = [re.sub(r"\s+", " ", nfc(c or "")).strip() for c in row]
+            if any(cells):
+                rows_txt.append(" | ".join(cells))
+    if len(rows_txt) >= 2:
+        return [("table", 1, "Bảng CSV", "\n".join(rows_txt))]
+    return []
+
+
 def extract_document_units(fp: str, max_units: int = 25) -> List[ExtractedUnit]:
     """
     Format-aware ground-truth extractor supporting PDF (tables + text via pdfplumber & PyMuPDF),
-    DOCX, HTML, PPTX, Markdown, and plain text, with stratified sampling across the whole document.
+    DOCX, XLSX, CSV, HTML, PPTX, Markdown, and plain text, with stratified sampling across the whole document.
     """
     ext = os.path.splitext(fp)[1].lower()
     if ext == ".pdf":
         raw_units = _extract_pdf(fp)
     elif ext == ".docx":
         raw_units = _extract_docx(fp)
+    elif ext in (".xlsx", ".xlsm"):
+        raw_units = _extract_excel(fp)
+    elif ext == ".csv":
+        raw_units = _extract_csv(fp)
     elif ext in (".html", ".htm"):
         raw_units = _extract_html(fp)
     elif ext == ".pptx":

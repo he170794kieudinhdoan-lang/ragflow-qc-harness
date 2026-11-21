@@ -1,10 +1,12 @@
+import asyncio
 import json
 import os
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from database import UPLOAD_DIR, get_db, get_setting, repair_chunk_document_links, utc_now, repair_chunk_document_links
+from database import UPLOAD_DIR, get_current_account_key, get_db, get_setting, repair_chunk_document_links, utc_now
 from ragflow_client import RAGFlowClient, RAGFlowError
 from metrics import detect_chunk_rule_flags
 from unit_sync import ensure_units_for_document_async
@@ -220,6 +222,19 @@ async def upload_documents_batch(
     return {"ok": True, "uploaded_count": len(created), "documents": created}
 
 
+@router.get("/documents/{doc_id}/file")
+def open_document_file(doc_id: int):
+    with get_db() as conn:
+        doc = conn.execute("SELECT filename, file_path FROM documents WHERE id = ?", (doc_id,)).fetchone()
+    if not doc or not doc["file_path"] or not os.path.exists(doc["file_path"]):
+        raise HTTPException(status_code=404, detail="Không tìm thấy file gốc trên máy chủ local.")
+    return FileResponse(
+        path=doc["file_path"],
+        filename=doc["filename"],
+        content_disposition_type="inline",
+    )
+
+
 @router.delete("/documents/{doc_id}")
 def delete_document(doc_id: int, run_id: Optional[int] = None):
     """
@@ -282,8 +297,15 @@ def clear_documents(synced_only: bool = False, run_id: Optional[int] = None):
 # ---------- Runs / Experiments ----------
 @router.get("/runs")
 def list_runs():
+    acct = get_current_account_key()
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM runs ORDER BY is_baseline DESC, id DESC").fetchall()
+        if acct:
+            rows = conn.execute(
+                "SELECT * FROM runs WHERE account_key = ? ORDER BY is_baseline DESC, id DESC",
+                (acct,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM runs ORDER BY is_baseline DESC, id DESC").fetchall()
         out = []
         for r in rows:
             d = dict(r)
@@ -325,14 +347,15 @@ async def create_run(payload: RunCreate):
         except RAGFlowError as e:
             raise HTTPException(status_code=400, detail=f"Tạo dataset trên RAGFlow thất bại: {e}")
 
+    acct = get_current_account_key()
     with get_db() as conn:
         if payload.is_baseline:
-            conn.execute("UPDATE runs SET is_baseline = 0")
+            conn.execute("UPDATE runs SET is_baseline = 0 WHERE account_key = ?", (acct,))
         try:
             cur = conn.execute(
                 """
-                INSERT INTO runs (name, description, is_baseline, ragflow_dataset_id, ragflow_dataset_name, parser_config, retrieval_config, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'READY', ?)
+                INSERT INTO runs (name, description, is_baseline, ragflow_dataset_id, ragflow_dataset_name, parser_config, retrieval_config, status, account_key, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?)
                 """,
                 (
                     run_name,
@@ -342,6 +365,7 @@ async def create_run(payload: RunCreate):
                     dataset_name,
                     json.dumps(payload.parser_config, ensure_ascii=False),
                     json.dumps(payload.retrieval_config, ensure_ascii=False),
+                    acct,
                     utc_now(),
                 ),
             )
@@ -353,9 +377,53 @@ async def create_run(payload: RunCreate):
 
 
 class RunParserConfigUpdate(BaseModel):
-    chunk_method: str = "naive"
+    chunk_method: str = "general"
     parser_config: Dict[str, Any] = {}
+    pagerank: Optional[int] = None
     sync_remote: bool = True
+
+
+@router.get("/runs/{run_id}/parser-config")
+async def get_run_parser_config(run_id: int):
+    with get_db() as conn:
+        run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if not run:
+            raise HTTPException(status_code=404, detail="Run không tồn tại")
+        dataset_id = run["ragflow_dataset_id"] or ""
+        local_cfg = json.loads(run["parser_config"] or "{}")
+
+    remote_ds = None
+    remote_error = ""
+    if dataset_id:
+        try:
+            client = _get_client()
+            remote_ds = await client.get_dataset(dataset_id)
+        except Exception as e:
+            remote_error = str(e)
+
+    if remote_ds and isinstance(remote_ds.get("parser_config"), dict):
+        pc = remote_ds["parser_config"]
+        parser_id = remote_ds.get("parser_id") or remote_ds.get("chunk_method") or "general"
+        pagerank = int(remote_ds.get("pagerank") or 0)
+        embedding_model = remote_ds.get("embedding_model") or ""
+        source = "ragflow"
+    else:
+        pc = local_cfg
+        parser_id = local_cfg.get("chunk_method") or "general"
+        pagerank = int(local_cfg.get("pagerank") or 0)
+        embedding_model = ""
+        source = "local"
+
+    return {
+        "ok": True,
+        "source": source,
+        "dataset_id": dataset_id,
+        "parser_id": parser_id,
+        "pagerank": pagerank,
+        "embedding_model": embedding_model,
+        "parser_config": pc,
+        "remote_error": remote_error,
+    }
 
 
 @router.put("/runs/{run_id}/parser-config")
@@ -366,23 +434,28 @@ async def update_run_parser_config(run_id: int, payload: RunParserConfigUpdate):
             raise HTTPException(status_code=404, detail="Run không tồn tại")
         dataset_id = run["ragflow_dataset_id"] or ""
 
-    stored_cfg = dict(payload.parser_config or {})
-    stored_cfg["chunk_method"] = payload.chunk_method or "naive"
+    remote_cfg = dict(payload.parser_config or {})
+    chunk_method = payload.chunk_method or "general"
 
     remote_synced = False
     remote_warning = ""
     if payload.sync_remote and dataset_id:
         try:
             client = _get_client()
-            remote_cfg = {k: v for k, v in stored_cfg.items() if k != "chunk_method"}
             await client.update_dataset(
                 dataset_id=dataset_id,
-                chunk_method=stored_cfg["chunk_method"],
+                chunk_method=chunk_method,
                 parser_config=remote_cfg,
+                pagerank=payload.pagerank,
             )
             remote_synced = True
         except Exception as e:
             remote_warning = str(e)
+
+    stored_cfg = dict(remote_cfg)
+    stored_cfg["chunk_method"] = chunk_method
+    if payload.pagerank is not None:
+        stored_cfg["pagerank"] = payload.pagerank
 
     with get_db() as conn:
         conn.execute(
@@ -448,6 +521,10 @@ STATUS_MAP = {
     "FAILED": "FAIL",
     "PENDING": "RUNNING",
     "QUEUED": "RUNNING",
+    "SCHEDULED": "RUNNING",
+    "IN_PROGRESS": "RUNNING",
+    "PROCESSING": "RUNNING",
+    "PARSING": "RUNNING",
 }
 
 
@@ -455,6 +532,8 @@ def _extract_remote_doc_meta(rdoc: Dict[str, Any]) -> Dict[str, Any]:
     raw_status = rdoc.get("ingestion_status") or rdoc.get("run") or "UNSTART"
     r_status = STATUS_MAP.get(str(raw_status).upper(), str(raw_status).upper())
     r_progress = float(rdoc.get("progress", 0) or 0)
+    if r_progress > 1.0:
+        r_progress = r_progress / 100.0
     r_chunk_cnt = int(rdoc.get("chunk_count", 0) or 0)
     r_token_cnt = int(rdoc.get("token_count", 0) or 0)
     r_dur = float(rdoc.get("process_duration", 0) or 0)
@@ -604,8 +683,46 @@ async def get_run_parse_status(run_id: int):
     }
 
 
+async def _bg_ensure_units(
+    run_id: int,
+    dataset_id: str,
+    client: RAGFlowClient,
+    docs_for_units: List[tuple],
+) -> None:
+    """Offloads heavy pdfplumber/PyMuPDF + RapidFuzz alignment in parallel worker threads."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    sem = asyncio.Semaphore(4)
+
+    async def _run_one(item: tuple) -> None:
+        local_doc_id, r_doc_id, doc_code, r_name, existing_fp = item
+        async with sem:
+            try:
+                await ensure_units_for_document_async(
+                    run_id,
+                    local_doc_id,
+                    r_doc_id,
+                    doc_code,
+                    r_name,
+                    existing_fp,
+                    client=client,
+                    dataset_id=dataset_id,
+                )
+            except Exception as e:
+                logger.warning("_bg_ensure_units failed for %s (%s): %s", doc_code, r_name, e)
+
+    if docs_for_units:
+        await asyncio.gather(*(_run_one(item) for item in docs_for_units))
+
+
 @router.post("/runs/{run_id}/sync-from-ragflow")
-async def sync_run_from_ragflow(run_id: int, pull_chunks: bool = True, force: bool = False):
+async def sync_run_from_ragflow(
+    run_id: int,
+    background_tasks: BackgroundTasks,
+    pull_chunks: bool = True,
+    force: bool = False,
+):
     """
     Pulls the document list and (optionally) the chunk snapshot of the linked RAGFlow dataset.
 
@@ -677,22 +794,30 @@ async def sync_run_from_ragflow(run_id: int, pull_chunks: bool = True, force: bo
             by_filename[r_name.lower()] = local_doc
         plan.append((meta, local_doc))
 
-    # ---- Phase 2: network I/O outside the SQLite write transaction ----
+    # ---- Phase 2: parallel network I/O outside the SQLite write transaction ----
     chunk_payloads: Dict[str, List[Dict[str, Any]]] = {}
     failed_docs: List[Dict[str, str]] = []
-    for meta, _local in plan:
+    sem = asyncio.Semaphore(5)
+
+    async def _fetch_doc_chunks(meta: Dict[str, Any]) -> None:
         r_doc_id = meta["ragflow_doc_id"]
-        needs_pull = (
+        async with sem:
+            try:
+                chunk_payloads[r_doc_id] = await client.list_all_chunks(dataset_id, r_doc_id)
+            except Exception as e:  # network / API error must be visible, never silently ignored
+                failed_docs.append({"name": meta["name"], "error": str(e)[:300]})
+
+    to_fetch = [
+        meta
+        for meta, _local in plan
+        if (
             pull_chunks
             and meta["status"] == "DONE"
-            and (force or local_chunk_counts.get(r_doc_id, 0) != meta["chunk_count"])
+            and (force or local_chunk_counts.get(meta["ragflow_doc_id"], 0) != meta["chunk_count"])
         )
-        if not needs_pull:
-            continue
-        try:
-            chunk_payloads[r_doc_id] = await client.list_all_chunks(dataset_id, r_doc_id)
-        except Exception as e:  # network / API error must be visible, never silently ignored
-            failed_docs.append({"name": meta["name"], "error": str(e)[:300]})
+    ]
+    if to_fetch:
+        await asyncio.gather(*(_fetch_doc_chunks(m) for m in to_fetch))
 
     # ---- Phase 3: single write transaction ----
     synced_docs = 0
@@ -826,35 +951,69 @@ async def sync_run_from_ragflow(run_id: int, pull_chunks: bool = True, force: bo
         repair_chunk_document_links(conn)
         conn.execute("UPDATE runs SET status = 'SYNCED' WHERE id = ?", (run_id,))
 
-    # ---- Phase 4: keep ground-truth units aligned with the fresh chunks ----
-    auto_extracted_units = 0
-    realigned_units = 0
-    for local_doc_id, r_doc_id, doc_code, r_name, existing_fp in docs_for_units:
-        try:
-            res = await ensure_units_for_document_async(
-                run_id,
-                local_doc_id,
-                r_doc_id,
-                doc_code,
-                r_name,
-                existing_fp,
-                client=client,
-                dataset_id=dataset_id,
-            )
-        except Exception:
-            continue
-        auto_extracted_units += res.get("extracted", 0)
-        realigned_units += res.get("realigned", 0)
+    # ---- Phase 4: offload ground-truth unit extraction/alignment to background ----
+    if docs_for_units:
+        background_tasks.add_task(_bg_ensure_units, run_id, dataset_id, client, docs_for_units)
 
     return {
         "ok": True,
         "synced_documents": synced_docs,
         "synced_chunks": synced_chunks,
-        "auto_extracted_units": auto_extracted_units,
-        "realigned_units": realigned_units,
+        "auto_extracted_units": 0,
+        "realigned_units": 0,
+        "units_syncing_in_background": bool(docs_for_units),
         "skipped_chunk_documents": skipped_chunk_docs,
         "failed_documents": failed_docs,
     }
+
+
+@router.post("/runs/{run_id}/documents/{doc_id}/parse")
+async def parse_single_document(run_id: int, doc_id: int):
+    """Triggers parsing for a single document on RAGFlow (mirrors RAGFlow per-file Play button)."""
+    client = _get_client()
+    with get_db() as conn:
+        run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if not run or not run["ragflow_dataset_id"]:
+            raise HTTPException(status_code=400, detail="Run chưa gắn RAGFlow Dataset ID")
+        dataset_id = run["ragflow_dataset_id"]
+        doc = conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Tài liệu không tồn tại")
+        rd = conn.execute(
+            "SELECT * FROM run_documents WHERE run_id = ? AND document_id = ?",
+            (run_id, doc_id),
+        ).fetchone()
+
+    ragflow_doc_id = rd["ragflow_doc_id"] if (rd and rd["ragflow_doc_id"]) else ""
+    if not ragflow_doc_id:
+        if not doc["file_path"] or not os.path.exists(doc["file_path"]):
+            raise HTTPException(status_code=400, detail="Không tìm thấy file gốc local để đẩy lên RAGFlow.")
+        with open(doc["file_path"], "rb") as f:
+            b = f.read()
+        res = await client.upload_document(dataset_id, doc["filename"], b)
+        if isinstance(res, list) and res and res[0].get("id"):
+            ragflow_doc_id = res[0]["id"]
+        elif isinstance(res, dict) and res.get("id"):
+            ragflow_doc_id = res["id"]
+        else:
+            raise HTTPException(status_code=400, detail="Upload file lên RAGFlow thất bại.")
+
+    await client.parse_documents(dataset_id, [ragflow_doc_id])
+    now = utc_now()
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO run_documents (run_id, document_id, ragflow_doc_id, parse_status, progress, chunk_count, token_count, parse_duration_sec, anomaly_flags, updated_at)
+            VALUES (?, ?, ?, 'RUNNING', 0, 0, 0, 0, '[]', ?)
+            ON CONFLICT(run_id, document_id) DO UPDATE SET
+                ragflow_doc_id=excluded.ragflow_doc_id,
+                parse_status='RUNNING',
+                progress=0,
+                updated_at=excluded.updated_at
+            """,
+            (run_id, doc_id, ragflow_doc_id, now),
+        )
+    return {"ok": True, "ragflow_doc_id": ragflow_doc_id}
 
 
 @router.post("/runs/{run_id}/upload-and-parse")
@@ -868,11 +1027,14 @@ async def upload_local_docs_and_parse(run_id: int):
         dataset_id = run["ragflow_dataset_id"]
         docs = conn.execute(
             """
-            SELECT d.*, rd.ragflow_doc_id AS linked_ragflow_doc_id
+            SELECT d.*, COALESCE(rd.ragflow_doc_id, '') AS linked_ragflow_doc_id
             FROM documents d
-            JOIN run_documents rd ON rd.document_id = d.id AND rd.run_id = ?
+            LEFT JOIN run_documents rd ON rd.document_id = d.id AND rd.run_id = ?
             WHERE d.file_path != ''
-              AND (rd.ragflow_doc_id = '' OR rd.parse_status = 'FAIL')
+              AND (
+                    (rd.id IS NOT NULL AND (rd.ragflow_doc_id = '' OR rd.parse_status = 'FAIL'))
+                 OR (rd.id IS NULL AND NOT EXISTS (SELECT 1 FROM run_documents rd2 WHERE rd2.document_id = d.id))
+              )
             ORDER BY d.doc_code
             """,
             (run_id,),

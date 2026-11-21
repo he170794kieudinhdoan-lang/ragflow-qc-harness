@@ -1,3 +1,4 @@
+import base64
 import json
 import re
 from typing import Any, Dict, Tuple
@@ -134,3 +135,54 @@ async def llm_judge_relevance(
     rel = 1 if int(data.get("relevant", 0)) == 1 else 0
     reason = str(data.get("reason", "")).strip()[:160]
     return rel, reason or ("LLM: Liên quan" if rel == 1 else "LLM: Không liên quan")
+
+
+async def llm_ocr_image(
+    base_url: str,
+    api_key: str,
+    model: str,
+    png_bytes: bytes,
+    timeout: float = 60.0,
+) -> str:
+    """Calls an OpenAI-compatible Vision LLM to transcribe a scanned PDF page into clean Vietnamese text."""
+    b64 = base64.b64encode(png_bytes).decode("ascii")
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if api_key.strip():
+        headers["Authorization"] = f"Bearer {api_key.strip()}"
+
+    body: Dict[str, Any] = {
+        "model": model.strip(),
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Bạn là công cụ OCR tiếng Việt chính xác cao. "
+                    "Hãy chép lại NGUYÊN VĂN toàn bộ chữ và số có trong ảnh trang tài liệu theo đúng thứ tự đọc. "
+                    "Giữ đúng dấu tiếng Việt; nếu có bảng biểu hãy trình bày dạng cột ngăn cách bởi dấu '|'. "
+                    "Chỉ trả về nội dung văn bản đã trích xuất, KHÔNG thêm lời giải thích hay markdown thừa."
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Trích xuất toàn bộ nội dung văn bản từ trang tài liệu này:"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                ],
+            },
+        ],
+        "temperature": 0.1,
+    }
+
+    client = get_shared_http_client()
+    r = await client.post(url, headers=headers, json=body, timeout=timeout)
+    if r.status_code >= 400:
+        raise LLMError(f"HTTP {r.status_code}: {r.text[:260]}")
+    payload = r.json()
+    choices = payload.get("choices") or []
+    if not choices:
+        raise LLMError("Vision LLM trả về phản hồi rỗng.")
+    text = str(choices[0].get("message", {}).get("content", "")).strip()
+    if not text:
+        raise LLMError("Vision LLM không trích xuất được văn bản.")
+    return text

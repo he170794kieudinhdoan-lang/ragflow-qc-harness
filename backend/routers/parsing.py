@@ -1,5 +1,6 @@
 import json
 import os
+from functools import lru_cache
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
@@ -7,11 +8,37 @@ from pydantic import BaseModel
 
 from database import UPLOAD_DIR, get_db, get_setting, repair_chunk_document_links, utc_now
 from ragflow_client import RAGFlowClient, RAGFlowError
+from llm_client import LLMError, llm_ocr_image
 from metrics import align_unit_to_chunks, extract_best_aligned_span_with_stitching, nfc
 from extractor import extract_document_units
 from unit_sync import realign_units, units_need_realign
 
 router = APIRouter(prefix="/api/parsing", tags=["parsing"])
+
+
+@lru_cache(maxsize=4096)
+def _cached_alignment(
+    source_text: str,
+    chunk_content: str,
+    prev_chunk_content: str,
+    prev_chunk_index: Optional[int],
+    next_chunk_content: str,
+    next_chunk_index: Optional[int],
+    unit_type: str,
+    format_group: str,
+):
+    # Cap huge source/chunk strings (e.g. 50k-char Excel sheets) so word-level
+    # SequenceMatcher alignment cannot hang the /units endpoint.
+    return extract_best_aligned_span_with_stitching(
+        source_text[:4000],
+        chunk_content[:6000],
+        prev_chunk_content=prev_chunk_content[:3000],
+        prev_chunk_index=prev_chunk_index,
+        next_chunk_content=next_chunk_content[:3000],
+        next_chunk_index=next_chunk_index,
+        unit_type=unit_type,
+        format_group=format_group,
+    )
 
 
 class ParsingUnitCreate(BaseModel):
@@ -33,11 +60,6 @@ class ParsingScoreUpdate(BaseModel):
 @router.get("/runs/{run_id}/units")
 def list_parsing_units(run_id: int, document_id: Optional[int] = None):
     with get_db() as conn:
-        # Heal snapshots where chunks arrived after the units were extracted (old behaviour froze
-        # matched_chunk_ids to [] and the parsing screen showed "không tìm thấy đoạn nào khớp").
-        if units_need_realign(conn, run_id):
-            realign_units(conn, run_id)
-
         q = """
             SELECT pu.*, d.doc_code, d.filename, d.format_group, d.file_path
             FROM parsing_units pu
@@ -97,12 +119,12 @@ def list_parsing_units(run_id: int, document_id: Optional[int] = None):
                     ch_item["content"] = nfc(ch_item["content"])
                     prev_ch = chunk_by_pos.get((ch_item["document_id"], ch_item["chunk_index"] - 1))
                     next_ch = chunk_by_pos.get((ch_item["document_id"], ch_item["chunk_index"] + 1))
-                    ch_item["alignment"] = extract_best_aligned_span_with_stitching(
+                    ch_item["alignment"] = _cached_alignment(
                         d["source_text"],
                         ch_item["content"],
-                        prev_chunk_content=nfc(prev_ch["content"]) if prev_ch else "",
-                        prev_chunk_index=prev_ch["chunk_index"] if prev_ch else None,
-                        next_chunk_content=nfc(next_ch["content"]) if next_ch else "",
+                        nfc(prev_ch["content"]) if prev_ch else "",
+                        prev_ch["chunk_index"] if prev_ch else None,
+                        nfc(next_ch["content"]) if next_ch else "",
                         next_chunk_index=next_ch["chunk_index"] if next_ch else None,
                         unit_type=d.get("unit_type", "text"),
                         format_group=d.get("format_group", ""),
@@ -137,6 +159,31 @@ def create_parsing_unit(run_id: int, payload: ParsingUnitCreate):
             ),
         )
         return {"ok": True, "id": cur.lastrowid, "matched_chunk_ids": matched_ids, "match_score": score}
+
+
+@router.post("/runs/{run_id}/re-extract")
+async def re_extract_run_units(run_id: int, max_units: int = 25):
+    """Re-extracts parsing_units for all documents in `run_id` with a custom `max_units` per document."""
+    max_units = max(1, min(max_units, 200))
+    with get_db() as conn:
+        docs = conn.execute(
+            """
+            SELECT DISTINCT d.id
+            FROM documents d
+            JOIN run_documents rd ON rd.document_id = d.id
+            WHERE rd.run_id = ?
+            ORDER BY d.doc_code
+            """,
+            (run_id,),
+        ).fetchall()
+    total_extracted = 0
+    for d in docs:
+        try:
+            res = await auto_extract_units(run_id, d["id"], max_units=max_units)
+            total_extracted += int(res.get("extracted_units", 0))
+        except Exception:
+            continue
+    return {"ok": True, "documents": len(docs), "extracted_units": total_extracted, "max_units": max_units}
 
 
 @router.post("/runs/{run_id}/documents/{document_id}/auto-extract")
@@ -227,6 +274,28 @@ async def auto_extract_units(run_id: int, document_id: int, max_units: int = 25)
         return {"ok": True, "extracted_units": len(extracted), "downloaded_from_ragflow": downloaded}
 
 
+class BulkApprovePayload(BaseModel):
+    unit_ids: List[int]
+
+
+@router.post("/runs/{run_id}/bulk-approve-pass")
+def bulk_approve_pass(run_id: int, payload: BulkApprovePayload):
+    if not payload.unit_ids:
+        return {"ok": True, "updated": 0}
+    now = utc_now()
+    placeholders = ",".join("?" for _ in payload.unit_ids)
+    with get_db() as conn:
+        cur = conn.execute(
+            f"""
+            UPDATE parsing_units
+            SET verdict = 'PASS', error_codes = '[]', char_error = 0, severity = '', updated_at = ?
+            WHERE run_id = ? AND id IN ({placeholders})
+            """,
+            [now, run_id, *payload.unit_ids],
+        )
+        return {"ok": True, "updated": cur.rowcount}
+
+
 @router.put("/units/{unit_id}/score")
 def score_parsing_unit(unit_id: int, payload: ParsingScoreUpdate):
     # Sync Character Error automatically if any Phụ lục B char-error code (P4, P5, P6) is tagged
@@ -250,6 +319,61 @@ def score_parsing_unit(unit_id: int, payload: ParsingScoreUpdate):
             ),
         )
     return {"ok": True}
+
+
+@router.post("/units/{unit_id}/vision-ocr")
+async def vision_ocr_unit(unit_id: int):
+    """Uses the configured Vision LLM to OCR a scanned PDF page as ground-truth source_text."""
+    llm_base = get_setting("llm_base_url", "").strip()
+    llm_key = get_setting("llm_api_key", "").strip()
+    llm_model = get_setting("llm_model", "").strip()
+    if not llm_base or not llm_model:
+        raise HTTPException(
+            status_code=400,
+            detail="Chưa cấu hình Vision LLM trong Cài đặt → LLM Chấm tự động (khuyên dùng Gemini / GPT-4o-mini / Qwen2.5-VL).",
+        )
+
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT pu.*, d.file_path
+            FROM parsing_units pu
+            JOIN documents d ON d.id = pu.document_id
+            WHERE pu.id = ?
+            """,
+            (unit_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Đoạn đối chiếu không tồn tại")
+    fp = row["file_path"]
+    if not fp or not os.path.exists(fp) or not fp.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Chỉ hỗ trợ Vision OCR cho tài liệu PDF có file gốc local.")
+
+    import fitz
+    pdf = fitz.open(fp)
+    idx = max(0, min((row["page_num"] or 1) - 1, len(pdf) - 1))
+    pix = pdf[idx].get_pixmap(dpi=150)
+    png_bytes = pix.tobytes("png")
+    pdf.close()
+
+    try:
+        ocr_text = await llm_ocr_image(llm_base, llm_key, llm_model, png_bytes)
+    except LLMError as e:
+        raise HTTPException(status_code=400, detail=f"Lỗi Vision LLM: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Không gọi được Vision LLM: {e}")
+
+    with get_db() as conn:
+        crows = conn.execute(
+            "SELECT ragflow_chunk_id, content FROM chunks WHERE run_id = ? AND document_id = ? ORDER BY chunk_index",
+            (row["run_id"], row["document_id"]),
+        ).fetchall()
+        matched_ids, score = align_unit_to_chunks(ocr_text, [dict(c) for c in crows])
+        conn.execute(
+            "UPDATE parsing_units SET source_text = ?, matched_chunk_ids = ?, match_score = ?, updated_at = ? WHERE id = ?",
+            (ocr_text, json.dumps(matched_ids), score, utc_now(), unit_id),
+        )
+    return {"ok": True, "source_text": ocr_text, "matched_chunk_ids": matched_ids, "match_score": score}
 
 
 @router.get("/documents/{document_id}/page/{page_num}")
@@ -284,22 +408,32 @@ def get_parsing_metrics(run_id: int):
         ).fetchall()
 
     rated = [r for r in rows if r["verdict"] != "UNRATED"]
-    text_units = [r for r in rated if r["unit_type"] not in ("table", "image", "diagram")]
     table_units = [r for r in rated if r["unit_type"] == "table"]
-    layout_units = [r for r in rated if r["unit_type"] in ("image", "diagram")]
 
-    text_pass = sum(1 for r in text_units if r["verdict"] == "PASS")
-    table_pass = sum(1 for r in table_units if r["verdict"] == "PASS")
-    layout_pass = sum(1 for r in layout_units if r["verdict"] == "PASS")
-
-    char_err = 0
+    # 1-to-1 OmniDocBench metrics (backward-compatible with legacy P1..P10 codes)
+    text_ok = 0
+    table_ok = 0
     order_ok = 0
+    layout_ok = 0
+    char_err = 0
+
     for r in rated:
-        codes = json.loads(r["error_codes"] or "[]")
-        if r["char_error"] == 1 or any(c in ("P4", "P5", "P6") for c in codes):
+        codes = set(json.loads(r["error_codes"] or "[]"))
+        has_text_err = bool(codes & {"TEXT", "P1", "P4", "P5", "P6", "P7", "P8"}) or r["char_error"] == 1
+        has_table_err = bool(codes & {"TABLE", "P9", "P10"})
+        has_order_err = bool(codes & {"ORDER", "P3"})
+        has_layout_err = bool(codes & {"LAYOUT", "P2"})
+
+        if not has_text_err:
+            text_ok += 1
+        else:
             char_err += 1
-        if "P3" not in codes:
+        if r["unit_type"] == "table" and not has_table_err:
+            table_ok += 1
+        if not has_order_err:
             order_ok += 1
+        if not has_layout_err:
+            layout_ok += 1
 
     by_group = {}
     for r in rated:
@@ -318,11 +452,11 @@ def get_parsing_metrics(run_id: int):
     return {
         "total_units": len(rows),
         "rated_units": len(rated),
-        "text_completeness": round(text_pass / len(text_units), 4) if text_units else 0.0,
-        "table_accuracy": round(table_pass / len(table_units), 4) if table_units else 0.0,
+        "text_completeness": round(text_ok / len(rated), 4) if rated else 0.0,
+        "table_accuracy": round(table_ok / len(table_units), 4) if table_units else 0.0,
         "character_error_rate": round(char_err / len(rated), 4) if rated else 0.0,
-        "layout_accuracy": round(layout_pass / len(layout_units), 4) if layout_units else 0.0,
-        "layout_total": len(layout_units),
+        "layout_accuracy": round(layout_ok / len(rated), 4) if rated else 0.0,
+        "layout_total": len(rated),
         "reading_order_accuracy": round(order_ok / len(rated), 4) if rated else 0.0,
         "by_format_group": by_group,
     }

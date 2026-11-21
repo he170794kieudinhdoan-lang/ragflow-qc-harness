@@ -5,10 +5,13 @@ import {
   ArrowRight,
   CheckCircle2,
   CloudDownload,
+  Download,
+  Eye,
   Loader2,
   Play,
   Plus,
   RefreshCw,
+  Search,
   Settings,
   SlidersHorizontal,
   Trash2,
@@ -17,6 +20,8 @@ import {
 } from 'lucide-react';
 import { api } from '../api/client';
 import { DocumentItem, RunDocumentItem, RunItem } from '../types';
+import { RagflowParserConfigModal } from '../components/RagflowParserConfigModal';
+import { DatasetFlowModal } from '../components/DatasetFlowModal';
 
 interface Props {
   activeRun: RunItem | null;
@@ -62,6 +67,11 @@ export const WorkspacePage: React.FC<Props> = ({
   const [polling, setPolling] = useState(false);
   const [parseErrors, setParseErrors] = useState<Record<number, string>>({});
   const pollBusyRef = useRef(false);
+  const pollingRef = useRef(false);
+  const updatePolling = (v: boolean) => {
+    pollingRef.current = v;
+    setPolling(v);
+  };
 
   const [showNewRun, setShowNewRun] = useState(false);
   const [showUpload, setShowUpload] = useState(false);
@@ -131,6 +141,7 @@ export const WorkspacePage: React.FC<Props> = ({
   const [upUrl, setUpUrl] = useState('');
   const [upFiles, setUpFiles] = useState<File[]>([]);
   const [dragOver, setDragOver] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
 
   const loadAll = async () => {
     const dRes = await api.listDocuments(activeRun?.id);
@@ -140,7 +151,9 @@ export const WorkspacePage: React.FC<Props> = ({
       const rd = await api.getRunDocuments(activeRun.id);
       setRunDocs(rd);
       if (rd.some((item: RunDocumentItem) => item.parse_status === 'RUNNING')) {
-        setPolling(true);
+        updatePolling(true);
+      } else {
+        updatePolling(false);
       }
     } else {
       setRunDocs([]);
@@ -154,43 +167,35 @@ export const WorkspacePage: React.FC<Props> = ({
     loadAll();
   }, [activeRun?.id, refreshKey]);
 
-  const checkParseStatus = async (autoSyncWhenDone: boolean) => {
+  const checkParseStatus = async (notifyWhenDone: boolean) => {
     if (!activeRun || pollBusyRef.current) return;
     pollBusyRef.current = true;
     try {
       const res = await api.getRunParseStatus(activeRun.id);
       setRunDocs(res.documents || []);
       setParseErrors(res.errors || {});
-      const dRes = await api.listDocuments(activeRun.id);
-      setDocs(dRes);
 
-      if (res.is_parsing) {
-        setPolling(true);
+      const anyRunning = Boolean(res.is_parsing) || (res.documents || []).some((d: RunDocumentItem) => d.parse_status === 'RUNNING');
+      if (anyRunning) {
+        updatePolling(true);
       } else {
-        setPolling(false);
-        if (autoSyncWhenDone) {
+        const wasPolling = pollingRef.current;
+        updatePolling(false);
+        if (notifyWhenDone && wasPolling) {
           const doneCount = res.counts?.done ?? 0;
           const failCount = res.counts?.failed ?? 0;
           if (doneCount > 0) {
-            setBusy('sync');
-            try {
-              const syncRes = await api.syncRunFromRagflow(activeRun.id);
-              await loadAll();
-              onReloadRuns();
-              const failSuffix = failCount > 0 ? ` (${failCount} file lỗi)` : '';
-              const msg = `Parse hoàn tất! Đã tự động đồng bộ ${syncRes.synced_documents} tài liệu và ${syncRes.synced_chunks} đoạn cắt${failSuffix}.`;
-              if (failCount === 0) toast.success(msg);
-              else toast.warning(msg);
-            } finally {
-              setBusy('');
-            }
+            const failSuffix = failCount > 0 ? ` (${failCount} file lỗi)` : '';
+            const msg = `Parse hoàn tất (${doneCount} file xong${failSuffix}). Bấm "Đồng bộ RAGFlow" để kéo chunks.`;
+            if (failCount === 0) toast.success(msg);
+            else toast.warning(msg);
           } else if (failCount > 0) {
             toast.error(`Parse thất bại (${failCount} file lỗi). Xem chi tiết lỗi ở cột Trạng thái.`);
           }
         }
       }
     } catch (err: any) {
-      setPolling(false);
+      updatePolling(false);
       toast.error(err.message);
     } finally {
       pollBusyRef.current = false;
@@ -200,8 +205,9 @@ export const WorkspacePage: React.FC<Props> = ({
   useEffect(() => {
     if (!polling || !activeRun) return;
     const timer = window.setInterval(() => {
+      if (!pollingRef.current) return;
       checkParseStatus(true);
-    }, 3000);
+    }, 4000);
     return () => window.clearInterval(timer);
   }, [polling, activeRun?.id]);
 
@@ -280,6 +286,19 @@ export const WorkspacePage: React.FC<Props> = ({
       setUpUrl('');
       setShowUpload(false);
       await loadAll();
+      // Automatically push & parse on RAGFlow if an active run with dataset_id is selected
+      if (activeRun?.ragflow_dataset_id) {
+        try {
+          const pushRes = await api.uploadAndParseRun(activeRun.id);
+          await loadAll();
+          if (pushRes.uploaded_and_triggered > 0) {
+            setPolling(true);
+            toast.info(`Đã tự động đẩy ${pushRes.uploaded_and_triggered} file lên RAGFlow và bắt đầu parse...`);
+          }
+        } catch (pushErr: any) {
+          toast.warning(`Đã lưu local nhưng chưa đẩy được lên RAGFlow: ${pushErr.message}`);
+        }
+      }
     } catch (err: any) {
       toast.error(err.message);
     } finally {
@@ -346,6 +365,7 @@ export const WorkspacePage: React.FC<Props> = ({
   const isLocked = !!busy || polling;
 
   return (
+    <div className="min-h-[calc(100dvh-48px)] bg-[#fefefe]">
     <div className="max-w-5xl mx-auto px-8 py-7 space-y-5">
       {/* Clean Page Header */}
       <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-[#ededeb]">
@@ -362,7 +382,7 @@ export const WorkspacePage: React.FC<Props> = ({
           {activeRun ? (
             <div className="flex flex-wrap items-center gap-2 text-xs text-[#78716c] mt-1">
               <span className="font-mono tabular-nums">
-                {activeRun.doc_count ?? 0} file · {activeRun.chunk_count ?? 0} đoạn
+                {activeRun.doc_count ?? 0} file · {activeRun.chunk_count ?? 0} chunk
               </span>
               <span>·</span>
               <button
@@ -429,29 +449,61 @@ export const WorkspacePage: React.FC<Props> = ({
       </div>
 
       {/* Unified Documents Workbench Card */}
-      <div className="border border-[#e6e6e3] rounded-[4px] overflow-hidden bg-white">
+      <div className="border border-[#e6e4de] rounded-xl overflow-hidden bg-white shadow-xs">
+        {/* Compact KPI Summary Strip */}
+        {docs.length > 0 && (
+          <div className="grid grid-cols-2 sm:grid-cols-4 border-b border-[#ededeb] divide-y sm:divide-y-0 sm:divide-x divide-[#ededeb] bg-white">
+            <div className="px-4 py-2.5">
+              <div className="text-[11px] text-[#71717a]">Tổng tài liệu</div>
+              <div className="text-base font-semibold font-mono tabular-nums text-[#18181b] mt-0.5">{docs.length}</div>
+            </div>
+            <div className="px-4 py-2.5">
+              <div className="text-[11px] text-[#71717a]">Đã parse xong</div>
+              <div className="text-base font-semibold font-mono tabular-nums text-emerald-700 mt-0.5">
+                {runDocs.filter((rd) => rd.parse_status === 'DONE').length}/{docs.length}
+              </div>
+            </div>
+            <div className="px-4 py-2.5">
+              <div className="text-[11px] text-[#71717a]">Tổng đoạn cắt (chunks)</div>
+              <div className="text-base font-semibold font-mono tabular-nums text-[#18181b] mt-0.5">
+                {runDocs.reduce((sum, rd) => sum + (rd.chunk_count || 0), 0)}
+              </div>
+            </div>
+            <div className="px-4 py-2.5">
+              <div className="text-[11px] text-[#71717a]">Có cảnh báo</div>
+              <div className="text-base font-semibold font-mono tabular-nums text-amber-600 mt-0.5">
+                {runDocs.filter((rd) => (rd.anomaly_flags?.length || 0) > 0 || rd.parse_status === 'FAIL').length}
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Single Crisp Action Toolbar */}
         <div className="px-4 py-3 border-b border-[#e6e6e3] bg-[#fafaf9] flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2.5">
             <span className="text-xs font-semibold text-[#18181b]">
               Danh sách tài liệu
             </span>
-            <span className="font-mono text-[11px] px-1.5 py-0.5 bg-[#ededeb] text-[#52525b] rounded-[3px] tabular-nums">
+            <span className="font-mono text-[11px] px-1.5 py-0.5 bg-[#ededeb] text-[#52525b] rounded-md tabular-nums">
               {docs.length}
             </span>
-            {polling && (
-              <span className="inline-flex items-center gap-1.5 text-[11px] text-amber-700 font-medium">
-                <Loader2 className="size-3 animate-spin" /> Đang theo dõi parse...
-              </span>
-            )}
             {busy === 'sync' && (
               <span className="inline-flex items-center gap-1.5 text-[11px] text-[#3f3f46] font-medium">
-                <Loader2 className="size-3 animate-spin" /> Đang đồng bộ & tự tách đoạn...
+                <Loader2 className="size-3 animate-spin" /> Đang đồng bộ...
               </span>
             )}
           </div>
 
           <div className="flex flex-wrap items-center gap-1.5">
+            <div className="flex items-center gap-1.5 bg-white border border-[#e4e4e2] focus-within:border-[#18181b] rounded-md px-2.5 py-1.5 w-48 transition-colors">
+              <Search className="size-3.5 text-[#a1a1aa] shrink-0" />
+              <input
+                className="w-full text-xs text-[#161616] placeholder:text-[#a1a1aa] focus:outline-none bg-transparent"
+                placeholder="Tìm file..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+              />
+            </div>
             <button
               onClick={() => setShowUpload(true)}
               disabled={isLocked}
@@ -475,12 +527,12 @@ export const WorkspacePage: React.FC<Props> = ({
                       : 'Đẩy các file mới lên RAGFlow và kích hoạt parse'
                   }
                 >
-                  {polling || busy === 'push' ? (
-                    <Loader2 className="size-3.5 animate-spin text-amber-600" />
+                  {busy === 'push' ? (
+                    <Loader2 className="size-3.5 animate-spin text-[#03aa5c]" />
                   ) : (
-                    <Play className="size-3.5 text-emerald-600" />
+                    <Play className="size-3.5 text-[#03aa5c]" />
                   )}
-                  {busy === 'push' ? 'Đang gửi...' : polling ? 'Đang parse...' : 'Đẩy & Parse'}
+                  {busy === 'push' ? 'Đang gửi...' : 'Đẩy & Parse'}
                 </button>
 
                 <button
@@ -504,7 +556,7 @@ export const WorkspacePage: React.FC<Props> = ({
                   title="Kiểm tra tiến độ parse hiện tại trên RAGFlow"
                   aria-label="Kiểm tra tiến độ"
                 >
-                  <RefreshCw className={`size-3.5 ${polling || busy === 'status' ? 'animate-spin text-amber-600' : ''}`} />
+                  <RefreshCw className={`size-3.5 ${busy === 'status' ? 'animate-spin text-[#03aa5c]' : ''}`} />
                 </button>
               </>
             )}
@@ -562,83 +614,148 @@ export const WorkspacePage: React.FC<Props> = ({
           <table className="w-full text-left text-[13px]">
             <thead>
               <tr className="border-b border-[#ededeb] text-[11px] font-mono text-[#78716c] bg-white">
-                <th className="py-2.5 px-4 font-medium w-20">MÃ</th>
+                <th className="py-2.5 px-4 font-medium w-16">MÃ</th>
                 <th className="py-2.5 px-3 font-medium">TÊN TÀI LIỆU</th>
-                <th className="py-2.5 px-3 font-medium w-40">ĐỊNH DẠNG</th>
-                <th className="py-2.5 px-3 font-medium w-48">TRẠNG THÁI</th>
-                <th className="py-2.5 px-3 font-medium text-right w-24">SỐ ĐOẠN</th>
-                <th className="py-2.5 px-4 font-medium text-right w-14"></th>
+                <th className="py-2.5 px-3 font-medium w-32">NGÀY TẢI</th>
+                <th className="py-2.5 px-3 font-medium w-20 text-right">CHUNKS</th>
+                <th className="py-2.5 px-3 font-medium w-44">PARSE</th>
+                <th className="py-2.5 px-4 font-medium text-right w-28">ACTION</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-[#f0f0ee]">
-              {docs.map((d) => {
+              {docs
+                .filter((d) => {
+                  const q = searchQuery.trim().toLowerCase();
+                  if (!q) return true;
+                  return d.filename.toLowerCase().includes(q) || d.doc_code.toLowerCase().includes(q);
+                })
+                .map((d) => {
                 const rd = runDocs.find((x) => x.document_id === d.id);
                 const status = rd?.parse_status || 'UNSTART';
+                const uploadDate = d.created_at ? d.created_at.replace('T', ' ').slice(0, 16) : '—';
                 return (
                   <tr key={d.id} className="hover:bg-[#fafaf9] group">
                     <td className="py-2.5 px-4 font-mono text-xs text-[#52525b]">{d.doc_code}</td>
                     <td className="py-2.5 px-3 font-medium text-[#18181b] max-w-xs truncate" title={d.filename}>
-                      {d.filename}
-                    </td>
-                    <td className="py-2.5 px-3">
-                      <span className="ts-tag-neutral font-sans">{d.format_group}</span>
-                    </td>
-                    <td className="py-2.5 px-3 text-xs">
-                      {status === 'DONE' ? (
-                        <span className="inline-flex items-center gap-1 text-emerald-700 font-medium">
-                          <CheckCircle2 className="size-3.5" /> Đã đọc xong
-                        </span>
-                      ) : status === 'RUNNING' ? (
-                        <div className="space-y-1">
-                          <span className="inline-flex items-center gap-1.5 text-amber-700 font-medium">
-                            <Loader2 className="size-3.5 animate-spin" />
-                            Đang parse {Math.round((rd?.progress || 0) * 100)}%
-                          </span>
-                          <div className="w-28 h-1.5 bg-[#ededeb] overflow-hidden">
-                            <div
-                              className="h-full bg-amber-500 transition-all duration-300"
-                              style={{ width: `${Math.max(8, Math.round((rd?.progress || 0) * 100))}%` }}
-                            />
-                          </div>
-                        </div>
-                      ) : status === 'FAIL' ? (
-                        <div className="space-y-0.5 max-w-[240px]">
-                          <span className="inline-flex items-center gap-1 text-rose-600 font-medium">
-                            <AlertCircle className="size-3.5 shrink-0" /> Lỗi đọc file
-                          </span>
-                          {parseErrors[d.id] && (
-                            <div className="text-[11px] text-rose-500 truncate" title={parseErrors[d.id]}>
-                              {parseErrors[d.id]}
-                            </div>
-                          )}
-                        </div>
+                      {d.file_path ? (
+                        <a
+                          href={`/api/workspace/documents/${d.id}/file`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="hover:text-[#03aa5c] hover:underline transition-colors"
+                          title={`Mở tài liệu: ${d.filename}`}
+                        >
+                          {d.filename}
+                        </a>
                       ) : (
-                        <span className="text-[#a1a1aa]">Chưa đồng bộ</span>
+                        d.filename
                       )}
+                    </td>
+                    <td className="py-2.5 px-3 font-mono text-[11px] text-[#71717a] tabular-nums">
+                      {uploadDate}
                     </td>
                     <td className="py-2.5 px-3 font-mono tabular-nums text-right text-[#18181b]">
                       {rd?.chunk_count ?? 0}
                     </td>
+                    <td className="py-2.5 px-3 text-xs">
+                      <div className="flex items-center gap-2">
+                        {status === 'DONE' ? (
+                          <span className="inline-flex items-center gap-1 text-emerald-700 font-medium">
+                            <CheckCircle2 className="size-3.5" /> Đã parse xong
+                          </span>
+                        ) : status === 'RUNNING' ? (
+                          <div className="space-y-1">
+                            <span className="inline-flex items-center gap-1.5 text-amber-700 font-medium">
+                              <span className="size-1.5 rounded-full bg-amber-500 animate-pulse" />
+                              Đang parse {Math.round((rd?.progress || 0) * 100)}%
+                            </span>
+                            <div className="w-24 h-1.5 bg-[#ededeb] overflow-hidden">
+                              <div
+                                className="h-full bg-amber-500 transition-all duration-300"
+                                style={{ width: `${Math.max(8, Math.round((rd?.progress || 0) * 100))}%` }}
+                              />
+                            </div>
+                          </div>
+                        ) : status === 'FAIL' ? (
+                          <div className="space-y-0.5 max-w-[180px]">
+                            <span className="inline-flex items-center gap-1 text-rose-600 font-medium">
+                              <AlertCircle className="size-3.5 shrink-0" /> Lỗi parse
+                            </span>
+                            {parseErrors[d.id] && (
+                              <div className="text-[11px] text-rose-500 truncate" title={parseErrors[d.id]}>
+                                {parseErrors[d.id]}
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <span className="text-[#a1a1aa]">Chưa parse</span>
+                        )}
+                      </div>
+                    </td>
                     <td className="py-2.5 px-4 text-right">
-                      <button
-                        disabled={isLocked}
-                        onClick={() =>
-                          setConfirmDialog({
-                            title: `Xóa tài liệu ${d.doc_code}?`,
-                            description: `Tài liệu "${d.filename}" sẽ bị xóa khỏi danh sách kiểm thử local.`,
-                            confirmLabel: 'Xóa tài liệu',
-                            onConfirm: async () => {
-                              await api.deleteDocument(d.id);
-                              await loadAll();
-                              toast.success(`Đã xóa tài liệu ${d.doc_code}.`);
-                            },
-                          })
-                        }
-                        aria-label="Xóa tài liệu"
-                        className="p-1 text-[#a1a1aa] hover:text-rose-600 rounded-[3px] opacity-60 group-hover:opacity-100 transition-opacity disabled:opacity-25 disabled:pointer-events-none"
-                      >
-                        <Trash2 className="size-3.5" />
-                      </button>
+                      <div className="inline-flex items-center gap-1">
+                        {activeRun && (
+                          <button
+                            disabled={isLocked || status === 'RUNNING'}
+                            onClick={async () => {
+                              try {
+                                await api.parseSingleDocument(activeRun.id, d.id);
+                                updatePolling(true);
+                                await checkParseStatus(false);
+                                toast.info(`Đang parse "${d.filename}" trên RAGFlow...`);
+                              } catch (err: any) {
+                                toast.error(err.message);
+                              }
+                            }}
+                            title="Chạy / chạy lại Parse cho file này"
+                            aria-label="Parse file này"
+                            className="p-1 text-[#71717a] hover:text-[#03aa5c] rounded-[3px] transition-colors disabled:opacity-25 disabled:pointer-events-none"
+                          >
+                            <Play className="size-3.5" />
+                          </button>
+                        )}
+                        {d.file_path && (
+                          <>
+                            <a
+                              href={`/api/workspace/documents/${d.id}/file`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              title="Xem trước file gốc"
+                              className="p-1 text-[#71717a] hover:text-[#161616] rounded-[3px] transition-colors"
+                            >
+                              <Eye className="size-3.5" />
+                            </a>
+                            <a
+                              href={`/api/workspace/documents/${d.id}/file`}
+                              download={d.filename}
+                              title="Tải xuống file gốc"
+                              className="p-1 text-[#71717a] hover:text-[#161616] rounded-[3px] transition-colors"
+                            >
+                              <Download className="size-3.5" />
+                            </a>
+                          </>
+                        )}
+                        <button
+                          disabled={isLocked}
+                          onClick={() =>
+                            setConfirmDialog({
+                              title: `Xóa tài liệu ${d.doc_code}?`,
+                              description: `Tài liệu "${d.filename}" sẽ bị xóa khỏi danh sách kiểm thử local.`,
+                              confirmLabel: 'Xóa tài liệu',
+                              onConfirm: async () => {
+                                await api.deleteDocument(d.id);
+                                await loadAll();
+                                toast.success(`Đã xóa tài liệu ${d.doc_code}.`);
+                              },
+                            })
+                          }
+                          aria-label="Xóa tài liệu"
+                          title="Xóa tài liệu"
+                          className="p-1 text-[#a1a1aa] hover:text-rose-600 rounded-[3px] transition-colors disabled:opacity-25 disabled:pointer-events-none"
+                        >
+                          <Trash2 className="size-3.5" />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 );
@@ -657,192 +774,24 @@ export const WorkspacePage: React.FC<Props> = ({
         </div>
       )}
 
-      {/* Modal: New Run */}
+      {/* Modal: 2-Step Dataset Picker & RAGFlow Create */}
       {showNewRun && (
-        <div className="fixed inset-0 z-50 bg-black/25 flex items-center justify-center p-4">
-          <form onSubmit={handleCreateRun} className="bg-white border border-[#e4e4e2] rounded-[6px] w-full max-w-md p-6 space-y-4 shadow-lg">
-            <div className="flex items-center justify-between">
-              <h2 className="text-base font-semibold text-[#18181b]">Tạo phiên kiểm thử mới</h2>
-              <button type="button" onClick={() => setShowNewRun(false)} aria-label="Đóng">
-                <X className="size-4 text-[#71717a]" />
-              </button>
-            </div>
-
-            {remoteDatasets.length > 0 && (
-              <div className="space-y-1.5">
-                <div className="text-xs text-[#71717a]">Dataset có sẵn trên RAGFlow (bấm để chọn):</div>
-                <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
-                  {remoteDatasets.map((ds: any) => (
-                    <button
-                      type="button"
-                      key={ds.id}
-                      onClick={() => {
-                        setRunDatasetId(ds.id);
-                        setRunName(ds.name);
-                        setRunCreateRemote(false);
-                      }}
-                      className="ts-tag-neutral hover:bg-[#eaeae7] cursor-pointer"
-                    >
-                      {ds.name}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            <div className="space-y-3">
-              <div>
-                <label className="block text-xs font-medium text-[#3f3f46] mb-1">Tên phiên</label>
-                <input
-                  className="ts-input w-full"
-                  placeholder="VD: Baseline_512"
-                  value={runName}
-                  onChange={(e) => setRunName(e.target.value)}
-                  required
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-[#3f3f46] mb-1">RAGFlow Dataset ID</label>
-                <input
-                  className="ts-input w-full font-mono text-xs"
-                  placeholder="Dán ID từ RAGFlow"
-                  value={runDatasetId}
-                  onChange={(e) => setRunDatasetId(e.target.value)}
-                  disabled={runCreateRemote}
-                />
-              </div>
-              <div className="flex items-center gap-4 text-xs text-[#3f3f46]">
-                <label className="flex items-center gap-1.5 cursor-pointer">
-                  <input type="checkbox" checked={runIsBase} onChange={(e) => setRunIsBase(e.target.checked)} />
-                  Đặt làm bản chuẩn
-                </label>
-                <label className="flex items-center gap-1.5 cursor-pointer">
-                  <input type="checkbox" checked={runCreateRemote} onChange={(e) => setRunCreateRemote(e.target.checked)} />
-                  Tạo Dataset mới trên RAGFlow
-                </label>
-              </div>
-              <div className="pt-2 border-t border-[#ededeb] space-y-2">
-                <div className="text-[11px] font-medium text-[#78716c]">Cấu hình Baseline Parsing</div>
-                <div className="grid grid-cols-2 gap-2.5">
-                  <div>
-                    <label className="block text-[11px] text-[#52525b] mb-1">Chunk method</label>
-                    <select className="ts-input w-full text-xs py-1" value={cfgMethod} onChange={(e) => setCfgMethod(e.target.value)}>
-                      {CHUNK_METHODS.map((m) => (
-                        <option key={m.id} value={m.id}>{m.label}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-[11px] text-[#52525b] mb-1">Chunk token size</label>
-                    <input
-                      type="number"
-                      min={64}
-                      max={4096}
-                      className="ts-input w-full font-mono text-xs py-1"
-                      value={cfgTokenNum}
-                      onChange={(e) => setCfgTokenNum(Number(e.target.value))}
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[11px] text-[#52525b] mb-1">Layout / OCR</label>
-                    <select className="ts-input w-full text-xs py-1" value={cfgLayout} onChange={(e) => setCfgLayout(e.target.value)}>
-                      <option value="DeepDOC">DeepDOC (OCR + bảng)</option>
-                      <option value="Plain Text">Plain Text (nhanh)</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-[11px] text-[#52525b] mb-1">Delimiter</label>
-                    <input
-                      className="ts-input w-full font-mono text-xs py-1"
-                      value={cfgDelimiter}
-                      onChange={(e) => setCfgDelimiter(e.target.value)}
-                    />
-                  </div>
-                </div>
-                <label className="flex items-center gap-1.5 text-xs text-[#3f3f46] cursor-pointer">
-                  <input type="checkbox" checked={cfgHtml4Excel} onChange={(e) => setCfgHtml4Excel(e.target.checked)} />
-                  Chuyển Excel sang HTML (html4excel)
-                </label>
-              </div>
-            </div>
-
-            <div className="flex justify-end gap-2 pt-2 border-t border-[#ededeb]">
-              <button type="button" onClick={() => setShowNewRun(false)} className="ts-btn-secondary">Hủy</button>
-              <button type="submit" disabled={!!busy} className="ts-btn-primary">Tạo phiên</button>
-            </div>
-          </form>
-        </div>
+        <DatasetFlowModal
+          onClose={() => setShowNewRun(false)}
+          onCreated={(created) => {
+            onSelectRun(created);
+            onReloadRuns(created.id);
+          }}
+        />
       )}
 
-      {/* Modal: Edit Parser Config */}
+      {/* Modal: Full RAGFlow Dataset Configuration */}
       {showParserCfg && activeRun && (
-        <div className="fixed inset-0 z-50 bg-black/25 flex items-center justify-center p-4">
-          <form onSubmit={handleSaveParserConfig} className="bg-white border border-[#e4e4e2] rounded-[6px] w-full max-w-md p-6 space-y-4 shadow-lg">
-            <div className="flex items-center justify-between">
-              <div>
-                <h2 className="text-base font-semibold text-[#18181b]">Cấu hình Parsing</h2>
-                <p className="text-[11px] text-[#78716c] mt-0.5">
-                  Phiên "{activeRun.name}" · Tự đồng bộ lên Dataset trên RAGFlow
-                </p>
-              </div>
-              <button type="button" onClick={() => setShowParserCfg(false)} aria-label="Đóng">
-                <X className="size-4 text-[#71717a]" />
-              </button>
-            </div>
-
-            <div className="space-y-3">
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-medium text-[#3f3f46] mb-1">Chunk method</label>
-                  <select className="ts-input w-full text-xs" value={cfgMethod} onChange={(e) => setCfgMethod(e.target.value)}>
-                    {CHUNK_METHODS.map((m) => (
-                      <option key={m.id} value={m.id}>{m.label}</option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-[#3f3f46] mb-1">Chunk token size</label>
-                  <input
-                    type="number"
-                    min={64}
-                    max={4096}
-                    className="ts-input w-full font-mono text-xs"
-                    value={cfgTokenNum}
-                    onChange={(e) => setCfgTokenNum(Number(e.target.value))}
-                  />
-                </div>
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-medium text-[#3f3f46] mb-1">Layout / OCR</label>
-                  <select className="ts-input w-full text-xs" value={cfgLayout} onChange={(e) => setCfgLayout(e.target.value)}>
-                    <option value="DeepDOC">DeepDOC (OCR + bảng)</option>
-                    <option value="Plain Text">Plain Text (nhanh)</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-[#3f3f46] mb-1">Delimiter</label>
-                  <input
-                    className="ts-input w-full font-mono text-xs"
-                    value={cfgDelimiter}
-                    onChange={(e) => setCfgDelimiter(e.target.value)}
-                  />
-                </div>
-              </div>
-              <label className="flex items-center gap-2 text-xs text-[#3f3f46] cursor-pointer">
-                <input type="checkbox" checked={cfgHtml4Excel} onChange={(e) => setCfgHtml4Excel(e.target.checked)} />
-                Chuyển Excel sang HTML (html4excel)
-              </label>
-            </div>
-
-            <div className="flex justify-end gap-2 pt-2 border-t border-[#ededeb]">
-              <button type="button" onClick={() => setShowParserCfg(false)} className="ts-btn-secondary">Hủy</button>
-              <button type="submit" disabled={!!busy} className="ts-btn-primary">
-                {busy === 'parser_cfg' ? 'Đang lưu...' : 'Lưu & Đồng bộ RAGFlow'}
-              </button>
-            </div>
-          </form>
-        </div>
+        <RagflowParserConfigModal
+          run={activeRun}
+          onClose={() => setShowParserCfg(false)}
+          onSaved={() => onReloadRuns(activeRun.id)}
+        />
       )}
 
       {/* Modal: Upload Document (Single & Batch) */}
@@ -1036,6 +985,7 @@ export const WorkspacePage: React.FC<Props> = ({
           </div>
         </div>
       )}
+    </div>
     </div>
   );
 };

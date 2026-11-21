@@ -161,14 +161,7 @@ export const OverviewPage: React.FC<Props> = ({ activeRun, onStartWorkflow }) =>
         </p>
 
         {/* Raw Brutalist Technical Blueprint Pipeline Banner */}
-        <div
-          onClick={() => onStartWorkflow('full_pipeline')}
-          role="button"
-          tabIndex={0}
-          onKeyDown={(e) => e.key === 'Enter' && onStartWorkflow('full_pipeline')}
-          title="Bấm để bắt đầu luồng kiểm thử 3 tầng (A → Z)"
-          className="ts-editorial-banner border-2 border-[#161616] shadow-[4px_4px_0_#161616] hover:translate-x-[1px] hover:translate-y-[1px] hover:shadow-[3px_3px_0_#03aa5c] px-5 py-4 cursor-pointer transition-all overflow-hidden"
-        >
+        <div className="ts-editorial-banner border-2 border-[#161616] shadow-[4px_4px_0_#161616] hover:translate-x-[1px] hover:translate-y-[1px] hover:shadow-[3px_3px_0_#03aa5c] transition-all px-5 py-4 overflow-hidden select-none">
           <svg
             viewBox="0 0 820 120"
             className="w-full h-[100px] md:h-[116px] block"
@@ -181,81 +174,103 @@ export const OverviewPage: React.FC<Props> = ({ activeRun, onStartWorkflow }) =>
             <path d="M2 110 L2 118 L10 118" stroke="#161616" strokeWidth="1.5" />
             <path d="M810 118 L818 118 L818 110" stroke="#161616" strokeWidth="1.5" />
 
-            {/* Stage 01: DOCS */}
+            {/* Stage 01: DOCS — Stacked pages + laser scan sweep */}
             <g transform="translate(22, 18)">
               <rect x="4" y="4" width="142" height="82" fill="#161616" />
               <rect x="0" y="0" width="142" height="82" fill="#fefefe" stroke="#161616" strokeWidth="2" />
-              <rect x="0" y="0" width="26" height="18" fill="#161616" />
-              <text x="5" y="12.5" fill="#fefefe" fontSize="9.5" fontWeight="700" fontFamily="monospace">01</text>
-              <rect x="14" y="28" width="28" height="38" fill="#f2fbf6" stroke="#161616" strokeWidth="1.75" />
-              <line x1="19" y1="38" x2="37" y2="38" stroke="#161616" strokeWidth="1.5" />
-              <line x1="19" y1="46" x2="33" y2="46" stroke="#161616" strokeWidth="1.5" />
-              <line x1="19" y1="54" x2="36" y2="54" stroke="#161616" strokeWidth="1.5" />
-              <line x1="10" y1="33" x2="46" y2="33" stroke="#03aa5c" strokeWidth="2.2" className="ts-anim-scan" />
+              <rect x="128" y="6" width="6" height="6" fill="#03aa5c" className="ts-anim-pulse" />
+              {/* Back stacked page */}
+              <rect x="18" y="24" width="28" height="38" fill="#fefefe" stroke="#161616" strokeWidth="1.2" strokeDasharray="2 2" />
+              {/* Front page */}
+              <rect x="13" y="28" width="28" height="38" fill="#f2fbf6" stroke="#161616" strokeWidth="1.75" />
+              <line x1="18" y1="38" x2="36" y2="38" stroke="#161616" strokeWidth="1.5" />
+              <line x1="18" y1="46" x2="32" y2="46" stroke="#161616" strokeWidth="1.5" />
+              <line x1="18" y1="54" x2="35" y2="54" stroke="#161616" strokeWidth="1.5" />
+              {/* Animated scan beam + soft trail */}
+              <g className="ts-anim-scan">
+                <rect x="12" y="30" width="30" height="7" fill="#03aa5c" fillOpacity="0.22" />
+                <line x1="9" y1="33" x2="45" y2="33" stroke="#03aa5c" strokeWidth="2.2" />
+              </g>
               <text x="54" y="44" fill="#161616" fontSize="13" fontWeight="700" fontFamily="monospace">DOCS</text>
               <text x="54" y="60" fill="#52525b" fontSize="9.5" fontFamily="monospace">[PDF/DOCX]</text>
             </g>
 
-            {/* Connector 1 -> 2 */}
+            {/* Connector 1 -> 2 + traveling data packet */}
             <circle cx="170" cy="59" r="2.5" fill="#161616" />
             <line x1="173" y1="59" x2="229" y2="59" stroke="#161616" strokeWidth="1.6" className="ts-anim-flow" />
+            <rect y="56.5" width="7" height="5" fill="#03aa5c">
+              <animate attributeName="x" values="173;222" dur="1.5s" repeatCount="indefinite" />
+            </rect>
             <path d="M223 53.5 L229.5 59 L223 64.5" stroke="#03aa5c" strokeWidth="2" strokeLinecap="square" strokeLinejoin="miter" />
 
-            {/* Stage 02: PARSING */}
+            {/* Stage 02: PARSE — Sequential OCR row lock-on */}
             <g transform="translate(234, 18)">
               <rect x="4" y="4" width="150" height="82" fill="#161616" />
               <rect x="0" y="0" width="150" height="82" fill="#fefefe" stroke="#161616" strokeWidth="2" />
-              <rect x="0" y="0" width="26" height="18" fill="#03aa5c" />
-              <text x="5" y="12.5" fill="#fefefe" fontSize="9.5" fontWeight="700" fontFamily="monospace">02</text>
-              <rect x="14" y="28" width="32" height="40" fill="#fefefe" stroke="#161616" strokeWidth="1.75" />
-              <rect x="19" y="34" width="22" height="8" fill="#03aa5c" />
-              <rect x="19" y="46" width="22" height="7" fill="#161616" fillOpacity="0.2" />
-              <rect x="19" y="57" width="14" height="6" fill="#161616" />
+              <rect x="14" y="21" width="32" height="40" fill="#fefefe" stroke="#161616" strokeWidth="1.75" />
+              {/* Sequential OCR highlight blocks */}
+              <rect x="19" y="27" width="22" height="7" fill="#03aa5c" className="ts-anim-ocr-1" />
+              <rect x="19" y="38" width="22" height="7" fill="#03aa5c" className="ts-anim-ocr-2" />
+              <rect x="19" y="49" width="15" height="7" fill="#161616" className="ts-anim-ocr-3" />
               <text x="58" y="44" fill="#161616" fontSize="13" fontWeight="700" fontFamily="monospace">PARSE</text>
               <text x="58" y="60" fill="#027a42" fontSize="9.5" fontWeight="700" fontFamily="monospace">[OCR/TBL]</text>
             </g>
 
-            {/* Connector 2 -> 3 */}
+            {/* Connector 2 -> 3 + traveling data packet */}
             <circle cx="390" cy="59" r="2.5" fill="#161616" />
             <line x1="393" y1="59" x2="449" y2="59" stroke="#161616" strokeWidth="1.6" className="ts-anim-flow" />
+            <rect y="56.5" width="7" height="5" fill="#03aa5c">
+              <animate attributeName="x" values="393;442" dur="1.5s" begin="0.4s" repeatCount="indefinite" />
+            </rect>
             <path d="M443 53.5 L449.5 59 L443 64.5" stroke="#03aa5c" strokeWidth="2" strokeLinecap="square" strokeLinejoin="miter" />
 
-            {/* Stage 03: CHUNKS */}
+            {/* Stage 03: CHUNKS — Animated splitting isometric cube */}
             <g transform="translate(454, 18)">
               <rect x="4" y="4" width="150" height="82" fill="#161616" />
               <rect x="0" y="0" width="150" height="82" fill="#fefefe" stroke="#161616" strokeWidth="2" />
-              <rect x="0" y="0" width="26" height="18" fill="#161616" />
-              <text x="5" y="12.5" fill="#fefefe" fontSize="9.5" fontWeight="700" fontFamily="monospace">03</text>
+              {/* Base cube */}
               <polygon
-                points="32 26 48 35 48 53 32 62 16 53 16 35 32 26"
-                fill="#03aa5c"
-                fillOpacity="0.2"
+                points="16 38 32 47 48 38 48 55 32 64 16 55"
+                fill="#f2fbf6"
                 stroke="#161616"
-                strokeWidth="1.8"
+                strokeWidth="1.75"
               />
-              <line x1="32" y1="62" x2="32" y2="44" stroke="#161616" strokeWidth="1.6" />
-              <line x1="48" y1="35" x2="32" y2="44" stroke="#161616" strokeWidth="1.6" />
-              <line x1="16" y1="35" x2="32" y2="44" stroke="#161616" strokeWidth="1.6" />
-              <rect x="29.5" y="41.5" width="5" height="5" fill="#03aa5c" className="ts-anim-pulse" />
+              <line x1="32" y1="64" x2="32" y2="47" stroke="#161616" strokeWidth="1.6" />
+              {/* Glowing inner core */}
+              <rect x="29" y="41" width="6" height="6" fill="#03aa5c" className="ts-anim-pulse" />
+              {/* Animated lifting top cap */}
+              <g className="ts-anim-cube-top">
+                <polygon
+                  points="32 25 48 34 32 43 16 34"
+                  fill="#03aa5c"
+                  fillOpacity="0.28"
+                  stroke="#161616"
+                  strokeWidth="1.75"
+                />
+              </g>
               <text x="60" y="44" fill="#161616" fontSize="13" fontWeight="700" fontFamily="monospace">CHUNKS</text>
               <text x="60" y="60" fill="#52525b" fontSize="9.5" fontFamily="monospace">[SPLIT/QC]</text>
             </g>
 
-            {/* Connector 3 -> 4 */}
+            {/* Connector 3 -> 4 + traveling data packet */}
             <circle cx="610" cy="59" r="2.5" fill="#161616" />
             <line x1="613" y1="59" x2="663" y2="59" stroke="#161616" strokeWidth="1.6" className="ts-anim-flow" />
+            <rect y="56.5" width="7" height="5" fill="#03aa5c">
+              <animate attributeName="x" values="613;656" dur="1.5s" begin="0.8s" repeatCount="indefinite" />
+            </rect>
             <path d="M657 53.5 L663.5 59 L657 64.5" stroke="#03aa5c" strokeWidth="2" strokeLinecap="square" strokeLinejoin="miter" />
 
-            {/* Stage 04: TOP-K / A-B */}
+            {/* Stage 04: TOP-K / A-B — Live breathing ranking bars + blinking terminal cursor */}
             <g transform="translate(668, 18)">
               <rect x="4" y="4" width="128" height="82" fill="#03aa5c" />
               <rect x="0" y="0" width="128" height="82" fill="#161616" stroke="#161616" strokeWidth="2" />
-              <rect x="12" y="14" width="102" height="10" fill="#03aa5c" />
-              <rect x="12" y="30" width="78" height="10" fill="#fefefe" />
-              <rect x="12" y="46" width="52" height="10" fill="#71717a" />
+              <rect x="12" y="14" width="102" height="10" fill="#03aa5c" className="ts-anim-bar-1" />
+              <rect x="12" y="30" width="82" height="10" fill="#fefefe" className="ts-anim-bar-2" />
+              <rect x="12" y="46" width="58" height="10" fill="#71717a" className="ts-anim-bar-3" />
               <text x="12" y="72" fill="#03aa5c" fontSize="10" fontWeight="700" fontFamily="monospace">
                 &gt; TOP-K / A-B
               </text>
+              <rect x="101" y="63" width="6" height="10" fill="#03aa5c" className="ts-anim-blink" />
             </g>
           </svg>
         </div>

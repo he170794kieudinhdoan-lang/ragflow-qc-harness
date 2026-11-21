@@ -1,6 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { diffChars, diffWordsWithSpace } from 'diff';
-import { ArrowRight, BarChart3, ChevronLeft, ChevronRight, Loader2, Lock, Plus, X } from 'lucide-react';
+import { AlertCircle, ArrowRight, BarChart3, CheckCheck, ChevronLeft, ChevronRight, FileText, GripHorizontal, Image as ImageIcon, Layers, LayoutGrid, List, ListOrdered, Loader2, Lock, Maximize2, Minimize2, Plus, Sparkles, Table2, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { api } from '../api/client';
 import { DocumentItem, ErrorCodeDef, ParsingUnit, RunItem } from '../types';
@@ -12,7 +12,7 @@ interface Props {
   onProgressChange?: (rated: number, total: number) => void;
 }
 
-type ColorFilter = 'ALL' | 'PASS' | 'PARTIAL' | 'FAIL';
+type ColorFilter = 'ALL' | 'PASS' | 'FAIL';
 
 export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextStep, onProgressChange }) => {
   const [docs, setDocs] = useState<DocumentItem[]>([]);
@@ -21,6 +21,7 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
   const [selectedUnit, setSelectedUnit] = useState<ParsingUnit | null>(null);
   const [hoveredUnit, setHoveredUnit] = useState<ParsingUnit | null>(null);
   const [colorFilter, setColorFilter] = useState<ColorFilter>('ALL');
+  const [sidebarViewMode, setSidebarViewMode] = useState<'grid' | 'list'>('grid');
   const [metrics, setMetrics] = useState<any>(null);
   const [showAdd, setShowAdd] = useState(false);
 
@@ -40,14 +41,116 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
   const [charLevel, setCharLevel] = useState(false);
   const [showFullChunk, setShowFullChunk] = useState(false);
   const [showCharts, setShowCharts] = useState(false);
+  const [showErrPopover, setShowErrPopover] = useState(false);
+  const [bulkApproving, setBulkApproving] = useState(false);
+  const [ocrRunning, setOcrRunning] = useState(false);
+  const [samplePerDoc, setSamplePerDoc] = useState<number>(25);
+  const [reExtracting, setReExtracting] = useState(false);
 
-  const getUnitEffectiveState = (u: ParsingUnit): 'PASS' | 'PARTIAL' | 'FAIL' => {
-    if (u.verdict === 'PASS' || u.verdict === 'PARTIAL' || u.verdict === 'FAIL') return u.verdict;
+  const handleReExtract = async () => {
+    if (!activeRun || reExtracting) return;
+    setReExtracting(true);
+    try {
+      const res = await api.reExtractRunUnits(activeRun.id, samplePerDoc);
+      await load();
+      toast.success(`Đã tách lại ${res.extracted_units} đoạn (${samplePerDoc} đoạn/file).`);
+    } catch (e: any) {
+      toast.error(e.message);
+    } finally {
+      setReExtracting(false);
+    }
+  };
+
+  const handleVisionOcr = async () => {
+    if (!selectedUnit || ocrRunning) return;
+    setOcrRunning(true);
+    try {
+      await api.visionOcrUnit(selectedUnit.id);
+      await load();
+      toast.success(`Đã OCR bản chuẩn cho ${selectedUnit.doc_code} trang ${selectedUnit.page_num}.`);
+    } catch (e: any) {
+      toast.error(e.message);
+    } finally {
+      setOcrRunning(false);
+    }
+  };
+
+  // Draggable floating score popup position (bottom-right default)
+  const [popupPos, setPopupPos] = useState<{ x: number; y: number }>(() => ({
+    x: typeof window !== 'undefined' ? Math.max(24, window.innerWidth - 292) : 900,
+    y: typeof window !== 'undefined' ? Math.max(80, window.innerHeight - 280) : 420,
+  }));
+  const dragRef = useRef<{ startX: number; startY: number; origX: number; origY: number } | null>(null);
+
+  // Resizable split between top heatmap matrix and side-by-side detail panel
+  const [matrixHeight, setMatrixHeight] = useState<number>(130);
+  const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
+  const [matrixMinimized, setMatrixMinimized] = useState<boolean>(false);
+  const [matrixPopupPos, setMatrixPopupPos] = useState<{ x: number; y: number }>({ x: 24, y: 64 });
+  const matrixDragRef = useRef<{ startX: number; startY: number; origX: number; origY: number } | null>(null);
+
+  const onMatrixDragStart = (e: React.MouseEvent) => {
+    e.preventDefault();
+    matrixDragRef.current = { startX: e.clientX, startY: e.clientY, origX: matrixPopupPos.x, origY: matrixPopupPos.y };
+    const onMove = (ev: MouseEvent) => {
+      if (!matrixDragRef.current) return;
+      const nextX = Math.max(8, Math.min(window.innerWidth - 308, matrixDragRef.current.origX + (ev.clientX - matrixDragRef.current.startX)));
+      const nextY = Math.max(8, Math.min(window.innerHeight - 100, matrixDragRef.current.origY + (ev.clientY - matrixDragRef.current.startY)));
+      setMatrixPopupPos({ x: nextX, y: nextY });
+    };
+    const onUp = () => {
+      matrixDragRef.current = null;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+  const onResizeStart = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startY = e.clientY;
+    const origH = matrixHeight;
+    const onMove = (ev: MouseEvent) => {
+      const nextH = Math.max(48, Math.min(window.innerHeight - 240, origH + (ev.clientY - startY)));
+      setMatrixHeight(nextH);
+    };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  const onDragStart = (e: React.MouseEvent) => {
+    e.preventDefault();
+    dragRef.current = { startX: e.clientX, startY: e.clientY, origX: popupPos.x, origY: popupPos.y };
+    const onMove = (ev: MouseEvent) => {
+      if (!dragRef.current) return;
+      const dx = ev.clientX - dragRef.current.startX;
+      const dy = ev.clientY - dragRef.current.startY;
+      const nextX = Math.max(8, Math.min(window.innerWidth - 268, dragRef.current.origX + dx));
+      const nextY = Math.max(56, Math.min(window.innerHeight - 120, dragRef.current.origY + dy));
+      setPopupPos({ x: nextX, y: nextY });
+    };
+    const onUp = () => {
+      dragRef.current = null;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  const getUnitEffectiveState = (u: ParsingUnit): 'PASS' | 'FAIL' => {
+    if (u.verdict === 'PASS') return 'PASS';
+    if (u.verdict === 'FAIL' || u.verdict === 'PARTIAL') return 'FAIL';
     if (!u.matched_chunks || u.matched_chunks.length === 0) return 'FAIL';
-    return u.matched_chunks[0]?.alignment?.suggested_verdict || 'PARTIAL';
+    return u.matched_chunks[0]?.alignment?.suggested_verdict === 'PASS' ? 'PASS' : 'FAIL';
   };
 
   const filteredUnits = units.filter((u) => {
+    if (selectedDocId && u.document_id !== selectedDocId) return false;
     if (colorFilter === 'ALL') return true;
     return getUnitEffectiveState(u) === colorFilter;
   });
@@ -76,7 +179,7 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
     try {
       const [dRes, uRes, mRes] = await Promise.all([
         api.listDocuments(activeRun.id),
-        api.listParsingUnits(activeRun.id, selectedDocId),
+        api.listParsingUnits(activeRun.id),
         api.getParsingMetrics(activeRun.id),
       ]);
       setDocs(dRes);
@@ -103,18 +206,52 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
   };
 
   useEffect(() => {
+    setSelectedDocId(undefined);
     setSelectedUnit(null);
     setHoveredUnit(null);
     load();
-  }, [activeRun?.id, selectedDocId]);
+  }, [activeRun?.id]);
 
   const handleScore = async (verdict: 'PASS' | 'PARTIAL' | 'FAIL') => {
     if (!selectedUnit || scoring) return;
     setScoring(true);
+    setShowErrPopover(false);
     const savedCodes = verdict === 'PASS' ? [] : errCodes;
     const savedCharErr = verdict === 'PASS' ? false : charErr || savedCodes.some((c) => c === 'P4' || c === 'P5' || c === 'P6');
     const savedSeverity = verdict === 'FAIL' ? 'High' : verdict === 'PARTIAL' ? 'Medium' : '';
     const scoredId = selectedUnit.id;
+    const prevUnits = units;
+
+    // 1. Optimistic UI: đổi màu ô ngay lập tức và nhảy tới ô chưa chấm kế tiếp
+    const updatedUnits = units.map((u) =>
+      u.id === scoredId
+        ? { ...u, verdict, error_codes: savedCodes, char_error: savedCharErr ? 1 : 0, severity: savedSeverity, notes }
+        : u
+    );
+    setUnits(updatedUnits);
+    const ratedNow = updatedUnits.filter((u) => u.verdict !== 'UNRATED').length;
+    onProgressChange?.(ratedNow, updatedUnits.length);
+
+    const curIdx = filteredUnits.findIndex((u) => u.id === scoredId);
+    const remainingAfter = filteredUnits
+      .slice(curIdx + 1)
+      .map((f) => updatedUnits.find((u) => u.id === f.id) || f);
+    const remainingBefore = filteredUnits
+      .slice(0, Math.max(0, curIdx))
+      .map((f) => updatedUnits.find((u) => u.id === f.id) || f);
+    const nextUnrated =
+      remainingAfter.find((u) => u.verdict === 'UNRATED') ||
+      remainingBefore.find((u) => u.verdict === 'UNRATED') ||
+      remainingAfter[0] ||
+      null;
+
+    if (nextUnrated) {
+      selectUnit(nextUnrated);
+    } else {
+      setSelectedUnit(null);
+    }
+
+    // 2. Gọi API lưu nền (trong lúc chờ thì disable 3 nút chấm để tránh bấm đúp)
     try {
       await api.scoreParsingUnit(scoredId, {
         verdict,
@@ -123,31 +260,42 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
         severity: savedSeverity,
         notes,
       });
-      // Patch local state immediately instead of re-fetching & re-aligning all 125 units
-      const updatedUnits = units.map((u) =>
-        u.id === scoredId
-          ? { ...u, verdict, error_codes: savedCodes, char_error: savedCharErr ? 1 : 0, severity: savedSeverity, notes }
-          : u
-      );
-      setUnits(updatedUnits);
-      const ratedNow = updatedUnits.filter((u) => u.verdict !== 'UNRATED').length;
-      onProgressChange?.(ratedNow, updatedUnits.length);
-      const curIdx = filteredUnits.findIndex((u) => u.id === scoredId);
-      const nextFiltered = curIdx >= 0 && curIdx + 1 < filteredUnits.length ? filteredUnits[curIdx + 1] : null;
-      if (nextFiltered) {
-        const freshNext = updatedUnits.find((u) => u.id === nextFiltered.id) || nextFiltered;
-        selectUnit(freshNext);
-      } else {
-        setSelectedUnit(null);
-      }
-      // Refresh lightweight metrics in background (~5ms)
       if (activeRun) {
         api.getParsingMetrics(activeRun.id).then(setMetrics).catch(() => {});
       }
     } catch (e: any) {
-      toast.error(e.message);
+      setUnits(prevUnits);
+      onProgressChange?.(prevUnits.filter((u) => u.verdict !== 'UNRATED').length, prevUnits.length);
+      toast.error(`Lưu thất bại: ${e.message}`);
     } finally {
       setScoring(false);
+    }
+  };
+
+  const unratedGreenIds = units
+    .filter((u) => u.verdict === 'UNRATED' && getUnitEffectiveState(u) === 'PASS')
+    .map((u) => u.id);
+
+  const handleBulkApproveGreen = async () => {
+    if (!activeRun || bulkApproving || unratedGreenIds.length === 0) return;
+    setBulkApproving(true);
+    const prevUnits = units;
+    const idSet = new Set(unratedGreenIds);
+    const updatedUnits = units.map((u) =>
+      idSet.has(u.id) ? { ...u, verdict: 'PASS' as const, error_codes: [], char_error: 0, severity: '' } : u
+    );
+    setUnits(updatedUnits);
+    onProgressChange?.(updatedUnits.filter((u) => u.verdict !== 'UNRATED').length, updatedUnits.length);
+    try {
+      await api.bulkApproveParsingUnits(activeRun.id, unratedGreenIds);
+      api.getParsingMetrics(activeRun.id).then(setMetrics).catch(() => {});
+      toast.success(`Đã duyệt nhanh ${unratedGreenIds.length} ô xanh.`);
+    } catch (e: any) {
+      setUnits(prevUnits);
+      onProgressChange?.(prevUnits.filter((u) => u.verdict !== 'UNRATED').length, prevUnits.length);
+      toast.error(e.message);
+    } finally {
+      setBulkApproving(false);
     }
   };
 
@@ -175,15 +323,17 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
         } else if (e.key === '1') {
           handleScore('PASS');
         } else if (e.key === '2') {
-          handleScore('PARTIAL');
-        } else if (e.key === '3') {
+          if (showErrPopover) handleScore('FAIL');
+          else setShowErrPopover(true);
+        } else if (e.key === 'Enter' && showErrPopover) {
+          e.preventDefault();
           handleScore('FAIL');
         }
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [selectedUnit, filteredUnits, errCodes, charErr, notes, scoring]);
+  }, [selectedUnit, filteredUnits, errCodes, charErr, notes, scoring, showErrPopover]);
 
   if (!activeRun) {
     return <div className="p-8 text-sm text-[#71717a]">Hãy chọn hoặc tạo một phiên kiểm thử trước.</div>;
@@ -223,24 +373,21 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
   };
 
   const badge = (v: string) => {
-    if (v === 'PASS') return { text: 'Đúng', cls: 'bg-[#f0fdf4] text-[#15803d] border-[#bbf7d0]' };
-    if (v === 'PARTIAL') return { text: 'Thiếu 1 phần', cls: 'bg-[#fffbeb] text-[#b45309] border-[#fde68a]' };
-    if (v === 'FAIL') return { text: 'Sai', cls: 'bg-[#fef2f2] text-[#b91c1c] border-[#fecaca]' };
+    if (v === 'PASS') return { text: 'Đạt', cls: 'bg-[#f0fdf4] text-[#15803d] border-[#bbf7d0]' };
+    if (v === 'FAIL' || v === 'PARTIAL') return { text: 'Không đạt', cls: 'bg-[#fef2f2] text-[#b91c1c] border-[#fecaca]' };
     return { text: 'Chưa chấm', cls: 'bg-[#f4f4f2] text-[#71717a] border-[#e6e6e3]' };
   };
 
-  // TypeSafe-inspired crisp tiles: pale when unrated, solid & bold once confirmed
+  // Muted 2-level tones: pale pastel when unrated, calm medium saturation once confirmed
   const getTileClass = (u: ParsingUnit, isSelected: boolean) => {
     const sel = isSelected
       ? 'outline outline-2 outline-[#161616] outline-offset-1 z-10'
       : 'hover:opacity-85';
-    if (u.verdict === 'PASS') return `bg-[#03aa5c] ${sel}`;
-    if (u.verdict === 'PARTIAL') return `bg-[#d4a72c] ${sel}`;
-    if (u.verdict === 'FAIL') return `bg-[#cf222e] ${sel}`;
+    if (u.verdict === 'PASS') return `bg-[#4ea874] ${sel}`;
+    if (u.verdict === 'FAIL' || u.verdict === 'PARTIAL') return `bg-[#d6656c] ${sel}`;
     const auto = getUnitEffectiveState(u);
-    if (auto === 'PASS') return `bg-[#03aa5c]/30 ${sel}`;
-    if (auto === 'PARTIAL') return `bg-[#d4a72c]/35 ${sel}`;
-    return `bg-[#cf222e]/30 ${sel}`;
+    if (auto === 'PASS') return `bg-[#4ea874]/30 ${sel}`;
+    return `bg-[#d6656c]/30 ${sel}`;
   };
 
   const counts = units.reduce(
@@ -250,7 +397,7 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
       if (u.verdict === 'UNRATED') acc.UNRATED += 1;
       return acc;
     },
-    { PASS: 0, PARTIAL: 0, FAIL: 0, UNRATED: 0 }
+    { PASS: 0, FAIL: 0, UNRATED: 0 }
   );
 
   const groupedUnits = filteredUnits.reduce<
@@ -262,6 +409,65 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
     acc[u.doc_code].items.push(u);
     return acc;
   }, {});
+
+  const renderPipeTable = (rawText: string) => {
+    let cleaned = rawText || '';
+    if (/<t[dh]\b/i.test(cleaned)) {
+      cleaned = cleaned
+        .replace(/<\/t[dh]\s*>\s*<t[dh][^>]*>/gi, ' | ')
+        .replace(/<\/tr\s*>/gi, '\n')
+        .replace(/<br\s*\/?>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ');
+    }
+    const lines = cleaned
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l && !/^[\|\-\s:]+$/.test(l));
+    const pipeLines = lines.filter((l) => l.includes('|'));
+    if (pipeLines.length < 2) {
+      return <div className="whitespace-pre-wrap text-pretty">{rawText}</div>;
+    }
+    const rows = pipeLines.map((ln) =>
+      ln
+        .replace(/^\|/, '')
+        .replace(/\|$/, '')
+        .split('|')
+        .map((c) => c.trim())
+    );
+    const maxCols = Math.max(...rows.map((r) => r.length));
+    return (
+      <div className="max-h-[360px] overflow-auto border border-[#dedede] bg-white">
+        <table className="w-full text-left border-collapse text-[12px]">
+          <thead>
+            <tr className="bg-[#f7f7f6] border-b border-[#dedede]">
+              {Array.from({ length: maxCols }).map((_, ci) => (
+                <th
+                  key={ci}
+                  className="px-2.5 py-1.5 font-semibold text-[#161616] border-r border-[#ededeb] last:border-r-0 align-top"
+                >
+                  {rows[0][ci] ?? ''}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-[#ededeb]">
+            {rows.slice(1).map((r, ri) => (
+              <tr key={ri} className="hover:bg-[#fafaf9]">
+                {Array.from({ length: maxCols }).map((_, ci) => (
+                  <td
+                    key={ci}
+                    className="px-2.5 py-1.5 text-[#18181b] border-r border-[#ededeb] last:border-r-0 align-top"
+                  >
+                    {r[ci] ?? ''}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  };
 
   const renderDiffText = (sourceText: string, targetText: string) => {
     const src = checkFormat
@@ -307,18 +513,10 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
   const previewSim = previewUnit?.matched_chunks?.[0]?.alignment?.text_similarity;
   const previewFlags = previewUnit?.matched_chunks?.[0]?.alignment?.risk_flags || [];
 
-  // Visual analytics data (uses rated metrics when available, falls back to auto-alignment preview when unrated)
-  const isAutoPreview = (metrics?.rated_units || 0) === 0 && units.length > 0;
+  // Visual analytics data: always blends manual verdicts (for rated units) with auto-alignment (for unrated units)
+  // so metrics never jump to a misleading 100% after rating just 1-2 units.
+  const isAutoPreview = (metrics?.rated_units || 0) < units.length && units.length > 0;
   const effectiveMetrics = (() => {
-    if (!isAutoPreview) {
-      return {
-        textCompleteness: (metrics?.text_completeness || 0) * 100,
-        tableAccuracy: (metrics?.table_accuracy || 0) * 100,
-        charErrorRate: (metrics?.character_error_rate || 0) * 100,
-        layoutAccuracy: metrics?.layout_total ? (metrics.layout_accuracy || 0) * 100 : null,
-        readingOrder: metrics?.rated_units ? (metrics.reading_order_accuracy || 0) * 100 : null,
-      };
-    }
     const textU = units.filter((u) => u.unit_type !== 'table' && u.unit_type !== 'image' && u.unit_type !== 'diagram');
     const tableU = units.filter((u) => u.unit_type === 'table');
     const layoutU = units.filter((u) => u.unit_type === 'image' || u.unit_type === 'diagram');
@@ -326,13 +524,20 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
       u.verdict !== 'UNRATED'
         ? u.error_codes || []
         : u.matched_chunks?.[0]?.alignment?.suggested_error_codes || [];
-    const charErrCnt = units.filter((u) => getCodes(u).some((c) => c === 'P4' || c === 'P5' || c === 'P6')).length;
-    const orderOkCnt = units.filter((u) => !getCodes(u).includes('P3')).length;
+    const charErrCnt = units.filter((u) =>
+      getCodes(u).some((c) => c === 'P4' || c === 'P5' || c === 'P6' || c === 'TEXT')
+    ).length;
+    const orderOkCnt = units.filter((u) => !getCodes(u).some((c) => c === 'P3' || c === 'ORDER')).length;
+    const layoutOkCnt = units.filter((u) => !getCodes(u).some((c) => c === 'P2' || c === 'LAYOUT')).length;
     return {
-      textCompleteness: textU.length ? (textU.filter((u) => getUnitEffectiveState(u) === 'PASS').length / textU.length) * 100 : 0,
-      tableAccuracy: tableU.length ? (tableU.filter((u) => getUnitEffectiveState(u) === 'PASS').length / tableU.length) * 100 : 0,
+      textCompleteness: textU.length ? (textU.filter((u) => getUnitEffectiveState(u) === 'PASS').length / textU.length) * 100 : null,
+      tableAccuracy: tableU.length ? (tableU.filter((u) => getUnitEffectiveState(u) === 'PASS').length / tableU.length) * 100 : null,
       charErrorRate: units.length ? (charErrCnt / units.length) * 100 : 0,
-      layoutAccuracy: layoutU.length ? (layoutU.filter((u) => getUnitEffectiveState(u) === 'PASS').length / layoutU.length) * 100 : null,
+      layoutAccuracy: layoutU.length
+        ? (layoutU.filter((u) => getUnitEffectiveState(u) === 'PASS').length / layoutU.length) * 100
+        : units.length
+        ? (layoutOkCnt / units.length) * 100
+        : null,
       readingOrder: units.length ? (orderOkCnt / units.length) * 100 : null,
     };
   })();
@@ -370,7 +575,6 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
       }
       const st = getUnitEffectiveState(u);
       if (st === 'PASS') acc[u.doc_code].pass += 1;
-      else if (st === 'PARTIAL') acc[u.doc_code].partial += 1;
       else acc[u.doc_code].fail += 1;
       acc[u.doc_code].total += 1;
       return acc;
@@ -380,10 +584,10 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
   return (
     <div className="h-[calc(100dvh-48px)] flex flex-col bg-white">
       {/* Sub-header Toolbar */}
-      <div className="px-5 py-2.5 border-b border-[#e8e8e6] bg-[#fafaf9] flex flex-wrap items-center justify-between gap-3 shrink-0">
-        <div className="flex items-center gap-2">
+      <div className="px-5 py-1.5 border-b border-[#e8e8e6] bg-[#fafaf9] flex flex-wrap items-center justify-between gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-1.5">
           <select
-            className="ts-input py-1 text-xs"
+            className="ts-input py-1 px-2 text-xs rounded-md bg-white max-w-[200px]"
             value={selectedDocId ?? ''}
             onChange={(e) => setSelectedDocId(e.target.value ? Number(e.target.value) : undefined)}
             disabled={loading}
@@ -391,14 +595,38 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
             <option value="">Tất cả tài liệu ({docs.length})</option>
             {docs.map((d) => (
               <option key={d.id} value={d.id}>
-                {d.doc_code} — {d.filename.slice(0, 36)}
+                {d.doc_code} — {d.filename.slice(0, 32)}
               </option>
             ))}
           </select>
+
+          <div className="inline-flex items-center border border-[#e4e4e2] bg-white rounded-md overflow-hidden">
+            <select
+              className="py-1 px-2 text-xs bg-white text-[#18181b] focus:outline-none"
+              value={samplePerDoc}
+              onChange={(e) => setSamplePerDoc(Number(e.target.value))}
+              disabled={loading || reExtracting}
+              title="Số đoạn mẫu trích mỗi tài liệu"
+            >
+              <option value={5}>5 đoạn/file</option>
+              <option value={15}>15 đoạn/file</option>
+              <option value={25}>25 đoạn/file</option>
+              <option value={50}>50 đoạn/file</option>
+            </select>
+            <button
+              type="button"
+              onClick={handleReExtract}
+              disabled={loading || reExtracting}
+              className="px-2 py-1 text-xs font-medium bg-[#f7f7f6] hover:bg-[#ededeb] text-[#18181b] border-l border-[#e4e4e2] disabled:opacity-45 transition-colors"
+              title="Tách lại toàn bộ đoạn đối chiếu theo số mẫu đã chọn"
+            >
+              {reExtracting ? 'Đang tách...' : 'Tách lại'}
+            </button>
+          </div>
           <button
             onClick={() => setShowAdd(true)}
             disabled={loading}
-            className="ts-btn-secondary py-1 text-xs disabled:opacity-45"
+            className="ts-btn-ghost py-1 px-2 text-xs rounded-md disabled:opacity-45"
           >
             <Plus className="size-3.5" />
             Thêm đoạn
@@ -406,57 +634,22 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
           {loading && <Loader2 className="size-3.5 animate-spin text-[#71717a]" />}
         </div>
 
-        <div className="flex flex-wrap items-center gap-3 text-xs text-[#52525b]">
-          {[
-            { label: 'Đủ chữ', val: effectiveMetrics.textCompleteness, invert: false, tip: 'Text Completeness (Phụ lục A)' },
-            { label: 'Bảng', val: effectiveMetrics.tableAccuracy, invert: false, tip: 'Table Accuracy (Phụ lục A)' },
-            { label: 'Lỗi ký tự', val: effectiveMetrics.charErrorRate, invert: true, tip: 'Character Error (P4/P5/P6)' },
-            { label: 'Sơ đồ', val: effectiveMetrics.layoutAccuracy, invert: false, tip: 'Layout Accuracy (sơ đồ/ảnh)' },
-            { label: 'Thứ tự', val: effectiveMetrics.readingOrder, invert: false, tip: 'Reading Order (không bị P3)' },
-          ].map((m) => {
-            const hasVal = m.val !== null;
-            const pctVal = hasVal ? Math.max(0, Math.min(100, m.val as number)) : 0;
-            const barColor = !hasVal
-              ? 'bg-[#e4e4e2]'
-              : m.invert
-              ? pctVal <= 5
-                ? 'bg-[#2da44e]'
-                : pctVal <= 20
-                ? 'bg-[#d4a72c]'
-                : 'bg-[#cf222e]'
-              : pctVal >= 85
-              ? 'bg-[#2da44e]'
-              : pctVal >= 60
-              ? 'bg-[#d4a72c]'
-              : 'bg-[#cf222e]';
-            return (
-              <div key={m.label} title={`${m.tip}${isAutoPreview ? ' (ước tính tự động)' : ''}`} className="flex flex-col gap-0.5 min-w-[68px]">
-                <div className="flex items-baseline justify-between gap-1.5 text-[11px] leading-none">
-                  <span className="text-[#71717a]">{m.label}</span>
-                  <strong className={`font-mono tabular-nums ${m.invert && pctVal > 5 ? 'text-[#cf222e]' : 'text-[#18181b]'}`}>
-                    {hasVal ? `${pctVal.toFixed(0)}%` : '—'}
-                  </strong>
-                </div>
-                <div className="h-[3px] w-full bg-[#e6e6e3] overflow-hidden">
-                  <div
-                    className={`h-full transition-all duration-300 ${barColor}`}
-                    style={{ width: `${hasVal ? Math.max(pctVal, pctVal > 0 ? 6 : 0) : 0}%` }}
-                  />
-                </div>
-              </div>
-            );
-          })}
+        <div className="flex flex-wrap items-center gap-1.5 text-xs text-[#52525b]">
           <button
-            onClick={() => setShowCharts((v) => !v)}
-            className={`py-1 px-2 text-[11px] inline-flex items-center gap-1 border transition-colors ${
-              showCharts
-                ? 'bg-[#18181b] text-white border-[#18181b]'
-                : 'bg-white text-[#52525b] border-[#e4e4e2] hover:bg-[#f4f4f2]'
-            }`}
-            title="Mở/đóng biểu đồ chi tiết mã lỗi P1–P10 và theo từng tài liệu"
+            type="button"
+            disabled={loading || filteredUnits.length === 0}
+            onClick={() => {
+              const firstUnrated = filteredUnits.find((u) => u.verdict === 'UNRATED') || filteredUnits[0];
+              if (firstUnrated) {
+                selectUnit(firstUnrated);
+                setIsFullscreen(true);
+              }
+            }}
+            className="py-1 px-2.5 text-xs font-medium rounded-md inline-flex items-center gap-1.5 bg-[#18181b] text-white hover:bg-[#27272a] disabled:opacity-45 transition-colors"
+            title="Mở chế độ chấm toàn màn hình"
           >
-            <BarChart3 className="size-3" />
-            Chi tiết lỗi
+            <Maximize2 className="size-3" />
+            Chế độ chấm
           </button>
           {onNextStep && (() => {
             const ratedNow = units.filter((u) => u.verdict !== 'UNRATED').length;
@@ -470,92 +663,21 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
                     ? 'Sang Bước 3: Chấm cắt đoạn'
                     : `Cần chấm xong toàn bộ đoạn Parsing (${ratedNow}/${units.length}) để mở khóa Bước 3`
                 }
-                className="ts-btn-primary py-1 text-xs"
+                className="ts-btn-secondary py-1 px-2.5 text-xs rounded-md"
               >
                 {!isParsingComplete && <Lock className="size-3" />}
-                Bước 3: Cắt đoạn
-                {isParsingComplete && <ArrowRight className="size-3.5" />}
+                Bước 3
+                {isParsingComplete && <ArrowRight className="size-3" />}
               </button>
             );
           })()}
         </div>
       </div>
 
-      {/* Collapsible Compact Error Breakdown Drawer */}
-      {showCharts && units.length > 0 && (
-        <div className="px-5 py-2.5 border-b border-[#e8e8e6] bg-[#fafaf9] shrink-0">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            {/* Left: Compact P1-P10 Error Distribution */}
-            <div className="bg-white border border-[#e6e6e3] px-3 py-2 space-y-1.5">
-              <div className="flex items-center justify-between text-[11px]">
-                <span className="font-semibold text-[#18181b]">
-                  Phân bố mã lỗi (P1–P10)
-                  {isAutoPreview && <span className="ml-1.5 font-normal text-amber-700">· ước tính</span>}
-                </span>
-                <span className="font-mono text-[10px] text-[#78716c]">
-                  {errorCodeBreakdown.reduce((s, e) => s + e.count, 0)} lượt
-                </span>
-              </div>
-              {errorCodeBreakdown.length === 0 ? (
-                <div className="text-[11px] text-[#71717a] py-1">Chưa phát hiện mã lỗi nào.</div>
-              ) : (
-                <div className="space-y-1 max-h-24 overflow-y-auto pr-1">
-                  {errorCodeBreakdown.map((item) => (
-                    <div key={item.code} className="flex items-center gap-2 text-[11px]">
-                      <span className="font-mono font-semibold text-[#18181b] w-6 shrink-0">{item.code}</span>
-                      <span className="text-[#52525b] truncate w-36 shrink-0" title={item.name}>{item.name}</span>
-                      <div className="flex-1 h-1.5 bg-[#f4f4f2] overflow-hidden">
-                        <div
-                          className={`h-full ${item.severity === 'Nghiêm trọng' ? 'bg-[#cf222e]' : 'bg-[#d4a72c]'}`}
-                          style={{ width: `${Math.max(6, (item.count / maxErrCount) * 100)}%` }}
-                        />
-                      </div>
-                      <span className="font-mono tabular-nums text-[#18181b] w-6 text-right shrink-0">{item.count}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/* Right: Compact Per-Document Stacked Bar */}
-            <div className="bg-white border border-[#e6e6e3] px-3 py-2 space-y-1.5">
-              <div className="flex items-center justify-between text-[11px]">
-                <span className="font-semibold text-[#18181b]">Đúng / Thiếu / Sai theo file</span>
-                <span className="font-mono text-[10px] text-[#78716c]">{docBreakdown.length} file</span>
-              </div>
-              <div className="space-y-1 max-h-24 overflow-y-auto pr-1">
-                {docBreakdown.map((d) => {
-                  const pPct = (d.pass / d.total) * 100;
-                  const paPct = (d.partial / d.total) * 100;
-                  const fPct = (d.fail / d.total) * 100;
-                  return (
-                    <div key={d.doc_code} className="flex items-center gap-2 text-[11px]">
-                      <span className="font-mono font-medium text-[#18181b] w-12 shrink-0" title={d.filename}>{d.doc_code}</span>
-                      <div className="flex-1 h-1.5 bg-[#f4f4f2] flex overflow-hidden">
-                        {pPct > 0 && <div className="h-full bg-[#2da44e]" style={{ width: `${pPct}%` }} title={`Đúng: ${d.pass}`} />}
-                        {paPct > 0 && <div className="h-full bg-[#d4a72c]" style={{ width: `${paPct}%` }} title={`Thiếu 1 phần: ${d.partial}`} />}
-                        {fPct > 0 && <div className="h-full bg-[#cf222e]" style={{ width: `${fPct}%` }} title={`Sai: ${d.fail}`} />}
-                      </div>
-                      <span className="font-mono tabular-nums text-[10px] text-[#52525b] w-14 text-right shrink-0">
-                        <span className="text-[#15803d]">{d.pass}</span>/
-                        <span className="text-[#b45309]">{d.partial}</span>/
-                        <span className="text-[#b91c1c]">{d.fail}</span>
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Sharp GitHub-style Matrix Overview */}
-      <div
-        className={`px-6 py-3.5 border-b border-[#e8e8e6] bg-white ${
-          selectedUnit ? 'shrink-0' : 'flex-1 overflow-y-auto'
-        }`}
-      >
+      {/* 2-Column Overview: Left = Matrix (DOC01..DOC20), Right = Thống kê lỗi */}
+      <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 min-h-0 overflow-hidden bg-white">
+        {/* Left: Matrix Overview */}
+        <div className="lg:col-span-7 overflow-y-auto px-6 py-4 border-b lg:border-b-0 lg:border-r border-[#e8e8e6] bg-white">
         <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
           <div className="flex flex-wrap items-center gap-1.5 text-xs">
             <span className="font-mono text-[11px] font-semibold text-[#18181b] mr-2">
@@ -564,9 +686,8 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
             {(
               [
                 { id: 'ALL', label: `Tất cả (${units.length})`, dot: 'bg-[#161616]' },
-                { id: 'PASS', label: `${counts.PASS}`, dot: 'bg-[#03aa5c]' },
-                { id: 'PARTIAL', label: `${counts.PARTIAL}`, dot: 'bg-[#d4a72c]' },
-                { id: 'FAIL', label: `${counts.FAIL}`, dot: 'bg-[#cf222e]' },
+                { id: 'PASS', label: `Đạt (${counts.PASS})`, dot: 'bg-[#4ea874]' },
+                { id: 'FAIL', label: `Không đạt (${counts.FAIL})`, dot: 'bg-[#d6656c]' },
               ] as { id: ColorFilter; label: string; dot: string }[]
             ).map((f) => (
               <button
@@ -582,37 +703,56 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
                 <span className="font-mono tabular-nums">{f.label}</span>
               </button>
             ))}
-          </div>
-
-          <div className="text-[11px] font-mono text-[#52525b] min-h-[18px] flex items-center gap-2">
-            {previewUnit ? (
-              <>
-                <span className="font-semibold text-[#18181b]">
-                  {previewUnit.doc_code} #{previewUnit.unit_index}
-                </span>
-                <span>p.{previewUnit.page_num}</span>
-                <span>{previewUnit.unit_type === 'table' ? 'BẢNG' : 'TEXT'}</span>
-                {previewSim !== undefined && <span>{previewSim.toFixed(1)}%</span>}
-                {previewFlags.length > 0 && (
-                  <span className="text-[#cf222e]">{previewFlags[0].code}</span>
-                )}
-              </>
-            ) : (
-              <span className="text-[#a1a1aa] font-sans">Bấm vào ô vuông để xem chi tiết</span>
+            {unratedGreenIds.length > 0 && (
+              <button
+                type="button"
+                onClick={handleBulkApproveGreen}
+                disabled={bulkApproving}
+                className="ml-1 inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium bg-[#03aa5c]/15 text-[#027a42] border border-[#03aa5c]/35 hover:bg-[#03aa5c] hover:text-white transition-colors disabled:opacity-45"
+                title="Chốt nhanh toàn bộ các ô xanh khớp cao thành Đọc đúng"
+              >
+                <CheckCheck className="size-3.5" />
+                {bulkApproving ? 'Đang duyệt...' : `Duyệt nhanh ô xanh (${unratedGreenIds.length})`}
+              </button>
             )}
           </div>
         </div>
 
         {loading && units.length === 0 ? (
-          <div className="py-12 flex items-center justify-center gap-2 text-xs text-[#71717a]">
-            <Loader2 className="size-4 animate-spin" /> Đang tải dữ liệu đối chiếu...
+          <div className="space-y-2.5 py-0.5">
+            {[25, 25, 25, 25, 25, 25, 3, 25, 10, 13, 1, 9, 25, 25].map((cnt, rowIdx) => (
+              <div
+                key={rowIdx}
+                className="flex items-start gap-3"
+                style={{ opacity: Math.max(0.25, 1 - rowIdx * 0.055) }}
+              >
+                <div className="w-20 shrink-0 pt-0.5">
+                  <div
+                    className="h-3.5 w-11 rounded-[2px] ts-shimmer"
+                    style={{ animationDelay: `${rowIdx * 60}ms` }}
+                  />
+                </div>
+                <div className="flex flex-wrap gap-[4px] flex-1">
+                  {Array.from({ length: cnt }).map((__, colIdx) => (
+                    <div
+                      key={colIdx}
+                      className="size-[22px] ts-shimmer"
+                      style={{ animationDelay: `${(rowIdx * 40 + colIdx * 20) % 800}ms` }}
+                    />
+                  ))}
+                </div>
+              </div>
+            ))}
           </div>
         ) : units.length === 0 ? (
           <div className="py-12 text-center text-xs text-[#71717a] bg-[#fafaf9]">
             Chưa có đoạn đối chiếu nào. Hãy vào <strong>Bước 1</strong> bấm <strong>Đồng bộ RAGFlow</strong> để tự động tách đoạn.
           </div>
         ) : (
-          <div className={`space-y-2.5 ${selectedUnit ? 'max-h-[130px] overflow-y-auto pr-1' : ''}`}>
+          <div
+            style={selectedUnit ? { height: `${matrixHeight}px` } : undefined}
+            className={`space-y-2.5 ${selectedUnit ? 'overflow-y-auto pr-1' : ''}`}
+          >
             {Object.values(groupedUnits).map((grp) => (
               <div key={grp.doc_code} className="flex items-start gap-3">
                 <div
@@ -629,8 +769,6 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
                         key={u.id}
                         type="button"
                         onClick={() => (isSel ? setSelectedUnit(null) : selectUnit(u))}
-                        onMouseEnter={() => setHoveredUnit(u)}
-                        onMouseLeave={() => setHoveredUnit(null)}
                         aria-label={`${u.doc_code} #${u.unit_index}`}
                         className={`relative size-[22px] rounded-none border-0 transition-opacity cursor-pointer ${getTileClass(
                           u,
@@ -644,11 +782,280 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
             ))}
           </div>
         )}
+        </div>
+
+        {/* Right: Chill Editorial Thống kê lỗi Panel */}
+        <div
+          className="lg:col-span-5 overflow-y-auto px-5 py-4 space-y-4"
+          style={{
+            backgroundColor: '#f8f7f4',
+            backgroundImage: 'radial-gradient(#e4e2dc 0.8px, transparent 0.8px)',
+            backgroundSize: '18px 18px',
+          }}
+        >
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2 text-xs font-semibold text-[#27272a]">
+              <span className="size-6 rounded-full bg-white border border-[#e6e4de] shadow-2xs flex items-center justify-center">
+                <BarChart3 className="size-3.5 text-[#52a478]" />
+              </span>
+              <span>Thống kê chất lượng & lỗi</span>
+            </div>
+            {isAutoPreview && (
+              <span className="text-[11px] text-[#8a6d3b] bg-[#fdf8ed] border border-[#efe2c4] px-2.5 py-0.5 rounded-full">
+                Ước tính tự động
+              </span>
+            )}
+          </div>
+
+          {loading && units.length === 0 ? (
+            <div className="space-y-4 animate-pulse">
+              <div className="bg-white border border-[#e6e4de] rounded-xl p-4 space-y-4">
+                <div className="flex items-center justify-between">
+                  <div className="space-y-1.5">
+                    <div className="h-3.5 w-32 bg-[#eceae4] rounded" />
+                    <div className="h-2.5 w-24 bg-[#f1efe9] rounded" />
+                  </div>
+                  <div className="flex gap-1.5">
+                    <div className="h-5 w-14 bg-[#f1efe9] rounded-full" />
+                    <div className="h-5 w-12 bg-[#f1efe9] rounded-full" />
+                  </div>
+                </div>
+                <div className="flex justify-center py-3">
+                  <div className="size-36 rounded-full bg-[#f4f3ef] border border-[#eceae4]" />
+                </div>
+                <div className="pt-2.5 border-t border-[#efede8] flex gap-1.5">
+                  <div className="h-5 w-16 bg-[#f1efe9] rounded-md" />
+                  <div className="h-5 w-16 bg-[#f1efe9] rounded-md" />
+                  <div className="h-5 w-16 bg-[#f1efe9] rounded-md" />
+                </div>
+              </div>
+              <div className="bg-white border border-[#e6e4de] rounded-xl p-4 space-y-2.5">
+                <div className="h-3.5 w-36 bg-[#eceae4] rounded" />
+                {Array.from({ length: 4 }).map((_, i) => (
+                  <div key={i} className="h-12 w-full bg-[#f4f3ef] rounded-lg" />
+                ))}
+              </div>
+            </div>
+          ) : units.length === 0 ? (
+            <div className="text-xs text-[#71717a] py-8 text-center">Chưa có dữ liệu thống kê.</div>
+          ) : (
+            <>
+              {/* 1. 4-Axis SVG Radar Chart Card */}
+              {(() => {
+                const total = Math.max(units.length, 1);
+                const passPct = Math.round((counts.PASS / total) * 100);
+                const vText = Math.max(0, Math.min(100, effectiveMetrics.textCompleteness ?? 0));
+                const vTable = Math.max(0, Math.min(100, effectiveMetrics.tableAccuracy ?? 0));
+                const vOrder = Math.max(0, Math.min(100, effectiveMetrics.readingOrder ?? 0));
+                const vLayout = Math.max(0, Math.min(100, effectiveMetrics.layoutAccuracy ?? 0));
+
+                const cx = 160;
+                const cy = 98;
+                const maxR = 60;
+                const pt = (angleDeg: number, pct: number) => {
+                  const rad = (angleDeg * Math.PI) / 180;
+                  const r = (pct / 100) * maxR;
+                  return [cx + r * Math.cos(rad), cy + r * Math.sin(rad)];
+                };
+                // Top (-90), Right (0), Bottom (90), Left (180)
+                const pTop = pt(-90, vText);
+                const pRight = pt(0, vTable);
+                const pBottom = pt(90, vOrder);
+                const pLeft = pt(180, vLayout);
+                const polyPoints = [pTop, pRight, pBottom, pLeft].map((p) => `${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' ');
+
+                return (
+                  <div className="bg-white border border-[#e6e4de] rounded-xl shadow-xs p-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <div className="text-xs font-semibold text-[#18181b]">Biểu đồ Radar 4 trục</div>
+                        <div className="text-[11px] text-[#78716c]">
+                          Đạt <span className="font-mono font-semibold text-[#027a42]">{passPct}%</span> ({counts.PASS}/{units.length} đoạn)
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1.5 text-[11px] font-mono">
+                        <span className="px-2 py-0.5 rounded-full bg-[#f2f7f4] text-[#027a42] border border-[#d6eadf]">
+                          {counts.PASS} đạt
+                        </span>
+                        <span className="px-2 py-0.5 rounded-full bg-[#fef2f2] text-[#b91c1c] border border-[#f5d0d3]">
+                          {counts.FAIL} lỗi
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="flex justify-center">
+                      <svg viewBox="0 0 320 198" className="w-full max-w-[330px] h-auto select-none">
+                        {/* Concentric diamond grid rings */}
+                        {[25, 50, 75, 100].map((lvl) => {
+                          const ring = [pt(-90, lvl), pt(0, lvl), pt(90, lvl), pt(180, lvl)]
+                            .map((p) => `${p[0].toFixed(1)},${p[1].toFixed(1)}`)
+                            .join(' ');
+                          return (
+                            <polygon
+                              key={lvl}
+                              points={ring}
+                              fill="none"
+                              stroke={lvl === 100 ? '#d8d5ce' : '#eceae4'}
+                              strokeWidth={lvl === 100 ? 1.2 : 1}
+                              strokeDasharray={lvl === 100 ? undefined : '2 2'}
+                            />
+                          );
+                        })}
+                        {/* Axis lines */}
+                        <line x1={cx} y1={cy - maxR} x2={cx} y2={cy + maxR} stroke="#e6e4de" strokeWidth="1" />
+                        <line x1={cx - maxR} y1={cy} x2={cx + maxR} y2={cy} stroke="#e6e4de" strokeWidth="1" />
+
+                        {/* Data polygon */}
+                        <polygon
+                          points={polyPoints}
+                          fill="rgba(82, 164, 120, 0.16)"
+                          stroke="#52a478"
+                          strokeWidth="2"
+                          strokeLinejoin="round"
+                          className="transition-all duration-500 ease-out"
+                        />
+
+                        {/* Vertex dots */}
+                        {[pTop, pRight, pBottom, pLeft].map((p, idx) => (
+                          <circle
+                            key={idx}
+                            cx={p[0]}
+                            cy={p[1]}
+                            r="3.5"
+                            fill="#ffffff"
+                            stroke="#52a478"
+                            strokeWidth="2"
+                            className="transition-all duration-500 ease-out"
+                          />
+                        ))}
+
+                        {/* Axis Labels (Accurate 0-100% Higher-is-Better Document Parsing Metrics) */}
+                        <text x={cx} y={14} textAnchor="middle" className="fill-[#52525b] text-[10px] font-medium">
+                          Text Accuracy
+                        </text>
+                        <text x={cx} y={26} textAnchor="middle" className="fill-[#18181b] text-[10px] font-mono font-semibold">
+                          {effectiveMetrics.textCompleteness !== null ? `${vText.toFixed(0)}%` : '—'}
+                        </text>
+
+                        <text x={cx + maxR + 10} y={cy - 3} textAnchor="start" className="fill-[#52525b] text-[10px] font-medium">
+                          Table Accuracy
+                        </text>
+                        <text x={cx + maxR + 10} y={cy + 10} textAnchor="start" className="fill-[#18181b] text-[10px] font-mono font-semibold">
+                          {effectiveMetrics.tableAccuracy !== null ? `${vTable.toFixed(0)}%` : '—'}
+                        </text>
+
+                        <text x={cx} y={cy + maxR + 14} textAnchor="middle" className="fill-[#52525b] text-[10px] font-medium">
+                          Reading Order
+                        </text>
+                        <text x={cx} y={cy + maxR + 26} textAnchor="middle" className="fill-[#18181b] text-[10px] font-mono font-semibold">
+                          {effectiveMetrics.readingOrder !== null ? `${vOrder.toFixed(0)}%` : '—'}
+                        </text>
+
+                        <text x={cx - maxR - 10} y={cy - 3} textAnchor="end" className="fill-[#52525b] text-[10px] font-medium">
+                          Layout Accuracy
+                        </text>
+                        <text x={cx - maxR - 10} y={cy + 10} textAnchor="end" className="fill-[#18181b] text-[10px] font-mono font-semibold">
+                          {effectiveMetrics.layoutAccuracy !== null ? `${vLayout.toFixed(0)}%` : '—'}
+                        </text>
+                      </svg>
+                    </div>
+
+                    {/* Compact Error Group Pills */}
+                    {errorCodeBreakdown.length > 0 && (
+                      <div className="pt-2.5 border-t border-[#efede8] flex flex-wrap items-center gap-1.5">
+                        <span className="text-[11px] text-[#78716c] mr-1">Nhóm lỗi:</span>
+                        {errorCodeBreakdown.map((item) => (
+                          <span
+                            key={item.code}
+                            title={`${item.code} — ${item.name}`}
+                            className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-[#faf9f6] border border-[#e6e4de] text-[11px] cursor-help"
+                          >
+                            <span className="font-mono font-semibold text-[#18181b]">{item.code}</span>
+                            <span className="font-mono text-[#b91c1c] font-medium">{item.count}</span>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {/* 2. Hotspots: Top 5 Files Needing Attention (clickable to jump straight to scoring) */}
+              {(() => {
+                const hotspots = [...docBreakdown]
+                  .filter((d) => d.fail + d.partial > 0)
+                  .sort((a, b) => b.fail + b.partial - (a.fail + a.partial))
+                  .slice(0, 5);
+                return (
+                  <div className="bg-white border border-[#e6e4de] rounded-xl shadow-xs p-4 space-y-2.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold text-[#18181b] inline-flex items-center gap-1.5">
+                        <AlertCircle className="size-3.5 text-[#df7a80]" />
+                        Điểm nóng cần chú ý
+                      </span>
+                      <span className="text-[11px] text-[#78716c]">Top {hotspots.length} file lỗi nhiều</span>
+                    </div>
+
+                    {hotspots.length === 0 ? (
+                      <div className="text-xs text-[#027a42] bg-[#f2f7f4] rounded-lg px-3 py-2.5">
+                        Tuyệt vời! Chưa phát hiện file nào có lỗi nổi bật.
+                      </div>
+                    ) : (
+                      <div className="space-y-1.5">
+                        {hotspots.map((d, idx) => {
+                          const errCnt = d.fail + d.partial;
+                          const errRate = Math.round((errCnt / Math.max(d.total, 1)) * 100);
+                          const cleanName = (d.filename || '').replace(new RegExp(`^${d.doc_code}[_\\-\\s]*`, 'i'), '');
+                          return (
+                            <button
+                              key={d.doc_code}
+                              type="button"
+                              onClick={() => {
+                                const docUnits = units.filter((u) => u.doc_code === d.doc_code);
+                                const target =
+                                  docUnits.find((u) => getUnitEffectiveState(u) !== 'PASS') || docUnits[0];
+                                if (target) {
+                                  selectUnit(target);
+                                  setIsFullscreen(true);
+                                }
+                              }}
+                              className="w-full text-left group p-2.5 rounded-lg border border-[#efede8] bg-[#fcfcfa] hover:bg-white hover:border-[#d4d4d8] transition-all flex items-center justify-between gap-3"
+                            >
+                              <div className="min-w-0 flex items-center gap-2.5">
+                                <span className="size-5 rounded-full bg-[#fef2f2] text-[#b91c1c] font-mono text-[10px] font-bold flex items-center justify-center shrink-0">
+                                  {idx + 1}
+                                </span>
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="font-mono text-xs font-semibold text-[#18181b]">
+                                      {d.doc_code}
+                                    </span>
+                                    <span className="text-[11px] text-[#78716c] truncate">{cleanName}</span>
+                                  </div>
+                                  <div className="text-[10px] text-[#78716c] mt-0.5">
+                                    Lỗi <strong className="font-mono text-[#b91c1c]">{errCnt}/{d.total}</strong> đoạn ({errRate}%)
+                                  </div>
+                                </div>
+                              </div>
+                              <span className="text-[11px] font-medium text-[#78716c] group-hover:text-[#18181b] inline-flex items-center gap-0.5 shrink-0 transition-colors">
+                                Chấm <ArrowRight className="size-3" />
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+            </>
+          )}
+        </div>
       </div>
 
-      {/* Expandable Side-by-Side Detail Panel — ONLY shown when a square is clicked */}
+      {/* Fullscreen Scoring Mode — opened via "Chế độ chấm" button or clicking a square */}
       {selectedUnit && (
-        <div className="flex-1 flex flex-col min-h-0 bg-white">
+        <div className="fixed inset-0 z-30 flex flex-col bg-[#fefefe]">
           <div className="px-5 py-2 border-b border-[#ededeb] bg-[#fafaf9] flex items-center justify-between text-xs shrink-0">
             <div className="flex items-center gap-2.5">
               <div className="inline-flex items-center border border-[#e4e4e2] bg-white">
@@ -688,13 +1095,13 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
               </span>
             </div>
 
-            <div className="flex items-center gap-3">
-              <span className="hidden md:inline text-[11px] text-[#a1a1aa] font-mono">
-                ←/→ chuyển · 1/2/3 chấm · Esc đóng
-              </span>
+            <div className="flex items-center gap-2">
               <button
-                onClick={() => setSelectedUnit(null)}
-                className="inline-flex items-center gap-1 text-xs text-[#52525b] hover:text-[#18181b] px-2 py-1 hover:bg-[#ededeb]"
+                onClick={() => {
+                  setIsFullscreen(false);
+                  setSelectedUnit(null);
+                }}
+                className="inline-flex items-center gap-1 text-xs text-[#52525b] hover:text-[#18181b] px-2.5 py-1 rounded-md border border-[#e4e4e2] bg-white hover:bg-[#f4f4f2]"
                 title="Đóng (Esc)"
               >
                 <X className="size-3.5" /> Đóng
@@ -702,12 +1109,29 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
             </div>
           </div>
 
+          <div className="flex-1 flex min-h-0 overflow-hidden">
           <div className="flex-1 grid grid-cols-2 min-h-0 divide-x divide-[#e8e8e6] overflow-hidden">
             {/* Original */}
             <div className="p-5 overflow-y-auto space-y-3">
-              <div className="ts-eyebrow">ĐOẠN TRÍCH GỐC</div>
+              <div className="flex items-center justify-between gap-2">
+                <div className="ts-eyebrow">ĐOẠN TRÍCH GỐC</div>
+                {selectedUnit.has_local_file && selectedUnit.filename.toLowerCase().endsWith('.pdf') && (
+                  <button
+                    type="button"
+                    onClick={handleVisionOcr}
+                    disabled={ocrRunning}
+                    className="inline-flex items-center gap-1.5 px-2 py-0.5 text-[11px] font-medium bg-[#f2fbf6] text-[#027a42] border border-[#03aa5c]/35 hover:bg-[#03aa5c] hover:text-white transition-colors disabled:opacity-45"
+                    title="Dùng Vision LLM (trong Cài đặt) để đọc chữ từ ảnh trang PDF làm bản chuẩn"
+                  >
+                    {ocrRunning ? <Loader2 className="size-3 animate-spin" /> : <Sparkles className="size-3" />}
+                    {ocrRunning ? 'Đang OCR...' : 'OCR bản chuẩn (Vision LLM)'}
+                  </button>
+                )}
+              </div>
               <div className="bg-[#fafaf9] border border-[#ededeb] p-4 text-[13.5px] text-[#18181b] leading-relaxed whitespace-pre-wrap text-pretty">
-                {selectedUnit.source_text}
+                {selectedUnit.unit_type === 'table'
+                  ? renderPipeTable(selectedUnit.source_text)
+                  : selectedUnit.source_text}
               </div>
               {selectedUnit.has_local_file && selectedUnit.filename.toLowerCase().endsWith('.pdf') && (
                 <img
@@ -722,40 +1146,6 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
             <div className="p-5 overflow-y-auto space-y-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="ts-eyebrow">ĐOẠN SO SÁNH & KẾT QUẢ</span>
-                <div className="flex flex-wrap items-center gap-2.5 text-[11px]">
-                  <label className="flex items-center gap-1 cursor-pointer text-[#52525b]">
-                    <input type="checkbox" checked={showDiff} onChange={(e) => setShowDiff(e.target.checked)} />
-                    Diff
-                  </label>
-                  {showDiff && (
-                    <>
-                      <label className="flex items-center gap-1 cursor-pointer text-[#52525b]">
-                        <input
-                          type="checkbox"
-                          checked={checkFormat}
-                          onChange={(e) => setCheckFormat(e.target.checked)}
-                        />
-                        Format (\n)
-                      </label>
-                      <label className="flex items-center gap-1 cursor-pointer text-[#52525b]">
-                        <input
-                          type="checkbox"
-                          checked={charLevel}
-                          onChange={(e) => setCharLevel(e.target.checked)}
-                        />
-                        Ký tự
-                      </label>
-                    </>
-                  )}
-                  <label className="flex items-center gap-1 cursor-pointer text-[#52525b]">
-                    <input
-                      type="checkbox"
-                      checked={showFullChunk}
-                      onChange={(e) => setShowFullChunk(e.target.checked)}
-                    />
-                    Cả chunk
-                  </label>
-                </div>
               </div>
 
               {selectedUnit.matched_chunks.map((ch) => {
@@ -809,6 +1199,8 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
                     <div className="text-[13.5px] text-[#18181b] leading-relaxed whitespace-pre-wrap text-pretty">
                       {showDiff && !showFullChunk
                         ? renderDiffText(selectedUnit.source_text, targetText)
+                        : selectedUnit.unit_type === 'table'
+                        ? renderPipeTable(targetText)
                         : targetText}
                     </div>
                   </div>
@@ -822,73 +1214,257 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
             </div>
           </div>
 
-          {/* Calm, Compact Bottom Action Bar */}
-          <div className="px-5 py-2.5 border-t border-[#e8e8e6] bg-[#fafaf9] space-y-2 shrink-0">
-            <div className="flex flex-wrap items-center gap-1">
-              <span className="text-[11px] text-[#78716c] mr-1.5">
-                Lỗi{autoSuggested ? ' (gợi ý)' : ''}:
-              </span>
-              {errorCatalog.map((ec) => {
-                const active = errCodes.includes(ec.code);
-                return (
-                  <button
-                    key={ec.code}
-                    disabled={scoring}
-                    onClick={() => toggleCode(ec.code)}
-                    title={`${ec.code} · ${ec.name} (${ec.severity})`}
-                    className={`font-mono text-[11px] px-2 py-0.5 border transition-colors disabled:opacity-45 ${
-                      active
-                        ? 'bg-[#18181b] text-white border-[#18181b] font-semibold'
-                        : 'bg-white text-[#52525b] border-[#e4e4e2] hover:border-[#a1a1aa] hover:text-[#18181b]'
-                    }`}
-                  >
-                    {ec.code}
-                  </button>
-                );
-              })}
-              {errCodes.length > 0 && (
-                <span className="text-[11px] text-[#52525b] ml-1.5 truncate max-w-[300px]">
-                  {errCodes
-                    .map((c) => errorCatalog.find((e) => e.code === c)?.name)
-                    .filter(Boolean)
-                    .join(' · ')}
-                </span>
-              )}
-              <label className="ml-auto flex items-center gap-1.5 text-[11px] text-[#52525b] cursor-pointer">
-                <input type="checkbox" checked={charErr} onChange={(e) => setCharErr(e.target.checked)} />
-                Lỗi ký tự
-              </label>
+          {/* Dedicated Right Sidebar: Navigation List (fills height) + Display Options + Pinned Scoring */}
+          <aside className="w-[300px] shrink-0 border-l border-[#e4e4e2] bg-[#fafaf9] flex flex-col min-h-0 overflow-hidden divide-y divide-[#e8e8e6]">
+            {/* 1. Document Selector & Scrollable Unit List */}
+            {(() => {
+              const groupsList = Object.values(groupedUnits);
+              const activeDocCode = selectedUnit?.doc_code || groupsList[0]?.doc_code || '';
+              const activeGroup = groupsList.find((g) => g.doc_code === activeDocCode) || groupsList[0];
+              return (
+                <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+                  <div className="p-3.5 pb-2.5 space-y-2 shrink-0">
+                    <div className="flex items-center justify-between text-[11px] font-semibold uppercase tracking-wider text-[#52525b]">
+                      <span>
+                        Danh sách{' '}
+                        <span className="font-mono font-normal text-[#71717a]">
+                          ({units.filter((u) => u.verdict !== 'UNRATED').length}/{units.length})
+                        </span>
+                      </span>
+                      <div className="inline-flex items-center rounded-[2px] border border-[#e4e4e2] bg-white p-0.5">
+                        <button
+                          type="button"
+                          onClick={() => setSidebarViewMode('grid')}
+                          title="Hiển thị dạng ô vuông"
+                          className={`p-1 rounded-[2px] transition-colors ${
+                            sidebarViewMode === 'grid'
+                              ? 'bg-[#18181b] text-white'
+                              : 'text-[#71717a] hover:text-[#18181b]'
+                          }`}
+                        >
+                          <LayoutGrid className="size-3" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setSidebarViewMode('list')}
+                          title="Hiển thị dạng danh sách"
+                          className={`p-1 rounded-[2px] transition-colors ${
+                            sidebarViewMode === 'list'
+                              ? 'bg-[#18181b] text-white'
+                              : 'text-[#71717a] hover:text-[#18181b]'
+                          }`}
+                        >
+                          <List className="size-3" />
+                        </button>
+                      </div>
+                    </div>
+                    <select
+                      className="w-full py-1.5 px-2 text-[11px] font-medium bg-white border border-[#e4e4e2] rounded-[3px] text-[#18181b] focus:outline-none focus:border-[#18181b]"
+                      value={activeGroup?.doc_code || ''}
+                      title={activeGroup?.filename || ''}
+                      onChange={(e) => {
+                        const target = groupsList.find((g) => g.doc_code === e.target.value);
+                        if (target && target.items.length > 0) {
+                          selectUnit(target.items[0]);
+                        }
+                      }}
+                    >
+                      {groupsList.map((grp) => {
+                        const doneCnt = grp.items.filter((u) => u.verdict !== 'UNRATED').length;
+                        const cleanName = (grp.filename || '').replace(new RegExp(`^${grp.doc_code}[_\\-\\s]*`, 'i'), '');
+                        return (
+                          <option key={grp.doc_code} value={grp.doc_code}>
+                            {grp.doc_code} ({doneCnt}/{grp.items.length}) · {cleanName}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </div>
+
+                  {activeGroup && sidebarViewMode === 'grid' && (
+                    <div className="flex-1 overflow-y-auto px-3.5 pb-3.5">
+                      <div className="flex flex-wrap gap-[4px]">
+                        {activeGroup.items.map((u) => {
+                          const isSel = selectedUnit?.id === u.id;
+                          return (
+                            <button
+                              key={u.id}
+                              type="button"
+                              onClick={() => selectUnit(u)}
+                              aria-label={`${u.doc_code} #${u.unit_index}`}
+                              title={`${u.doc_code} #${u.unit_index} · Trang ${u.page_num}`}
+                              className={`size-[20px] rounded-none border-0 transition-opacity cursor-pointer ${getTileClass(
+                                u,
+                                isSel
+                              )}`}
+                            />
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {activeGroup && sidebarViewMode === 'list' && (
+                    <div className="flex-1 overflow-y-auto px-2.5 pb-2.5 space-y-1">
+                      {activeGroup.items.map((u) => {
+                        const isSel = selectedUnit?.id === u.id;
+                        const eff = getUnitEffectiveState(u);
+                        const dotCls =
+                          eff === 'PASS'
+                            ? 'bg-[#4ea874]'
+                            : eff === 'FAIL'
+                            ? 'bg-[#df7a80]'
+                            : 'bg-[#d4d4d8]';
+                        const sim = u.matched_chunks?.[0]?.alignment?.text_similarity;
+                        const preview = (u.title || u.source_text || '').replace(/\s+/g, ' ').trim();
+                        return (
+                          <button
+                            key={u.id}
+                            type="button"
+                            onClick={() => selectUnit(u)}
+                            className={`w-full text-left px-2.5 py-2 rounded-md border transition-colors flex items-start gap-2 ${
+                              isSel
+                                ? 'bg-white border-[#18181b] shadow-2xs'
+                                : 'bg-transparent border-transparent hover:bg-white/80 hover:border-[#e4e4e2]'
+                            }`}
+                          >
+                            <span className={`size-2 rounded-full mt-1.5 shrink-0 ${dotCls}`} />
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center justify-between gap-1.5">
+                                <span className="font-mono text-[11px] font-semibold text-[#18181b]">
+                                  #{u.unit_index}{' '}
+                                  <span className="font-normal text-[#71717a]">· tr.{u.page_num}</span>
+                                </span>
+                                {sim !== undefined && (
+                                  <span className="font-mono text-[10px] text-[#71717a] tabular-nums">
+                                    {sim.toFixed(0)}%
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-[11px] text-[#52525b] truncate mt-0.5">
+                                {preview || '(Không có văn bản)'}
+                              </div>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
+            {/* 2. Display Options */}
+            <div className="p-3.5 space-y-2 shrink-0">
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-[#52525b]">
+                Tùy chọn hiển thị
+              </div>
+              <div className="grid grid-cols-2 gap-2 text-xs text-[#3f3f46]">
+                <label className="flex items-center gap-2 px-2.5 py-1.5 rounded-md bg-white border border-[#e4e4e2] cursor-pointer select-none hover:border-[#d4d4d8]">
+                  <input type="checkbox" checked={showDiff} onChange={(e) => setShowDiff(e.target.checked)} />
+                  <span>So sánh Diff</span>
+                </label>
+                <label className="flex items-center gap-2 px-2.5 py-1.5 rounded-md bg-white border border-[#e4e4e2] cursor-pointer select-none hover:border-[#d4d4d8]">
+                  <input type="checkbox" checked={showFullChunk} onChange={(e) => setShowFullChunk(e.target.checked)} />
+                  <span>Xem cả chunk</span>
+                </label>
+              </div>
             </div>
 
-            <div className="flex flex-wrap items-center gap-2">
-              <input
-                className="ts-input flex-1 min-w-[200px] py-1 text-xs"
-                placeholder="Ghi chú ngắn..."
-                value={notes}
-                onChange={(e) => setNotes(e.target.value)}
-              />
-              <button
-                onClick={() => handleScore('PASS')}
-                disabled={scoring}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-[#18181b] hover:bg-[#27272a] text-white disabled:opacity-45"
-              >
-                <span className="size-2 bg-[#4ac26b] inline-block" /> Đọc đúng (1)
-              </button>
-              <button
-                onClick={() => handleScore('PARTIAL')}
-                disabled={scoring}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-white hover:bg-[#f4f4f2] text-[#18181b] border border-[#d4d4d0] disabled:opacity-45"
-              >
-                <span className="size-2 bg-[#d4a72c] inline-block" /> Thiếu 1 phần (2)
-              </button>
-              <button
-                onClick={() => handleScore('FAIL')}
-                disabled={scoring}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-white hover:bg-[#fef2f2] text-[#18181b] border border-[#d4d4d0] disabled:opacity-45"
-              >
-                <span className="size-2 bg-[#cf222e] inline-block" /> Đọc sai (3)
-              </button>
+            {/* 3. Pinned Scoring Controls */}
+            <div className="p-3.5 space-y-2.5 shrink-0 bg-white">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-[#52525b]">
+                  Chấm điểm
+                </span>
+                {scoring && <Loader2 className="size-3.5 animate-spin text-[#4ea874]" />}
+              </div>
+
+              <div className="space-y-2">
+                <button
+                  onClick={() => handleScore('PASS')}
+                  disabled={scoring}
+                  className={`w-full flex items-center justify-between px-3.5 py-2 rounded-md text-xs font-medium border disabled:opacity-45 disabled:cursor-not-allowed transition-colors ${
+                    selectedUnit.verdict === 'PASS'
+                      ? 'bg-[#ecfdf5] border-[#4ea874] text-[#027a42]'
+                      : 'bg-white hover:bg-[#f0fdf4] text-[#18181b] border-[#d4d4d8]'
+                  }`}
+                >
+                  <span className="inline-flex items-center gap-2">
+                    <span className="size-2 rounded-full bg-[#4ea874] inline-block" />
+                    Đạt
+                  </span>
+                  <span className="font-mono text-[10px] text-[#71717a]">1</span>
+                </button>
+                <button
+                  onClick={() => {
+                    if (showErrPopover) handleScore('FAIL');
+                    else setShowErrPopover(true);
+                  }}
+                  disabled={scoring}
+                  className={`w-full flex items-center justify-between px-3.5 py-2 rounded-md text-xs font-medium border disabled:opacity-45 disabled:cursor-not-allowed transition-colors ${
+                    showErrPopover || selectedUnit.verdict === 'FAIL' || selectedUnit.verdict === 'PARTIAL'
+                      ? 'bg-[#fef2f2] border-[#df7a80] text-[#b91c1c]'
+                      : 'bg-white hover:bg-[#fef2f2] text-[#18181b] border-[#d4d4d8]'
+                  }`}
+                >
+                  <span className="inline-flex items-center gap-2">
+                    <span className="size-2 rounded-full bg-[#df7a80] inline-block" />
+                    {showErrPopover ? 'Xác nhận Không đạt' : 'Không đạt'}
+                  </span>
+                  <span className="font-mono text-[10px] text-[#71717a]">{showErrPopover ? 'Enter' : '2'}</span>
+                </button>
+              </div>
+
+              {showErrPopover && (
+                <div className="pt-3 border-t border-[#e8e8e6] space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-medium text-[#3f3f46]">
+                      Chọn mã lỗi ({errCodes.length})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setShowErrPopover(false)}
+                      className="text-xs text-[#71717a] hover:text-[#18181b]"
+                    >
+                      Đóng
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {errorCatalog.map((ec) => {
+                      const active = errCodes.includes(ec.code);
+                      return (
+                        <button
+                          key={ec.code}
+                          type="button"
+                          disabled={scoring}
+                          onClick={() => toggleCode(ec.code)}
+                          title={`${ec.code} · ${ec.name} (${ec.severity})`}
+                          className={`font-mono text-[11px] px-2 py-1 rounded-md border transition-colors disabled:opacity-45 ${
+                            active
+                              ? 'bg-[#18181b] text-white border-[#18181b] font-semibold'
+                              : 'bg-white text-[#52525b] border-[#e4e4e2] hover:border-[#18181b]'
+                          }`}
+                        >
+                          {ec.code}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <input
+                    className="ts-input w-full py-1.5 text-xs rounded-md bg-white"
+                    placeholder="Ghi chú ngắn..."
+                    value={notes}
+                    onChange={(e) => setNotes(e.target.value)}
+                  />
+                  <label className="flex items-center gap-1.5 text-xs text-[#52525b] cursor-pointer select-none">
+                    <input type="checkbox" checked={charErr} onChange={(e) => setCharErr(e.target.checked)} />
+                    Lỗi ký tự
+                  </label>
+                </div>
+              )}
             </div>
+          </aside>
           </div>
         </div>
       )}

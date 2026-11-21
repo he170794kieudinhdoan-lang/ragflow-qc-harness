@@ -162,7 +162,7 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
       <div className="px-5 py-2.5 border-b border-[#e8e8e6] bg-[#fafaf9] flex flex-wrap items-center justify-between gap-3 shrink-0">
         <div className="flex flex-wrap items-center gap-2">
           <select
-            className="ts-input py-1 text-xs min-w-[200px]"
+            className="ts-input py-1.5 px-2.5 text-xs rounded-md bg-white min-w-[200px]"
             value={selectedRrId ?? ''}
             onChange={(e) => setSelectedRrId(Number(e.target.value))}
           >
@@ -174,12 +174,14 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
             {rrList.length === 0 && <option value="">Chưa có lần chạy tìm kiếm nào</option>}
           </select>
 
+          <div className="h-4 w-px bg-[#e4e4e2] mx-0.5 hidden sm:block" />
+
           <div className="inline-flex items-center gap-1.5 text-xs text-[#71717a]">
             <input
               type="number"
               min={1}
               max={15}
-              className="ts-input py-1 w-12 font-mono text-center text-xs"
+              className="ts-input py-1.5 w-12 font-mono text-center text-xs rounded-md bg-white"
               value={genPerDoc}
               onChange={(e) => setGenPerDoc(Number(e.target.value))}
               title="Số câu hỏi sinh ra trên mỗi tài liệu"
@@ -191,7 +193,7 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
             <button
               onClick={handleAutoGenerate}
               disabled={generating || busy}
-              className="ts-btn-secondary py-1 text-xs disabled:opacity-45"
+              className="ts-btn-secondary py-1.5 px-2.5 text-xs rounded-md disabled:opacity-45"
               title="Tự động sinh Golden Dataset từ các tài liệu trong phiên hiện tại"
             >
               {generating ? <Loader2 className="size-3.5 animate-spin" /> : <Wand2 className="size-3.5" />}
@@ -199,21 +201,21 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
             </button>
           </div>
 
-          <button onClick={() => setShowRunModal(true)} disabled={busy || generating} className="ts-btn-primary py-1 text-xs disabled:opacity-45">
+          <button onClick={() => setShowRunModal(true)} disabled={busy || generating} className="ts-btn-primary py-1.5 px-3 text-xs rounded-md disabled:opacity-45">
             <Play className="size-3.5" /> Chạy test tìm kiếm
           </button>
-          <button onClick={() => setShowAddTc(true)} className="ts-btn-secondary py-1 text-xs">
+          <button onClick={() => setShowAddTc(true)} className="ts-btn-secondary py-1.5 px-2.5 text-xs rounded-md">
             <Plus className="size-3.5" /> Thêm tay
           </button>
         </div>
 
-        <div className="flex items-center gap-4 text-xs text-[#52525b]">
-          <span title="Contextual Precision trung bình (Phụ lục A — 0..1)">
-            Contextual Precision:{' '}
+        <div className="flex items-center gap-2 text-xs text-[#52525b]">
+          <span className="px-2.5 py-1 rounded-md bg-white border border-[#e4e4e2]" title="Contextual Precision trung bình (Phụ lục A — 0..1)">
+            Precision:{' '}
             <strong className="font-mono tabular-nums text-[#18181b]">{avgPrecision.toFixed(2)}</strong>
           </span>
-          <span title="Context Coverage trung bình (Phụ lục A — %)">
-            Context Coverage:{' '}
+          <span className="px-2.5 py-1 rounded-md bg-white border border-[#e4e4e2]" title="Context Coverage trung bình (Phụ lục A — %)">
+            Coverage:{' '}
             <strong className="font-mono tabular-nums text-[#18181b]">{(avgCoverage * 100).toFixed(0)}%</strong>
           </span>
         </div>
@@ -223,7 +225,7 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
       <div className="flex-1 grid grid-cols-12 min-h-0">
         {/* Left: Testcases */}
         <div className="col-span-4 border-r border-[#e8e8e6] overflow-y-auto bg-[#fafaf9]">
-          <div className="px-4 py-2 border-b border-[#ededeb] ts-eyebrow">
+          <div className="px-4 py-2.5 border-b border-[#ededeb] ts-eyebrow sticky top-0 bg-[#fafaf9] z-10">
             BỘ CÂU HỎI GOLDEN ({groups.length})
           </div>
           {groups.map((g) => (
@@ -238,6 +240,15 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
             >
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-1.5">
+                  <span
+                    className={`size-2 rounded-full shrink-0 ${
+                      g.relevant_count > 0
+                        ? 'bg-emerald-500'
+                        : g.hits.length > 0
+                        ? 'bg-rose-400'
+                        : 'bg-zinc-300'
+                    }`}
+                  />
                   <span className="font-mono text-xs font-semibold text-[#18181b]">{g.testcase.tc_code}</span>
                   <span className="ts-tag-neutral text-[10px]">{g.testcase.question_class}</span>
                 </div>

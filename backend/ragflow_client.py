@@ -124,18 +124,36 @@ class RAGFlowClient:
                 return self._unwrap(r2)
             raise
 
+    async def get_dataset(self, dataset_id: str) -> Optional[Dict[str, Any]]:
+        client = get_shared_http_client()
+        r = await client.get(
+            f"{self.base_url}/api/v1/datasets",
+            headers=self._headers(),
+            params={"id": dataset_id, "page": 1, "page_size": 10},
+            timeout=self.timeout,
+        )
+        data = self._unwrap(r)
+        if isinstance(data, list):
+            for ds in data:
+                if ds.get("id") == dataset_id:
+                    return ds
+            return data[0] if data else None
+        return data if isinstance(data, dict) else None
+
     async def update_dataset(
         self,
         dataset_id: str,
         chunk_method: Optional[str] = None,
         parser_config: Optional[Dict[str, Any]] = None,
+        pagerank: Optional[int] = None,
     ) -> Any:
-        body: Dict[str, Any] = {}
+        body: Dict[str, Any] = {"parse_type": 1}
         if chunk_method:
             body["parser_id"] = chunk_method
-            body["chunk_method"] = chunk_method
         if parser_config is not None:
             body["parser_config"] = parser_config
+        if pagerank is not None:
+            body["pagerank"] = int(pagerank)
         client = get_shared_http_client()
         r = await client.put(
             f"{self.base_url}/api/v1/datasets/{dataset_id}",
@@ -152,6 +170,8 @@ class RAGFlowClient:
                     fallback["chunk_method" if "parser_id" in str(e) else "parser_id"] = chunk_method
                 if parser_config is not None:
                     fallback["parser_config"] = parser_config
+                if pagerank is not None:
+                    fallback["pagerank"] = int(pagerank)
                 r2 = await client.put(
                     f"{self.base_url}/api/v1/datasets/{dataset_id}",
                     headers=self._headers(),
@@ -166,16 +186,50 @@ class RAGFlowClient:
         self, dataset_id: str, page: int = 1, page_size: int = 100
     ) -> List[Dict[str, Any]]:
         client = get_shared_http_client()
-        r = await client.get(
-            f"{self.base_url}/api/v1/datasets/{dataset_id}/documents",
-            headers=self._headers(),
-            params={"page": page, "page_size": page_size},
-            timeout=self.timeout,
-        )
-        data = self._unwrap(r)
-        if isinstance(data, dict) and "docs" in data:
-            return data["docs"]
-        return data if isinstance(data, list) else []
+        all_docs: List[Dict[str, Any]] = []
+        seen_ids = set()
+        current_page = page
+
+        while True:
+            r = await client.get(
+                f"{self.base_url}/api/v1/datasets/{dataset_id}/documents",
+                headers=self._headers(),
+                params={"page": current_page, "page_size": page_size},
+                timeout=self.timeout,
+            )
+            data = self._unwrap(r)
+            if isinstance(data, dict) and "docs" in data:
+                docs = data.get("docs") or []
+                total = int(data.get("total") or 0)
+            elif isinstance(data, list):
+                docs = data
+                total = len(docs)
+            else:
+                break
+
+            if not docs:
+                break
+
+            added = 0
+            for d in docs:
+                doc_id = d.get("id") if isinstance(d, dict) else None
+                if doc_id is None or doc_id not in seen_ids:
+                    if doc_id is not None:
+                        seen_ids.add(doc_id)
+                    all_docs.append(d)
+                    added += 1
+
+            if added == 0:
+                break
+            if total > 0 and len(all_docs) >= total:
+                break
+            if not (isinstance(data, dict) and "docs" in data):
+                break
+            current_page += 1
+            if current_page > 100:
+                break
+
+        return all_docs
 
     async def upload_document(self, dataset_id: str, filename: str, file_bytes: bytes) -> Any:
         client = get_shared_http_client()

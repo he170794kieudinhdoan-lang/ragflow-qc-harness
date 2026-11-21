@@ -47,14 +47,49 @@ const WORKFLOW_STEPS: Record<WorkflowModeId, WorkflowStepDef[]> = {
 };
 
 export default function App() {
-  const [workflowMode, setWorkflowMode] = useState<WorkflowModeId | null>(null);
-  const [tab, setTabState] = useState<string>('overview');
-  const [visitedTabs, setVisitedTabs] = useState<Record<string, boolean>>({ overview: true });
+  const [workflowMode, setWorkflowModeState] = useState<WorkflowModeId | null>(() => {
+    try {
+      const saved = localStorage.getItem('ragflow_qc_workflow_mode');
+      return saved && saved in WORKFLOW_STEPS ? (saved as WorkflowModeId) : null;
+    } catch {
+      return null;
+    }
+  });
+  const [tab, setTabState] = useState<string>(() => {
+    try {
+      return localStorage.getItem('ragflow_qc_active_tab') || 'overview';
+    } catch {
+      return 'overview';
+    }
+  });
+  const [visitedTabs, setVisitedTabs] = useState<Record<string, boolean>>(() => {
+    try {
+      const saved = localStorage.getItem('ragflow_qc_active_tab') || 'overview';
+      return { overview: true, [saved]: true };
+    } catch {
+      return { overview: true };
+    }
+  });
   const [parsingProgress, setParsingProgress] = useState<{ rated: number; total: number }>({ rated: 0, total: 0 });
+
+  const setWorkflowMode = (mode: WorkflowModeId | null) => {
+    setWorkflowModeState(mode);
+    try {
+      if (mode) localStorage.setItem('ragflow_qc_workflow_mode', mode);
+      else localStorage.removeItem('ragflow_qc_workflow_mode');
+    } catch {
+      // ignore storage errors
+    }
+  };
 
   const setTab = (next: string) => {
     setTabState(next);
     setVisitedTabs((prev) => (prev[next] ? prev : { ...prev, [next]: true }));
+    try {
+      localStorage.setItem('ragflow_qc_active_tab', next);
+    } catch {
+      // ignore storage errors
+    }
   };
 
   const startWorkflow = (mode: WorkflowModeId) => {
@@ -175,9 +210,9 @@ export default function App() {
       const saveRes = await api.saveSettings(settings);
       setHasKey(Boolean(settings.ragflow_api_key?.trim()));
       if (saveRes?.account_changed) {
-        // Connection moved to a different RAGFlow account: the local snapshot may be stale, but we
-        // no longer silently delete runs. Reload to drop stale selections without touching data.
+        persistActiveRun(null);
         await loadRuns();
+        setRefreshKey((k) => k + 1);
       }
       if (doTest) {
         const res = await api.testRagflow();
@@ -276,7 +311,6 @@ export default function App() {
                 <ArrowLeft className="size-3.5" />
                 <span>Trang chủ</span>
               </button>
-              <span className="hidden sm:inline-flex ts-tag-teal">{activeWorkflowMeta.title}</span>
             </>
           )}
         </div>
@@ -319,7 +353,7 @@ export default function App() {
               <div className="absolute right-0 mt-1.5 w-72 bg-[#fefefe] border border-[#dedede] rounded-[3px] shadow-md z-50 overflow-hidden">
                 <div className="px-3 py-2 border-b border-[#ededeb] bg-[#f7f7f6] flex items-center justify-between">
                   <span className="font-mono text-[10px] uppercase tracking-wider text-[#71717a]">
-                    Chọn phiên kiểm thử
+                    Chọn Datasets
                   </span>
                   <span className="font-mono text-[10px] text-[#71717a]">{runs.length} phiên</span>
                 </div>
@@ -395,17 +429,17 @@ export default function App() {
                   disabled={gate.locked}
                   onClick={() => !gate.locked && setTab(step.id)}
                   title={gate.locked ? gate.reason : step.label}
-                  className={`inline-flex items-center gap-2 px-2.5 py-1 rounded-[2px] text-xs transition-colors shrink-0 border ${
+                  className={`inline-flex items-center gap-1.5 px-2 py-2 text-xs transition-colors shrink-0 border-b-2 -mb-px ${
                     active
-                      ? 'bg-[#161616] text-[#fefefe] border-[#161616] font-medium'
+                      ? 'text-[#18181b] border-[#18181b] font-semibold'
                       : gate.locked
-                      ? 'bg-transparent text-[#a1a1aa] border-transparent cursor-not-allowed'
-                      : 'bg-[#fefefe] text-[#3d3d3d] border-[#dedede] hover:border-[#161616] hover:text-[#161616]'
+                      ? 'text-[#a1a1aa] border-transparent cursor-not-allowed'
+                      : 'text-[#52525b] border-transparent hover:text-[#18181b] hover:border-[#d4d4d8]'
                   }`}
                 >
                   <span
                     className={`font-mono text-[10px] ${
-                      active ? 'text-[#03aa5c]' : gate.locked ? 'text-[#a1a1aa]' : 'text-[#71717a]'
+                      active ? 'text-[#52a478] font-bold' : gate.locked ? 'text-[#a1a1aa]' : 'text-[#a1a1aa]'
                     }`}
                   >
                     {step.num}
@@ -414,7 +448,7 @@ export default function App() {
                   {gate.locked ? (
                     <Lock className="size-3 text-[#a1a1aa]" />
                   ) : isDone ? (
-                    <Check className={`size-3 ${active ? 'text-[#03aa5c]' : 'text-[#03aa5c]'}`} />
+                    <Check className="size-3 text-[#52a478]" />
                   ) : null}
                 </button>
               </React.Fragment>
@@ -468,7 +502,7 @@ export default function App() {
         )}
         {visitedTabs.compare && (
           <div className={tab === 'compare' ? '' : 'hidden'}>
-            <CompareLabPage />
+            <CompareLabPage activeRun={activeRun} />
           </div>
         )}
       </main>

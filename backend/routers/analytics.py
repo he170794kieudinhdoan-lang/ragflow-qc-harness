@@ -86,6 +86,113 @@ def _compute_retrieval_summary(conn, retrieval_run_id: int):
     }
 
 
+@router.get("/runs/{run_id}/diagnostics")
+def get_run_diagnostics(run_id: int):
+    """
+    Aggregates all 3 layers (Parsing, Chunking, Retrieval) for `run_id` and generates
+    actionable RAGFlow configuration recommendations based on detected failure patterns.
+    """
+    from routers.parsing import get_parsing_metrics
+    from routers.chunking import get_chunking_metrics
+
+    with get_db() as conn:
+        run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if not run:
+            raise HTTPException(status_code=404, detail="Run không tồn tại")
+        latest_rr = conn.execute(
+            "SELECT * FROM retrieval_runs WHERE run_id = ? ORDER BY id DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        ret_summary = _compute_retrieval_summary(conn, latest_rr["id"]) if latest_rr else None
+
+    p = get_parsing_metrics(run_id)
+    c = get_chunking_metrics(run_id)
+
+    recommendations = []
+
+    # Layer 1: Parsing diagnostics
+    if p["rated_units"] > 0:
+        if p["table_accuracy"] < 0.75:
+            recommendations.append({
+                "layer": "PARSING",
+                "severity": "high",
+                "title": f"Độ chính xác bảng biểu thấp ({round(p['table_accuracy'] * 100)}%)",
+                "action": "Trong Cấu hình Parse → Parser & OCR: bật DeepDOC, tăng Table Context Size (256–512) hoặc đổi Chunk Method sang 'table' cho tài liệu nhiều bảng.",
+            })
+        if p["text_completeness"] < 0.8:
+            recommendations.append({
+                "layer": "PARSING",
+                "severity": "high",
+                "title": f"Chất lượng đọc chữ / OCR chưa đạt ({round(p['text_completeness'] * 100)}%)",
+                "action": "Bật 'Enable Vision Enhancement' trong Cấu hình Parse hoặc chuyển PDF Parser sang MinerU đối với tài liệu scan / mờ.",
+            })
+        if p["reading_order_accuracy"] < 0.8:
+            recommendations.append({
+                "layer": "PARSING",
+                "severity": "medium",
+                "title": f"Lỗi thứ tự đọc / đảo cột ({round(p['reading_order_accuracy'] * 100)}%)",
+                "action": "Kiểm tra lại PDF nhiều cột; dùng DeepDOC layout-aware thay vì Plain Text.",
+            })
+
+    # Layer 2: Chunking diagnostics
+    if c["sampled_total"] > 0:
+        if c["chunk_integrity"] < 0.8:
+            recommendations.append({
+                "layer": "CHUNKING",
+                "severity": "high",
+                "title": f"Tính toàn vẹn chunk thấp ({round(c['chunk_integrity'] * 100)}%)",
+                "action": "Tăng Chunk Token Size (VD: 512 → 768/1024) hoặc tăng Overlapped Percent lên 10–15% để tránh cắt đứt câu/bảng.",
+            })
+        if c["noise_rate"] > 0.15:
+            recommendations.append({
+                "layer": "CHUNKING",
+                "severity": "medium",
+                "title": f"Tỷ lệ chunk dính nhiễu cao ({round(c['noise_rate'] * 100)}%)",
+                "action": "Kiểm tra header/footer lặp lại trong PDF và điều chỉnh Delimiters trong Cấu hình Parse → Chunker.",
+            })
+        if c["valid_size_rate"] < 0.85:
+            recommendations.append({
+                "layer": "CHUNKING",
+                "severity": "medium",
+                "title": f"Nhiều chunk sai kích thước chuẩn ({round((1 - c['valid_size_rate']) * 100)}%)",
+                "action": "Điều chỉnh Chunk Token Size hoặc bật Parent-Child Chunking để cân bằng độ dài chunk.",
+            })
+
+    # Layer 3: Retrieval diagnostics
+    if ret_summary and ret_summary["total_testcases"] > 0:
+        if ret_summary["avg_contextual_precision"] < 0.65:
+            recommendations.append({
+                "layer": "RETRIEVAL",
+                "severity": "high",
+                "title": f"Contextual Precision thấp ({round(ret_summary['avg_contextual_precision'] * 100)}%)",
+                "action": "Bật Rerank model, tăng trọng số Hybrid Search (vector_similarity_weight ~ 0.3–0.5) hoặc giảm similarity_threshold xuống 0.15.",
+            })
+        if ret_summary["avg_context_coverage"] < 0.7:
+            recommendations.append({
+                "layer": "RETRIEVAL",
+                "severity": "medium",
+                "title": f"Độ phủ ngữ cảnh (Context Coverage) còn thấp ({round(ret_summary['avg_context_coverage'] * 100)}%)",
+                "action": "Tăng Top-K (VD: 10 → 15) hoặc bật Parent-Child Chunking để trả về ngữ cảnh rộng hơn.",
+            })
+
+    if not recommendations:
+        recommendations.append({
+            "layer": "OK",
+            "severity": "ok",
+            "title": "Các chỉ số hiện tại đạt ngưỡng tốt",
+            "action": "Bạn có thể tiếp tục chạy so sánh A/B với các cấu hình tinh chỉnh nhỏ để tối ưu thêm.",
+        })
+
+    return {
+        "run_id": run_id,
+        "run_name": run["name"],
+        "parsing": p,
+        "chunking": c,
+        "retrieval": ret_summary,
+        "recommendations": recommendations,
+    }
+
+
 @router.get("/runs/{run_id}/overview")
 def get_run_overview(run_id: int):
     with get_db() as conn:

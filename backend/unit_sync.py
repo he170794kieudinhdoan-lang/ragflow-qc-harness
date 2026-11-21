@@ -5,13 +5,17 @@ Historically those links were computed once (at extraction time) and then frozen
 sync that added/fixed chunks left every unit with `matched_chunk_ids = []` forever.
 These helpers re-run the alignment cheaply and never touch manual verdicts.
 """
+import asyncio
 import json
+import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from database import UPLOAD_DIR, get_db, utc_now
 from extractor import extract_document_units
 from metrics import align_unit_to_chunks
+
+logger = logging.getLogger(__name__)
 
 
 def _load_chunks(conn, run_id: int, document_id: int) -> list:
@@ -103,8 +107,12 @@ async def ensure_units_for_document_async(
     if unit_count > 0:
         if chunk_count == 0:
             return result
-        with get_db() as conn:
-            result["realigned"] = realign_units(conn, run_id, document_id)
+
+        def _realign_sync() -> int:
+            with get_db() as conn:
+                return realign_units(conn, run_id, document_id)
+
+        result["realigned"] = await asyncio.to_thread(_realign_sync)
         return result
 
     if chunk_count == 0:
@@ -116,7 +124,8 @@ async def ensure_units_for_document_async(
             return result
         try:
             file_bytes = await client.download_document(dataset_id, ragflow_doc_id)
-        except Exception:
+        except Exception as e:
+            logger.warning("download_document failed for %s (%s): %s", doc_code, filename, e)
             return result
         safe_name = os.path.basename(filename or f"{doc_code}.bin")
         fp = os.path.join(UPLOAD_DIR, f"{doc_code}_{safe_name}")
@@ -139,29 +148,53 @@ async def ensure_units_for_document_async(
             )
         result["downloaded"] = 1
 
-    try:
-        extracted = extract_document_units(fp, max_units=max_units)
-    except Exception:
+    with get_db() as conn:
+        chunks_list = _load_chunks(conn, run_id, document_id)
+    if not chunks_list:
         return result
 
-    if not extracted:
+    def _extract_and_align() -> List[Tuple[Any, ...]]:
+        extracted = extract_document_units(fp, max_units=max_units)
+        if not extracted:
+            return []
+        now = utc_now()
+        rows: List[Tuple[Any, ...]] = []
+        for idx, (utype, pnum, title, stxt) in enumerate(extracted, start=1):
+            matched_ids, score = align_unit_to_chunks(stxt, chunks_list)
+            rows.append(
+                (
+                    run_id,
+                    document_id,
+                    idx,
+                    utype,
+                    pnum,
+                    title,
+                    stxt,
+                    json.dumps(matched_ids),
+                    score,
+                    now,
+                )
+            )
+        return rows
+
+    try:
+        rows_to_insert = await asyncio.to_thread(_extract_and_align)
+    except Exception as e:
+        logger.warning("extract_document_units failed for %s (%s): %s", doc_code, filename, e)
+        return result
+
+    if not rows_to_insert:
         return result
 
     with get_db() as conn:
-        chunks_list = _load_chunks(conn, run_id, document_id)
-        if not chunks_list:
-            return result
-        now = utc_now()
-        for idx, (utype, pnum, title, stxt) in enumerate(extracted, start=1):
-            matched_ids, score = align_unit_to_chunks(stxt, chunks_list)
-            conn.execute(
-                """
-                INSERT INTO parsing_units
-                    (run_id, document_id, unit_index, unit_type, page_num, title, source_text,
-                     matched_chunk_ids, match_score, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (run_id, document_id, idx, utype, pnum, title, stxt, json.dumps(matched_ids), score, now),
-            )
-            result["extracted"] += 1
+        conn.executemany(
+            """
+            INSERT INTO parsing_units
+                (run_id, document_id, unit_index, unit_type, page_num, title, source_text,
+                 matched_chunk_ids, match_score, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows_to_insert,
+        )
+        result["extracted"] = len(rows_to_insert)
     return result
