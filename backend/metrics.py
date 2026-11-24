@@ -6,27 +6,18 @@ from rapidfuzz import fuzz
 
 
 PARSING_ERROR_CATALOG = [
-    {"code": "P1", "group": "Mất nội dung", "name": "Mất đoạn văn bản", "severity": "Nghiêm trọng", "metric": "Text Completeness"},
-    {"code": "P2", "group": "Mất nội dung", "name": "Mất nội dung ảnh / sơ đồ / scan", "severity": "Nghiêm trọng", "metric": "Layout Accuracy"},
-    {"code": "P3", "group": "Sai thứ tự", "name": "Trộn dòng / sai thứ tự đọc / đảo nghĩa", "severity": "Nghiêm trọng", "metric": "Reading Order"},
-    {"code": "P4", "group": "Lỗi ký tự", "name": "Mất dấu tiếng Việt / lỗi ký tự", "severity": "Trung bình", "metric": "Character Error"},
-    {"code": "P5", "group": "Lỗi ký tự", "name": "Ký tự rác / hỏng font", "severity": "Trung bình", "metric": "Character Error"},
-    {"code": "P6", "group": "Lỗi ký tự", "name": "Lỗi OCR (tài liệu scan/ảnh)", "severity": "Trung bình", "metric": "Character Error"},
-    {"code": "P7", "group": "Mất cấu trúc", "name": "Mất cấu trúc heading", "severity": "Trung bình", "metric": "Layout Accuracy"},
-    {"code": "P8", "group": "Mất cấu trúc", "name": "Mất cấu trúc danh sách (bullet/numbering)", "severity": "Trung bình", "metric": "Layout Accuracy"},
-    {"code": "P9", "group": "Vỡ bảng", "name": "Vỡ cấu trúc bảng (mất hàng/cột/ô gộp)", "severity": "Nghiêm trọng", "metric": "Table Accuracy"},
-    {"code": "P10", "group": "Mất nội dung", "name": "Thiếu / sai số liệu trong bảng", "severity": "Nghiêm trọng", "metric": "Content Fidelity"},
+    {"code": "TEXT", "group": "Thiếu chữ / OCR", "name": "Thiếu chữ, sai số liệu hoặc lỗi dấu/OCR", "severity": "Nghiêm trọng", "metric": "Text Completeness"},
+    {"code": "TABLE", "group": "Vỡ bảng", "name": "Vỡ cấu trúc bảng, mất hàng/cột hoặc lệch ô", "severity": "Nghiêm trọng", "metric": "Table Accuracy"},
+    {"code": "ORDER", "group": "Sai thứ tự", "name": "Đảo cột, trộn dòng hoặc sai thứ tự đọc", "severity": "Trung bình", "metric": "Reading Order"},
+    {"code": "LAYOUT", "group": "Hình / Bố cục", "name": "Mất nội dung sơ đồ/ảnh hoặc vỡ heading/danh sách", "severity": "Nghiêm trọng", "metric": "Layout Accuracy"},
 ]
 
 CHUNKING_ERROR_CATALOG = [
-    {"code": "C1", "group": "Vỡ bảng", "name": "Vỡ bảng khi cắt chunk", "severity": "Nghiêm trọng", "metric": "Chunk Integrity"},
-    {"code": "C2", "group": "Cắt sai ranh giới", "name": "Cắt sai ranh giới", "severity": "Trung bình", "metric": "Chunk Integrity"},
-    {"code": "C3", "group": "Thiếu ngữ cảnh", "name": "Thiếu ngữ cảnh", "severity": "Trung bình", "metric": "Context Sufficiency"},
-    {"code": "C4", "group": "Nhiễu", "name": "Chunk chứa nội dung nhiễu", "severity": "Trung bình", "metric": "Noise Rate"},
-    {"code": "C5", "group": "Nhiễu", "name": "Chunk rỗng / chunk rác", "severity": "Nhẹ", "metric": "Noise Rate"},
-    {"code": "C6", "group": "Trùng lặp", "name": "Trùng lặp do cắt chunk", "severity": "Trung bình", "metric": "Duplicate Rate"},
-    {"code": "C7", "group": "Trùng lặp", "name": "Thừa nội dung / trùng lặp", "severity": "Trung bình", "metric": "Duplicate Rate"},
-    {"code": "C8", "group": "Kích thước bất thường", "name": "Kích thước bất thường", "severity": "Nhẹ", "metric": "Size Compliance"},
+    {"code": "INTEGRITY", "group": "Toàn vẹn đoạn", "name": "Cắt ngang câu / danh sách hoặc vỡ bảng", "severity": "Nghiêm trọng", "metric": "Chunk Integrity"},
+    {"code": "CONTEXT", "group": "Thiếu ngữ cảnh", "name": "Đọc độc lập thiếu chủ thể / ngữ cảnh", "severity": "Trung bình", "metric": "Context Sufficiency"},
+    {"code": "NOISE", "group": "Nhiễu / Rác", "name": "Chứa menu web, header/footer, OCR rác, chunk rỗng", "severity": "Trung bình", "metric": "Noise Rate"},
+    {"code": "DUPLICATE", "group": "Trùng lặp", "name": "Lặp nội dung giữa các chunk hoặc lặp header", "severity": "Trung bình", "metric": "Duplicate Rate"},
+    {"code": "SIZE", "group": "Kích thước", "name": "Quá ngắn hoặc quá dài bất thường", "severity": "Nhẹ", "metric": "Size Compliance"},
 ]
 
 RETRIEVAL_ERROR_CATALOG = [
@@ -43,12 +34,40 @@ def nfc(text: str) -> str:
     return unicodedata.normalize("NFC", text or "")
 
 
+_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\ufeff\u00ad]")
+_MD_IMG_RE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((?:<[^>]+>|[^()]*|\([^()]*\))*\)")
+_MD_ESCAPE_RE = re.compile(r"\\([.\-*_#()\[\]])")
+_MD_HEADING_PREFIX_RE = re.compile(r"(?m)^\s*#{1,6}\s+")
+
+
+def canonicalize_text(text: str) -> str:
+    """
+    Document-agnostic canonical normalization for both ground-truth source_text and parsed chunks:
+    strips invisible Unicode chars, normalizes dashes/quotes/NBSP, removes Markdown link URLs
+    (including quoted titles) & inline markup so comparison measures semantic text fidelity.
+    """
+    t = nfc(text or "")
+    t = _ZERO_WIDTH_RE.sub("", t)
+    t = t.replace("\u00a0", " ")
+    t = t.replace("–", "-").replace("—", "-").replace("−", "-")
+    t = t.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+    t = _MD_IMG_RE.sub(r"\1", t)
+    t = _MD_LINK_RE.sub(r"\1", t)
+    t = re.sub(r"\*\*([^*]+)\*\*", r"\1", t)
+    t = re.sub(r"__([^_]+)__", r"\1", t)
+    t = re.sub(r"`([^`]+)`", r"\1", t)
+    t = _MD_ESCAPE_RE.sub(r"\1", t)
+    t = _MD_HEADING_PREFIX_RE.sub("", t)
+    return t
+
+
 def normalize_text(text: str) -> str:
-    return re.sub(r"\s+", " ", nfc(text).strip().lower())
+    return re.sub(r"\s+", " ", canonicalize_text(text).strip().lower())
 
 
 def collapse_whitespace(text: str) -> str:
-    return re.sub(r"\s+", " ", nfc(text).strip())
+    return re.sub(r"\s+", " ", canonicalize_text(text).strip())
 
 
 def _html_table_to_pipe(text: str) -> str:
@@ -63,36 +82,118 @@ def _html_table_to_pipe(text: str) -> str:
     return "\n".join(ln for ln in lines if ln)
 
 
+def _extract_table_rows(text: str) -> List[List[str]]:
+    """Extract normalized non-empty rows of cells from pipe-delimited or HTML table text."""
+    pipe_txt = _html_table_to_pipe(text)
+    rows: List[List[str]] = []
+    for ln in nfc(pipe_txt).splitlines():
+        cells = [normalize_text(raw_cell) for raw_cell in ln.split("|")]
+        cells = [c for c in cells if c]
+        if cells:
+            rows.append(cells)
+    return rows
+
+
 def _extract_table_cells(text: str) -> List[str]:
     """Extract normalized non-empty table cells from either pipe-delimited or HTML table text."""
-    pipe_txt = _html_table_to_pipe(text)
-    cells: List[str] = []
-    for ln in nfc(pipe_txt).splitlines():
-        for raw_cell in ln.split("|"):
-            c = normalize_text(raw_cell)
-            if c:
-                cells.append(c)
-    return cells
+    return [c for row in _extract_table_rows(text) for c in row]
+
+
+def _cell_matches(src_cell: str, cand_cells: List[str], cand_row_flat: str) -> bool:
+    """Match a single source cell against candidate row cells; short cells require exact cell match."""
+    if src_cell in cand_cells:
+        return True
+    if len(src_cell) < 4:
+        return False
+    if src_cell in cand_row_flat:
+        return True
+    return any(float(fuzz.partial_ratio(src_cell, cc)) >= 88.0 for cc in cand_cells if len(cc) >= 3)
 
 
 def _compute_table_cell_recall(source_text: str, candidate_text: str) -> float:
     """
-    Format-agnostic table evaluation: measures what % of source table cells are faithfully
-    preserved in the parsed output (tolerant to colspan/rowspan/HTML-to-pipe formatting differences).
+    Fast structure-aware table evaluation (O(R*C)): matches source rows against candidate rows
+    using an inverted cell index while preserving row grouping and relative column order,
+    preventing scrambled-column false PASS without O(R^2*C^2) slowdowns on huge Excel sheets.
     """
-    src_cells = _extract_table_cells(source_text)
-    if not src_cells:
+    src_rows = _extract_table_rows(source_text)
+    if not src_rows:
         return 0.0
-    cand_norm = normalize_text(_html_table_to_pipe(candidate_text))
-    if not cand_norm:
+    cand_rows = _extract_table_rows(candidate_text)
+    if not cand_rows:
         return 0.0
-    matched = 0
-    for cell in src_cells:
-        if cell in cand_norm:
-            matched += 1
-        elif len(cell) >= 4 and float(fuzz.partial_ratio(cell, cand_norm)) >= 88.0:
-            matched += 1
-    return round((matched / len(src_cells)) * 100.0, 2)
+
+    has_cand_structure = (
+        len(cand_rows) >= 2
+        or "<td" in candidate_text.lower()
+        or "<tr" in candidate_text.lower()
+        or "|" in candidate_text
+    )
+
+    total_cells = sum(len(r) for r in src_rows)
+    if total_cells == 0:
+        return 0.0
+
+    # Inverted index: cell -> candidate row indices for O(1) candidate row lookup
+    cell_to_rows: Dict[str, List[int]] = {}
+    for c_idx, c_row in enumerate(cand_rows):
+        for cc in set(c_row):
+            cell_to_rows.setdefault(cc, []).append(c_idx)
+
+    use_fuzzy = len(src_rows) <= 35 and len(cand_rows) <= 60
+    matched_cells = 0.0
+    used_cand_rows = set()
+
+    for s_idx, s_row in enumerate(src_rows):
+        # Gather candidate rows that share at least one exact cell; fallback to nearby rows
+        cand_counts: Dict[int, int] = {}
+        for s_cell in s_row:
+            for c_idx in cell_to_rows.get(s_cell, ()):
+                if c_idx not in used_cand_rows:
+                    cand_counts[c_idx] = cand_counts.get(c_idx, 0) + 1
+
+        if cand_counts:
+            top_cands = sorted(cand_counts.keys(), key=lambda i: cand_counts[i], reverse=True)[:5]
+        elif use_fuzzy:
+            top_cands = [i for i in range(max(0, s_idx - 3), min(len(cand_rows), s_idx + 4)) if i not in used_cand_rows]
+        else:
+            top_cands = []
+
+        best_row_score = 0.0
+        best_row_idx = -1
+        for c_idx in top_cands:
+            c_row = cand_rows[c_idx]
+            c_set = set(c_row)
+            row_hits = 0.0
+            last_pos = -1
+            for s_cell in s_row:
+                found_idx = -1
+                for j in range(last_pos + 1, len(c_row)):
+                    cc = c_row[j]
+                    if s_cell == cc:
+                        found_idx = j
+                        break
+                    if len(s_cell) >= 4 and (s_cell in cc or (use_fuzzy and len(cc) >= 3 and float(fuzz.partial_ratio(s_cell, cc)) >= 88.0)):
+                        found_idx = j
+                        break
+                if found_idx != -1:
+                    row_hits += 1.0
+                    last_pos = found_idx
+                elif s_cell in c_set:
+                    # Out-of-order cell in same row gets half credit
+                    row_hits += 0.5
+            if row_hits > best_row_score:
+                best_row_score = row_hits
+                best_row_idx = c_idx
+
+        if best_row_idx != -1:
+            used_cand_rows.add(best_row_idx)
+            matched_cells += best_row_score
+
+    score = (matched_cells / total_cells) * 100.0
+    if len(src_rows) >= 2 and not has_cand_structure:
+        score = min(score, 65.0)
+    return round(score, 2)
 
 
 def strip_diacritics(text: str) -> str:
@@ -102,26 +203,44 @@ def strip_diacritics(text: str) -> str:
 
 
 _NUM_TOKEN_RE = re.compile(
-    r"(?:<=|>=|[<>±])?\s*\d+(?:[.,]\d+)?(?:\s*(?:%|mg|ml|g|kg|/l|/mm3|mm3|tuần|tháng|ngày|giờ))?",
+    r"(?:<=|>=|[<>±])?\s*\d+(?:[.,]\d+)?(?:\s*(?:%|mg|ml|g|kg|vnd|usd|tỷ|triệu|/l|/mm3|mm3|tuần|tháng|ngày|giờ|năm))?",
     re.IGNORECASE,
 )
+# Leading structural numbering (e.g. "4. ", "2.1. ", "Điều 5: ") that should not trigger CRITICAL_NUM_DIFF
+_LEADING_STRUCT_NUM_RE = re.compile(
+    r"^\s*(?:(?:chương|phần|mục|điều|khoản|bài|câu)\s+\d+[.:)]?\s*|\d+(?:\.\d+)*[.)]\s+)",
+    re.IGNORECASE,
+)
+# Universal domain-agnostic polarity & obligation terms (matched with word boundaries)
 _NEGATION_TERMS = [
     "chống chỉ định",
     "không chỉ định",
+    "nghiêm cấm",
+    "miễn trừ",
+    "ngoại trừ",
+    "bắt buộc",
+    "tối thiểu",
+    "tối đa",
     "âm tính",
     "dương tính",
+    "trước thuế",
+    "sau thuế",
     "không",
     "chưa",
-    "prep",
-    "pep",
-    "bậc 1",
-    "bậc 2",
+    "cấm",
+]
+_NEGATION_TERM_RES = [
+    (term, re.compile(rf"(?<!\w){re.escape(term)}(?!\w)", re.IGNORECASE))
+    for term in _NEGATION_TERMS
 ]
 
 
-def _extract_num_multiset(text: str) -> Dict[str, int]:
+def _extract_num_multiset(text: str, strip_leading_struct: bool = False) -> Dict[str, int]:
+    t = canonicalize_text(text)
+    if strip_leading_struct:
+        t = _LEADING_STRUCT_NUM_RE.sub("", t)
     counts: Dict[str, int] = {}
-    for m in _NUM_TOKEN_RE.findall(nfc(text)):
+    for m in _NUM_TOKEN_RE.findall(t):
         tok = re.sub(r"\s+", "", m.lower())
         if tok:
             counts[tok] = counts.get(tok, 0) + 1
@@ -175,12 +294,22 @@ def analyze_parsing_risks(
         flags.append({"code": "GARBAGE_CHAR", "label": "Phát hiện ký tự rác / lỗi mã hóa (P5)", "severity": "Trung bình"})
         add_code("P5")
 
-    # P4: Vietnamese diacritic loss/corruption
+    # P4: Vietnamese diacritic loss/corruption — only trigger when texts actually match after stripping diacritics
+    # (prevents false P4 when two unrelated short phrases happen to share ASCII letters)
     has_diacritic_issue = False
     if src_c.lower() != exc_c.lower():
         acc_sim = float(fuzz.ratio(src_c.lower(), exc_c.lower()))
         no_acc_sim = float(fuzz.ratio(strip_diacritics(src_c.lower()), strip_diacritics(exc_c.lower())))
-        if no_acc_sim - acc_sim >= 1.5:
+        word_diacritic_lost = False
+        if no_acc_sim >= 80.0 and no_acc_sim - acc_sim < 1.5:
+            src_words = set(re.findall(r"[^\W\d_]{2,}", src_c.lower()))
+            exc_words = set(re.findall(r"[^\W\d_]{2,}", exc_c.lower()))
+            for w in src_words - exc_words:
+                stripped = strip_diacritics(w)
+                if stripped != w and stripped in exc_words and stripped not in src_words:
+                    word_diacritic_lost = True
+                    break
+        if (no_acc_sim >= 85.0 and (no_acc_sim - acc_sim >= 1.5)) or word_diacritic_lost:
             has_diacritic_issue = True
             flags.append({
                 "code": "DIACRITIC_LOSS",
@@ -195,10 +324,11 @@ def analyze_parsing_risks(
     ):
         add_code("P6")
 
-    # P3: Scrambled reading order (high bag-of-words overlap, low sequential ratio)
-    if text_sim < 78.0:
-        tok_set = float(fuzz.token_set_ratio(src_c.lower(), exc_c.lower()))
-        if tok_set >= 85.0 and (tok_set - text_sim) >= 12.0:
+    # P3: Scrambled reading order — require substantial text (>=80 chars) and true word-order inversion
+    # (token_sort_ratio >> text_sim, not just 1 extra inserted word)
+    if len(src_c) >= 80 and len(exc_c) >= 80 and text_sim < 85.0:
+        tok_sort = float(fuzz.token_sort_ratio(src_c.lower(), exc_c.lower()))
+        if tok_sort >= 88.0 and (tok_sort - text_sim) >= 10.0:
             flags.append({
                 "code": "READING_ORDER_SCRAMBLED",
                 "label": "Nghi đảo thứ tự dòng / trộn cột (P3)",
@@ -206,25 +336,35 @@ def analyze_parsing_risks(
             })
             add_code("P3")
 
-    # P10 / P3: Critical numeric / operator mismatch
-    src_nums = _extract_num_multiset(src_c)
-    exc_nums = _extract_num_multiset(exc_c)
-    if src_nums and src_nums != exc_nums:
+    # P10 / P3: Critical numeric / operator mismatch (both missing AND extra/duplicated numbers;
+    # ignore leading structural numbering like "4. " on non-table text units)
+    strip_struct = unit_type != "table"
+    src_nums = _extract_num_multiset(src_c, strip_leading_struct=strip_struct)
+    exc_nums = _extract_num_multiset(exc_c, strip_leading_struct=strip_struct)
+    if src_nums != exc_nums and (src_nums or exc_nums):
         missing_nums = [k for k, v in src_nums.items() if exc_nums.get(k, 0) < v]
-        if missing_nums:
-            sample = ", ".join(missing_nums[:4])
+        extra_nums = [k for k, v in exc_nums.items() if src_nums.get(k, 0) < v]
+        if missing_nums or extra_nums:
+            parts = []
+            if missing_nums:
+                parts.append(f"thiếu {', '.join(missing_nums[:3])}")
+            if extra_nums:
+                parts.append(f"dư {', '.join(extra_nums[:3])}")
             err_code = "P10" if unit_type == "table" else "P3"
             flags.append({
                 "code": "CRITICAL_NUM_DIFF",
-                "label": f"Lệch / mất số liệu: {sample} ({err_code})",
+                "label": f"Lệch số liệu ({'; '.join(parts)}) ({err_code})",
                 "severity": "Nghiêm trọng",
             })
             add_code(err_code)
 
-    # P3: Critical negation / polarity flip
+    # P3: Critical negation / polarity flip (word-boundary regex, domain-agnostic)
     src_low = src_c.lower()
     exc_low = exc_c.lower()
-    diff_terms = [term for term in _NEGATION_TERMS if src_low.count(term) != exc_low.count(term)]
+    diff_terms = [
+        term for term, rx in _NEGATION_TERM_RES
+        if len(rx.findall(src_low)) != len(rx.findall(exc_low))
+    ]
     if diff_terms:
         flags.append({
             "code": "CRITICAL_NEGATION_DIFF",
@@ -246,9 +386,9 @@ def analyze_parsing_risks(
     else:
         src_lines = [ln.strip() for ln in nfc(source_text).splitlines() if ln.strip()]
         exc_lines = [ln.strip() for ln in nfc(excerpt).splitlines() if ln.strip()]
-        # P7: Heading merged into body paragraph
+        # P7: Heading merged into body paragraph (check first line even if excerpt has > 1 line)
         if len(src_lines) >= 2 and _HEADING_LINE_RE.match(src_lines[0]) and len(src_lines[0]) <= 110:
-            if len(exc_lines) == 1 and len(exc_lines[0]) > len(src_lines[0]) + 25:
+            if exc_lines and len(exc_lines[0]) > len(src_lines[0]) + 25:
                 add_code("P7")
         # P8: List merged
         src_list_cnt = sum(1 for ln in src_lines if _LIST_LINE_RE.match(ln))
@@ -266,39 +406,30 @@ def analyze_parsing_risks(
     return flags, suggested_codes
 
 
+_CHUNK_NOISE_PATTERNS = [
+    r"\btrang\s+\d+\s*/\s*\d+\b",
+    r"\bpage\s+\d+\s+of\s+\d+\b",
+    r"bản quyền|copyright|all rights reserved",
+    r"cookie|privacy policy|đăng nhập|đăng ký ngay|tìm kiếm\.\.\.",
+    r"mục lục|table of contents",
+]
+
+
 def detect_chunk_rule_flags(
-    content: str, min_chars: int = 50, max_chars: int = 2600
+    content: str, min_chars: int = 50, max_chars: int = 2600, exempt_intact_table: bool = True
 ) -> List[str]:
-    flags: List[str] = []
-    stripped = (content or "").strip()
-    n = len(stripped)
-
-    if n == 0:
-        flags.append("EMPTY")
-    elif n < min_chars:
-        flags.append("TOO_SHORT")
-    if n > max_chars:
-        flags.append("TOO_LONG")
-
-    # Page number / pure numeric noise
-    if re.fullmatch(r"[\d\s\-/.,|]+", stripped) and n > 0:
-        flags.append("NUMERIC_ONLY_NOISE")
-
-    # Common Vietnamese/web boilerplate noise
-    lower = stripped.lower()
-    noise_patterns = [
-        r"trang\s+\d+\s*/\s*\d+",
-        r"bản quyền thuộc về",
-        r"cookie|privacy policy|đăng nhập|đăng ký ngay|tìm kiếm\.\.\.",
-    ]
-    if any(re.search(p, lower) for p in noise_patterns):
-        flags.append("SUSPECTED_NOISE")
-
-    # Garbled / replacement characters (OCR / encoding)
-    if re.search(r"[\ufffd\x00-\x08\x0b\x0c\x0e-\x1f]", stripped):
-        flags.append("CHAR_CORRUPTION")
-
-    return flags
+    """
+    Lightweight single-chunk flag detector used during chunk sync; shares the exact same
+    size, table-exemption, noise, and char-corruption definitions as `analyze_chunk_rules`.
+    """
+    res = analyze_chunk_rules(
+        {"content": content},
+        min_chars=min_chars,
+        max_chars=max_chars,
+        exempt_intact_table=exempt_intact_table,
+    )
+    # Keep sync-time flags focused on per-chunk anomalies (exclude boundary/neighbor flags that need prev/next context)
+    return [f for f in res["rule_flags"] if f not in ("BROKEN_TABLE", "BAD_BOUNDARY", "LOW_CONTEXT")]
 
 
 def detect_duplicates_classified(
@@ -382,43 +513,87 @@ def analyze_chunk_rules(
     alpha_cnt = sum(1 for c in raw if c.isalpha())
     is_junk = n == 0 or alpha_cnt < 12 or bool(re.fullmatch(r"[\d\s\-/.,|]+", raw))
     if n == 0:
-        add("C5", "EMPTY")
+        add("NOISE", "EMPTY")
+        add("INTEGRITY")
+        add("CONTEXT")
+        add("SIZE")
     elif is_junk:
-        add("C5", "NUMERIC_ONLY_NOISE")
+        add("NOISE", "NUMERIC_ONLY_NOISE")
+        add("INTEGRITY")
+        add("CONTEXT")
+        add("SIZE")
 
     lower = raw.lower()
     has_td = "<td" in lower or "<tr" in lower
     has_table_open = "<table" in lower
     has_table_close = "</table" in lower
-    # Intact table exception (DOC07 #3, DOC11 #3): balanced standalone tables are exempt from C8 TOO_LONG
+    # Intact table exception: balanced standalone tables are exempt from SIZE TOO_LONG
     is_intact_table = has_table_open and has_table_close and (lower.count("<table") == lower.count("</table"))
 
     if 0 < n < min_chars:
-        add("C8", "TOO_SHORT")
+        add("SIZE", "TOO_SHORT")
     elif n > max_chars and not (exempt_intact_table and is_intact_table):
-        add("C8", "TOO_LONG")
-    noise_patterns = [
-        r"\btrang\s+\d+\s*/\s*\d+\b",
-        r"\bpage\s+\d+\s+of\s+\d+\b",
-        r"bản quyền|copyright|all rights reserved",
-        r"mục lục|table of contents",
-    ]
+        add("SIZE", "TOO_LONG")
+
+    if re.search(r"[\ufffd\x00-\x08\x0b\x0c\x0e-\x1f]", raw):
+        add("NOISE", "CHAR_CORRUPTION")
+
     has_rep_line = bool(repeated_lines and any(ln in repeated_lines for ln in lines))
-    if has_rep_line or any(re.search(p, lower) for p in noise_patterns):
-        add("C4", "SUSPECTED_NOISE")
+    has_isolated_page_num = len(lines) >= 3 and any(re.fullmatch(r"\d{1,3}", ln) for ln in lines)
+    has_cta_footer = bool(
+        re.search(r"(?:quét mã|truy cập website|để xem chi tiết|để biết thêm chi tiết|\.gov\.vn)", lower)
+    )
+    if has_rep_line or has_isolated_page_num or has_cta_footer or any(re.search(p, lower) for p in _CHUNK_NOISE_PATTERNS):
+        add("NOISE", "ISOLATED_PAGE_NUM" if has_isolated_page_num else "SUSPECTED_NOISE")
+
+    # Detect internal duplicate lines (e.g. accented + unaccented OCR double-extraction in same chunk)
+    has_internal_dup = False
+    if not is_junk and not has_td and len(lines) >= 3:
+        norm_lines = [re.sub(r"[^a-z0-9]+", " ", strip_diacritics(ln).lower()).strip() for ln in lines]
+        long_norm = [ln for ln in norm_lines if len(ln) >= 22]
+        for i_ln in range(len(long_norm)):
+            for j_ln in range(i_ln + 1, len(long_norm)):
+                if fuzz.ratio(long_norm[i_ln], long_norm[j_ln], score_cutoff=82) >= 82:
+                    has_internal_dup = True
+                    break
+            if has_internal_dup:
+                break
+        # Also catch repeated half-line inside same line (e.g. "... de xem chi tiet ... de xem chi tiet")
+        if not has_internal_dup:
+            for ln in long_norm:
+                toks = ln.split()
+                if len(toks) >= 10:
+                    half = len(toks) // 2
+                    left_s = " ".join(toks[:half])
+                    right_s = " ".join(toks[half:])
+                    if fuzz.partial_ratio(left_s, right_s, score_cutoff=85) >= 85:
+                        has_internal_dup = True
+                        break
 
     if is_adj_dup:
-        add("C6", "ADJACENT_DUPLICATE")
-    if is_far_dup:
-        add("C7", "DUPLICATE")
+        add("DUPLICATE", "ADJACENT_DUPLICATE")
+    if is_far_dup or has_internal_dup:
+        add("DUPLICATE", "INTERNAL_DUPLICATE" if has_internal_dup else "DUPLICATE")
 
-    has_td = "<td" in lower or "<tr" in lower
-    has_table_open = "<table" in lower
-    has_table_close = "</table" in lower
     prev_has_td = "<td" in (prev_content or "").lower()
     next_has_td = "<td" in (next_content or "").lower()
     if has_td and ((has_table_open != has_table_close) or (not has_table_open) or prev_has_td or next_has_td):
-        add("C1", "BROKEN_TABLE")
+        add("INTEGRITY", "BROKEN_TABLE")
+
+    prev_lines = [ln.strip() for ln in nfc(prev_content or "").splitlines() if ln.strip()]
+    prev_opened_list = any(
+        pl.endswith(":") and re.search(r"(?:con đường|bao gồm|sau đây|như sau|triệu chứng|yếu tố|nhóm|bước|giai đoạn|gồm|sau)\s*:$", pl.lower())
+        for pl in prev_lines[-5:]
+    )
+
+    has_heading = False
+    if not is_junk and lines:
+        first_line = lines[0]
+        has_heading = bool(
+            _HEADING_LINE_RE.match(first_line)
+            or first_line.startswith("#")
+            or (len(first_line) <= 100 and sum(1 for c in first_line if c.isupper()) >= max(6, int(0.75 * max(1, sum(1 for c in first_line if c.isalpha())))))
+        )
 
     if not is_junk and not has_td and lines:
         first_ch = lines[0][0]
@@ -427,24 +602,20 @@ def analyze_chunk_rules(
         starts_mid = first_ch.islower() or first_ch in ",;)]"
         ends_mid = last_ch not in ".!?:;\"')]" and not _HEADING_LINE_RE.match(last_line) and len(last_line) > 30
         trailing_colon = last_ch == ":" and len(lines) <= 2 and bool(next_content.strip())
-        if starts_mid or ends_mid or trailing_colon:
-            add("C2", "BAD_BOUNDARY")
+        list_split = prev_opened_list and not has_heading and len(lines[0]) <= 220
+        if starts_mid or ends_mid or trailing_colon or list_split:
+            add("INTEGRITY", "LIST_SPLIT" if (list_split and not (starts_mid or ends_mid or trailing_colon)) else "BAD_BOUNDARY")
 
     if not is_junk and lines:
         first_line = lines[0]
-        has_heading = bool(
-            _HEADING_LINE_RE.match(first_line)
-            or first_line.startswith("#")
-            or (len(first_line) <= 100 and sum(1 for c in first_line if c.isupper()) >= max(6, int(0.75 * max(1, sum(1 for c in first_line if c.isalpha())))))
-        )
-        if not has_heading and (_AMBIGUOUS_START_RE.match(first_line) or first_line[0].islower()):
-            add("C3", "LOW_CONTEXT")
+        if not has_heading and (_AMBIGUOUS_START_RE.match(first_line) or first_line[0].islower() or prev_opened_list):
+            add("CONTEXT", "LOW_CONTEXT")
 
-    integrity = 0 if ("C1" in codes or "C2" in codes) else 1
-    context_sufficiency = 0 if ("C3" in codes or "C5" in codes) else 1
-    no_noise = 0 if ("C4" in codes or "C5" in codes) else 1
-    no_duplicate = 0 if ("C6" in codes or "C7" in codes) else 1
-    valid_size = 0 if ("C8" in codes or "C5" in codes) else 1
+    integrity = 0 if "INTEGRITY" in codes else 1
+    context_sufficiency = 0 if "CONTEXT" in codes else 1
+    no_noise = 0 if "NOISE" in codes else 1
+    no_duplicate = 0 if "DUPLICATE" in codes else 1
+    valid_size = 0 if "SIZE" in codes else 1
 
     return {
         "integrity": integrity,
@@ -468,17 +639,77 @@ def _expand_to_word_bounds(text: str, start: int, end: int) -> Tuple[int, int]:
     return s, e
 
 
+def _locate_best_span(src_low: str, chk_low: str) -> Tuple[int, int]:
+    """
+    Fast span locator: uses exact/prefix anchor windowing when strings are long so
+    RapidFuzz partial_ratio_alignment runs on a small local window (O(ms) instead of O(N*M) seconds).
+    """
+    n_src = len(src_low)
+    n_chk = len(chk_low)
+    if n_src <= 1800 and n_chk <= 3500:
+        aln = fuzz.partial_ratio_alignment(src_low, chk_low)
+        if aln is not None and aln.dest_end > aln.dest_start:
+            return aln.dest_start, aln.dest_end
+        return 0, n_chk
+
+    # Try exact substring anchor from start/middle/end of src_low
+    anchor_pos = -1
+    for probe in (src_low[:80], src_low[n_src // 3 : n_src // 3 + 80], src_low[:40]):
+        probe = probe.strip()
+        if len(probe) >= 16:
+            idx = chk_low.find(probe)
+            if idx != -1:
+                anchor_pos = max(0, idx - (n_src // 3 if probe != src_low[:80] and probe != src_low[:40] else 0))
+                break
+
+    if anchor_pos != -1:
+        win_start = max(0, anchor_pos - 120)
+        win_end = min(n_chk, win_start + max(n_src + 500, 2600))
+        sub_chk = chk_low[win_start:win_end]
+        aln = fuzz.partial_ratio_alignment(src_low[:1800], sub_chk[:3500])
+        if aln is not None and aln.dest_end > aln.dest_start:
+            # Extend end proportionally if src_low was longer than 1800
+            est_end = win_start + aln.dest_end
+            if n_src > 1800:
+                est_end = min(n_chk, max(est_end, win_start + aln.dest_start + n_src + 120))
+            return win_start + aln.dest_start, est_end
+        return win_start, min(n_chk, win_start + n_src)
+
+    aln = fuzz.partial_ratio_alignment(src_low[:1500], chk_low[:3000])
+    if aln is not None and aln.dest_end > aln.dest_start:
+        est_end = aln.dest_end if n_src <= 1500 else min(n_chk, aln.dest_start + n_src + 120)
+        return aln.dest_start, est_end
+    return 0, min(n_chk, max(n_src, 3000))
+
+
 def extract_best_aligned_span(
     source_text: str, chunk_content: str, unit_type: str = "text", format_group: str = ""
 ) -> Dict[str, Any]:
     """
-    Uses RapidFuzz partial_ratio_alignment to locate the exact substring of `chunk_content`
-    that best matches `source_text`, even with OCR typos, missing Vietnamese accents, or
-    reformatted line breaks.
+    Uses RapidFuzz partial_ratio_alignment (with fast anchor windowing) to locate the exact
+    substring of `chunk_content` that best matches `source_text`, even with OCR typos,
+    missing Vietnamese accents, or reformatted line breaks.
     """
-    src_raw = nfc(source_text).strip()
+    src_raw = canonicalize_text(source_text).strip()
     chk_input = _html_table_to_pipe(chunk_content) if unit_type == "table" else chunk_content
-    chk_raw = nfc(chk_input).strip()
+    chk_raw = canonicalize_text(chk_input).strip()
+
+    # Placeholder ground-truth (embedded images or un-OCRed scanned pages) cannot be auto-scored via text diff
+    if src_raw.startswith("[Hình ảnh / Sơ đồ") or src_raw.startswith("[Trang "):
+        return {
+            "matched_excerpt": chk_raw[:1200],
+            "start": 0,
+            "end": min(len(chk_raw), 1200),
+            "raw_similarity": 0.0,
+            "text_similarity": 0.0,
+            "has_format_diff": False,
+            "has_text_diff": False,
+            "suggested_verdict": "UNRATED",
+            "stitched_with_chunk_index": None,
+            "risk_flags": [{"code": "NEEDS_VISUAL_REVIEW", "label": "Cần QC đối chiếu ảnh/scan hoặc chạy Vision OCR", "severity": "Trung bình"}],
+            "suggested_error_codes": [],
+        }
+
     if not src_raw or not chk_raw:
         return {
             "matched_excerpt": "",
@@ -496,14 +727,9 @@ def extract_best_aligned_span(
 
     src_low = src_raw.lower()
     chk_low = chk_raw.lower()
-    aln = fuzz.partial_ratio_alignment(src_low, chk_low)
-
-    if aln is not None and aln.dest_end > aln.dest_start:
-        s, e = _expand_to_word_bounds(chk_raw, aln.dest_start, aln.dest_end)
-        excerpt = chk_raw[s:e].strip()
-    else:
-        s, e = 0, len(chk_raw)
-        excerpt = chk_raw
+    raw_s, raw_e = _locate_best_span(src_low, chk_low)
+    s, e = _expand_to_word_bounds(chk_raw, raw_s, raw_e)
+    excerpt = chk_raw[s:e].strip() or chk_raw[:min(len(chk_raw), len(src_raw) + 200)]
 
     raw_sim = round(float(fuzz.ratio(src_raw, excerpt)), 2)
     src_collapsed = collapse_whitespace(src_raw)
@@ -523,7 +749,9 @@ def extract_best_aligned_span(
     )
     has_critical = any(f["severity"] == "Nghiêm trọng" for f in risk_flags)
 
-    if text_sim >= 98.0 and not has_critical:
+    if has_critical:
+        suggested = "FAIL"
+    elif text_sim >= 98.0:
         suggested = "PASS"
     elif text_sim >= 72.0:
         suggested = "PARTIAL"
@@ -563,6 +791,9 @@ def extract_best_aligned_span_with_stitching(
     base = extract_best_aligned_span(source_text, chunk_content, unit_type=unit_type, format_group=format_group)
     if base["text_similarity"] >= 99.5 and not base["risk_flags"]:
         return base
+    # Skip expensive neighbor stitching if source is an oversized sheet/table that already fits inside chunk_content
+    if len(source_text) > 3500 and len(chunk_content) > 4000 and base["text_similarity"] >= 70.0:
+        return base
 
     best = base
     candidates = []
@@ -582,26 +813,41 @@ def extract_best_aligned_span_with_stitching(
             stitched["stitched_with_chunk_index"] = neighbor_idx
             best = stitched
 
+    if prev_chunk_content and next_chunk_content and best["text_similarity"] < 92.0:
+        combined_3 = f"{prev_chunk_content}\n{chunk_content}\n{next_chunk_content}"
+        stitched_3 = extract_best_aligned_span(source_text, combined_3, unit_type=unit_type, format_group=format_group)
+        if stitched_3["text_similarity"] >= best["text_similarity"] + 1.0:
+            stitched_3["stitched_with_chunk_index"] = next_chunk_index
+            best = stitched_3
+
     return best
 
 
 def align_unit_to_chunks(
-    source_text: str, chunks: List[Dict[str, Any]], top_n: int = 3
+    source_text: str, chunks: List[Dict[str, Any]], top_n: int = 3, page_num: int | None = None
 ) -> Tuple[List[str], float]:
     """Fuzzy-align a source ground-truth paragraph/table to parsed chunks using RapidFuzz."""
-    src_norm = normalize_text(source_text)
+    # For multi-row pipe tables, match on body rows (skipping the repeated header row) so split
+    # multi-page tables align to their actual data chunk instead of the first header chunk.
+    raw_lines = [ln.strip() for ln in (source_text or "").splitlines() if ln.strip()]
+    is_pipe_table = len(raw_lines) >= 2 and ("|" in raw_lines[0]) and ("|" in raw_lines[1])
+    match_text = "\n".join(raw_lines[1:]) if is_pipe_table else source_text
+    src_norm = normalize_text(match_text) or normalize_text(source_text)
     if not src_norm:
         return [], 0.0
     src_tokens = set(re.findall(r"\w+", src_norm))
     if not src_tokens:
         return [], 0.0
 
-    # Cap string length passed to partial_ratio so huge tables (e.g. 50k-char Excel sheets)
-    # cannot hang O(N*M) DP alignment.
-    src_fuzzy = src_norm[:2000]
+    # Fast 2-stage alignment:
+    # Stage 1: O(1) prefix hit or token-overlap pre-filter across all chunks.
+    # Stage 2: RapidFuzz partial_ratio only on the top-8 token-overlap candidates (600x1500 cap)
+    # so 50k-char Excel sheets and 200-chunk DOCX files align in milliseconds instead of minutes.
+    src_fuzzy = src_norm[:600]
     src_prefix = src_norm[:120]
 
-    scored = []
+    exact_hits = []
+    candidates = []
     for ch in chunks:
         c_norm = ch.get("_norm")
         if c_norm is None:
@@ -609,25 +855,34 @@ def align_unit_to_chunks(
             ch["_norm"] = c_norm
         if not c_norm:
             continue
+        cid = ch.get("ragflow_chunk_id", "")
+        page_bonus = 0.06 if (page_num and ch.get("page_num") == page_num) else 0.0
         if src_prefix and src_prefix in c_norm:
-            score = 0.99
-        else:
-            c_tokens = ch.get("_tokens")
-            if c_tokens is None:
-                c_tokens = set(re.findall(r"\w+", c_norm))
-                ch["_tokens"] = c_tokens
-            if not c_tokens:
-                continue
-            shared = len(src_tokens & c_tokens)
-            overlap = shared / max(len(src_tokens), 1)
-            contain = shared / max(min(len(src_tokens), len(c_tokens)), 1)
-            # Fast pre-filter: skip expensive partial_ratio when almost no tokens overlap
-            if contain < 0.15:
-                continue
-            pr = fuzz.partial_ratio(src_fuzzy, c_norm[:4000]) / 100.0
-            score = round(max(pr * 0.7 + overlap * 0.3, overlap), 4)
-        if score >= 0.45:
-            scored.append((score, ch.get("ragflow_chunk_id", "")))
+            exact_hits.append((round(min(0.99 + page_bonus, 1.0), 4), cid))
+            continue
+        c_tokens = ch.get("_tokens")
+        if c_tokens is None:
+            c_tokens = set(re.findall(r"\w+", c_norm))
+            ch["_tokens"] = c_tokens
+        if not c_tokens:
+            continue
+        shared = len(src_tokens & c_tokens)
+        if shared == 0:
+            continue
+        overlap = shared / max(len(src_tokens), 1)
+        contain = shared / max(min(len(src_tokens), len(c_tokens)), 1)
+        if contain < 0.15:
+            continue
+        candidates.append((max(overlap, contain * 0.8) + page_bonus, overlap, page_bonus, c_norm, cid))
+
+    scored = list(exact_hits)
+    if len(scored) < top_n and candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        for _, overlap, page_bonus, c_norm, cid in candidates[:8]:
+            pr = fuzz.partial_ratio(src_fuzzy, c_norm[:1500]) / 100.0
+            score = round(min(max(pr * 0.7 + overlap * 0.3, overlap) + page_bonus, 1.0), 4)
+            if score >= 0.45:
+                scored.append((score, cid))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     matched_ids = [cid for _, cid in scored[:top_n]]
@@ -664,7 +919,10 @@ def compute_answer_containment(reference_context: str, chunks: List[Dict[str, An
     best_single = 0.0
     covered_union = set()
     for ch in chunks:
-        c_tokens = set(re.findall(r"\w+", normalize_text(ch.get("content", ""))))
+        c_tokens = ch.get("_tokens")
+        if c_tokens is None:
+            c_tokens = set(re.findall(r"\w+", normalize_text(ch.get("content", ""))))
+            ch["_tokens"] = c_tokens
         inter = ref_tokens & c_tokens
         ratio = len(inter) / len(ref_tokens)
         if ratio > best_single:
@@ -713,46 +971,68 @@ def compute_context_coverage(reference_context: str, retrieved_chunks: List[Dict
 
 def compute_parsing_metrics(rows: List[Any]) -> Dict[str, Any]:
     """
-    Single Source of Truth for Parsing metrics across parsing.py and analytics.py.
-    - text_completeness: text units passing without text/char/structure errors
-    - table_accuracy: table units passing without P9/P10/TABLE (None if no table units)
-    - character_error_rate: ONLY P4/P5/P6 or char_error == 1 (never P1/P7/P8!)
-    - layout_accuracy: ONLY image/diagram units (None if no image/diagram units — never fake 100%)
-    - reading_order_accuracy: all rated units without P3/ORDER
-    - content_fidelity: all rated units without P3/P10/FIDELITY
-    - parsing_score: weighted composite over available metrics (auto re-normalized)
+    Single Source of Truth for Parsing metrics across parsing.py and analytics.py (zero double-counting):
+    - text_completeness: text units passing completeness without P1/TEXT (PASS=1.0, PARTIAL=0.5, FAIL=0.0)
+    - table_accuracy: table units without P9/P10/TABLE (PASS=1.0, PARTIAL=0.5 if no P9/P10, FAIL=0.0)
+    - character_error_rate: ONLY P4/P5/P6 or char_error == 1
+    - layout_accuracy: unified with Phụ lục B — P2 (image/diagram) + P7 (heading) + P8 (list)
+    - reading_order_accuracy: rated units without P3/ORDER and NOT FAIL/missing (P1/P2)
+    - content_fidelity: rated units without P3/P10/FIDELITY and NOT FAIL/missing (P1/P2)
+    - coverage_rate: rated_units / total_units (prevents cherry-picking illusion)
+    - parsing_score: weighted composite over available metrics
     """
     import json
 
     rated = [r for r in rows if r["verdict"] != "UNRATED"]
     text_units = [r for r in rated if r["unit_type"] not in ("table", "image", "diagram")]
     table_units = [r for r in rated if r["unit_type"] == "table"]
-    layout_units = [r for r in rated if r["unit_type"] in ("image", "diagram")]
+    image_units = [r for r in rated if r["unit_type"] in ("image", "diagram")]
 
-    text_ok = 0
-    table_ok = 0
+    text_ok = 0.0
+    table_ok = 0.0
     layout_ok = 0
     order_ok = 0
     fidelity_ok = 0
     char_err = 0
+    critical_fail_count = 0
 
     for r in rated:
         raw_codes = r["error_codes"]
         codes = set(json.loads(raw_codes) if isinstance(raw_codes, str) else (raw_codes or []))
+        is_fail = r["verdict"] == "FAIL"
+        is_partial = r["verdict"] == "PARTIAL"
+        is_missing = bool(codes & {"P1", "P2"})
         is_char_err = bool(codes & {"P4", "P5", "P6"}) or r["char_error"] == 1
-        has_text_err = bool(codes & {"TEXT", "P1", "P4", "P5", "P6", "P7", "P8"}) or r["char_error"] == 1
+        # Strict axis separation (zero double-counting across Parsing axes)
+        has_completeness_err = bool(codes & {"TEXT", "P1"})
         has_table_err = bool(codes & {"TABLE", "P9", "P10"})
         has_order_err = bool(codes & {"ORDER", "P3"})
-        has_layout_err = bool(codes & {"LAYOUT", "P2"})
-        has_fidelity_err = bool(codes & {"FIDELITY", "P3", "P10"})
+        has_layout_err = bool(codes & {"LAYOUT", "P2", "P7", "P8"}) or (
+            r["unit_type"] in ("image", "diagram") and r["verdict"] != "PASS"
+        )
+        fid_flag = (r.get("fidelity_error") if isinstance(r, dict) else (r["fidelity_error"] if "fidelity_error" in r.keys() else 0)) == 1
+        has_fidelity_err = fid_flag or bool(codes & {"FIDELITY", "P10"})
+        is_critical = (
+            is_fail
+            or (r.get("severity") == "Nghiêm trọng" if isinstance(r, dict) else (r["severity"] == "Nghiêm trọng" if "severity" in r.keys() else False))
+            or bool(codes & {"P1", "P2", "P3", "P9", "P10"})
+        )
 
+        if is_critical:
+            critical_fail_count += 1
         if is_char_err:
             char_err += 1
-        if r["unit_type"] not in ("table", "image", "diagram") and not has_text_err and r["verdict"] == "PASS":
-            text_ok += 1
-        if r["unit_type"] == "table" and not has_table_err and r["verdict"] == "PASS":
-            table_ok += 1
-        if r["unit_type"] in ("image", "diagram") and not has_layout_err and r["verdict"] == "PASS":
+        if r["unit_type"] not in ("table", "image", "diagram"):
+            if not has_completeness_err and r["verdict"] == "PASS":
+                text_ok += 1.0
+            elif is_partial and not is_missing:
+                text_ok += 0.5
+        if r["unit_type"] == "table":
+            if not has_table_err and r["verdict"] == "PASS":
+                table_ok += 1.0
+            elif is_partial and not has_table_err:
+                table_ok += 0.5
+        if not has_layout_err:
             layout_ok += 1
         if not has_order_err:
             order_ok += 1
@@ -762,9 +1042,10 @@ def compute_parsing_metrics(rows: List[Any]) -> Dict[str, Any]:
     text_completeness = round(text_ok / len(text_units), 4) if text_units else None
     table_accuracy = round(table_ok / len(table_units), 4) if table_units else None
     character_error_rate = round(char_err / len(rated), 4) if rated else 0.0
-    layout_accuracy = round(layout_ok / len(layout_units), 4) if layout_units else None
+    layout_accuracy = round(layout_ok / len(rated), 4) if rated else None
     reading_order_accuracy = round(order_ok / len(rated), 4) if rated else None
     content_fidelity = round(fidelity_ok / len(rated), 4) if rated else None
+    coverage_rate = round(len(rated) / len(rows), 4) if rows else 0.0
 
     # Dynamically re-normalize weights over available metrics so N/A categories don't distort score
     weighted_terms = [
@@ -782,13 +1063,15 @@ def compute_parsing_metrics(rows: List[Any]) -> Dict[str, Any]:
     return {
         "total_units": len(rows),
         "rated_units": len(rated),
+        "coverage_rate": coverage_rate,
+        "critical_fail_count": critical_fail_count,
         "text_completeness": text_completeness if text_completeness is not None else 0.0,
         "table_accuracy": table_accuracy if table_accuracy is not None else 0.0,
         "table_total": len(table_units),
         "character_error_rate": character_error_rate,
         "content_fidelity": content_fidelity if content_fidelity is not None else 0.0,
         "layout_accuracy": layout_accuracy,
-        "layout_total": len(layout_units),
+        "layout_total": len(image_units),
         "reading_order_accuracy": reading_order_accuracy if reading_order_accuracy is not None else 0.0,
         "parsing_score": parsing_score,
     }

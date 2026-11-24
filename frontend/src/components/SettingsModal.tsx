@@ -227,7 +227,7 @@ export default function SettingsModal({
                     <div className="flex items-center gap-1 text-[11px]">
                       {[
                         { label: 'DeepSeek', url: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
-                        { label: 'Gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-flash' },
+                        { label: 'Gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-3.8-flash' },
                         { label: 'OpenAI', url: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
                         { label: 'Ollama', url: 'http://localhost:11434/v1', model: 'qwen2.5:7b' },
                       ].map((p) => (
@@ -289,6 +289,85 @@ export default function SettingsModal({
                   >
                     <FlaskConical className="size-3.5 text-[#03aa5c]" />
                     {testingLlm ? 'Đang kiểm tra...' : 'Kiểm tra kết nối LLM'}
+                  </button>
+                </div>
+
+                <div className="border-t border-[#ededeb] pt-4 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <span className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
+                        Vision LLM (Riêng cho OCR tài liệu scan / ảnh / biểu đồ)
+                      </span>
+                      <p className="text-[10px] text-[#71717a] mt-0.5">
+                        Để trống sẽ dùng chung cấu hình LLM ở trên. Tách riêng để giữ DeepSeek chấm text và dùng Gemini/GPT-4o-mini đọc ảnh.
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-1 text-[11px] shrink-0">
+                      {[
+                        { label: 'RapidOCR Local', url: 'local', model: 'local-rapidocr' },
+                        { label: 'Gemini Flash', url: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-3.8-flash' },
+                        { label: 'GPT-4o-mini', url: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+                      ].map((p) => (
+                        <button
+                          key={p.label}
+                          type="button"
+                          onClick={() =>
+                            setSettings((prev) => ({ ...prev, vision_base_url: p.url, vision_model: p.model }))
+                          }
+                          className="px-2 py-0.5 bg-[#f7f7f6] hover:bg-[#03aa5c]/15 hover:text-[#027a42] border border-[#dedede] text-[#3d3d3d] rounded-[2px]"
+                        >
+                          {p.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <FieldRow label="Vision Base URL">
+                      <input
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('vision_base_url')}
+                        onChange={(e) => setKey('vision_base_url', e.target.value)}
+                        placeholder="https://generativelanguage.googleapis.com/v1beta/openai"
+                      />
+                    </FieldRow>
+                    <FieldRow label="Tên Vision Model">
+                      <input
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('vision_model')}
+                        onChange={(e) => setKey('vision_model', e.target.value)}
+                        placeholder="gemini-3.8-flash"
+                      />
+                    </FieldRow>
+                  </div>
+                  <FieldRow label="Vision API Key">
+                    <input
+                      type="password"
+                      className="ts-input w-full font-mono text-xs"
+                      value={val('vision_api_key')}
+                      onChange={(e) => setKey('vision_api_key', e.target.value)}
+                      placeholder="AIza... hoặc sk-... (để trống nếu dùng chung key LLM)"
+                    />
+                  </FieldRow>
+                  <button
+                    type="button"
+                    disabled={testingLlm}
+                    onClick={async () => {
+                      setTestingLlm(true);
+                      setConnMsg({});
+                      try {
+                        await api.saveSettings(settings);
+                        const r = await api.testVision();
+                        setConnMsg({ ok: true, text: `Kết nối Vision LLM thành công (${r.model})` });
+                      } catch (e: any) {
+                        setConnMsg({ ok: false, text: e.message });
+                      } finally {
+                        setTestingLlm(false);
+                      }
+                    }}
+                    className="ts-btn-secondary text-xs"
+                  >
+                    <FlaskConical className="size-3.5 text-[#03aa5c]" />
+                    {testingLlm ? 'Đang kiểm tra...' : 'Kiểm tra kết nối Vision LLM'}
                   </button>
                 </div>
               </div>
@@ -379,7 +458,7 @@ export default function SettingsModal({
               <div className="space-y-5">
                 <div className="space-y-3">
                   <div className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
-                    Lấy mẫu &amp; Kích thước chunk (C8)
+                    Lấy mẫu &amp; Kích thước chunk (SIZE)
                   </div>
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                     <FieldRow label="Số chunk mẫu / tài liệu" hint="0 = lấy tất cả. Mặc định: 5">
@@ -425,7 +504,7 @@ export default function SettingsModal({
 
                 <div className="border-t border-[#ededeb] pt-4 space-y-3">
                   <div className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
-                    Rule phát hiện trùng lặp (C6/C7) &amp; nhiễu (C4)
+                    Rule phát hiện trùng lặp (DUPLICATE) &amp; nhiễu (NOISE)
                   </div>
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                     <FieldRow label="Ngưỡng trùng nội dung (0–1)" hint="Mặc định: 0.85">
@@ -439,7 +518,7 @@ export default function SettingsModal({
                         onChange={(e) => setKey('chunk_dup_threshold', e.target.value)}
                       />
                     </FieldRow>
-                    <FieldRow label="Trùng biên liền kề (%)" hint="C6 overlap. Mặc định: 88">
+                    <FieldRow label="Trùng biên liền kề (%)" hint="Overlap liền kề. Mặc định: 88">
                       <input
                         type="number"
                         min={50}
@@ -449,7 +528,7 @@ export default function SettingsModal({
                         onChange={(e) => setKey('chunk_adj_overlap_threshold', e.target.value)}
                       />
                     </FieldRow>
-                    <FieldRow label="Số lần lặp dòng → Nhiễu C4" hint="Header/footer. Mặc định: 3">
+                    <FieldRow label="Số lần lặp dòng → NOISE" hint="Header/footer. Mặc định: 3">
                       <input
                         type="number"
                         min={2}

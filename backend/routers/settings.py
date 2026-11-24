@@ -20,6 +20,7 @@ def read_settings():
     masked = dict(data)
     masked["has_ragflow_key"] = bool(data.get("ragflow_api_key", "").strip())
     masked["has_llm_key"] = bool(data.get("llm_api_key", "").strip())
+    masked["has_vision_key"] = bool(data.get("vision_api_key", "").strip())
     return {
         "settings": masked,
         "defaults": DEFAULT_SETTINGS,
@@ -37,7 +38,7 @@ def update_settings(payload: SettingsPayload):
     old_base_url = get_setting("ragflow_base_url", "").strip().rstrip("/")
 
     for k, v in payload.settings.items():
-        if k in ("has_ragflow_key", "has_llm_key"):
+        if k in ("has_ragflow_key", "has_llm_key", "has_vision_key"):
             continue
         value = str(v)
         if k == "ragflow_base_url":
@@ -86,3 +87,18 @@ async def test_llm_endpoint():
         raise HTTPException(status_code=400, detail=f"Lỗi kết nối LLM: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Không gọi được tới LLM: {e}")
+
+
+@router.post("/test-vision")
+async def test_vision_endpoint():
+    base_url = get_setting("vision_base_url", "").strip() or get_setting("llm_base_url", "").strip()
+    api_key = get_setting("vision_api_key", "").strip() or get_setting("llm_api_key", "").strip()
+    model = get_setting("vision_model", "").strip() or get_setting("llm_model", "").strip()
+    if not base_url or not model:
+        raise HTTPException(status_code=400, detail="Vui lòng nhập Vision Base URL và tên Vision Model trước.")
+    try:
+        return await test_llm_connection(base_url, api_key, model)
+    except LLMError as e:
+        raise HTTPException(status_code=400, detail=f"Lỗi kết nối Vision LLM: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Không gọi được tới Vision LLM: {e}")

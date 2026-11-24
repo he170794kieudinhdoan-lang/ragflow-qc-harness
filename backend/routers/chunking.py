@@ -1,9 +1,13 @@
+import asyncio
 import json
+import os
+import re
 from typing import List, Optional
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from database import get_bool_setting, get_db, get_float_setting, get_int_setting, get_setting, utc_now
+from llm_client import llm_judge_chunk
 from metrics import analyze_chunk_rules, compute_answer_containment, detect_duplicates_classified, nfc
 
 router = APIRouter(prefix="/api/chunking", tags=["chunking"])
@@ -21,10 +25,11 @@ class ChunkScoreUpdate(BaseModel):
 
 
 @router.post("/runs/{run_id}/sample")
-def auto_sample_chunks(run_id: int, per_doc: Optional[int] = None):
+async def auto_sample_chunks(run_id: int, per_doc: Optional[int] = None):
     """
     Deterministic stratified sampling: picks `per_doc` chunks per document covering
-    start -> middle -> end, then runs the 0-LLM Chunking QC rule engine (C1..C8).
+    start -> table -> middle -> end, runs the mechanical rule engine (C1..C8),
+    and automatically chains LLM-as-a-Judge (when LLM is configured).
     """
     if per_doc is None:
         per_doc = get_int_setting("chunk_sample_per_doc", 5)
@@ -81,8 +86,32 @@ def auto_sample_chunks(run_id: int, per_doc: Optional[int] = None):
             elif per_doc == 1:
                 chosen = [clist[0]]
             else:
-                idxs = sorted(set(round(i * (n - 1) / (per_doc - 1)) for i in range(per_doc)))
-                chosen = [clist[i] for i in idxs]
+                # Stratified sampling: first + last + up to 2 table chunks + evenly spaced middle
+                picked_idxs = {0, n - 1}
+                table_idxs = [
+                    i for i, ch in enumerate(clist)
+                    if "<table" in (ch.get("content") or "").lower()
+                    or "<td" in (ch.get("content") or "").lower()
+                    or bool(re.search(r"(?m)^\s*\|.*\|\s*$", ch.get("content") or ""))
+                ]
+                if table_idxs and len(picked_idxs) < per_doc:
+                    cand_tables = [table_idxs[0]]
+                    if len(table_idxs) > 1:
+                        cand_tables.append(table_idxs[len(table_idxs) // 2])
+                    for ti in cand_tables:
+                        if len(picked_idxs) < per_doc:
+                            picked_idxs.add(ti)
+                for i in range(per_doc):
+                    if len(picked_idxs) >= per_doc:
+                        break
+                    pos = round(i * (n - 1) / max(per_doc - 1, 1))
+                    if pos not in picked_idxs:
+                        picked_idxs.add(pos)
+                for pos in range(n):
+                    if len(picked_idxs) >= per_doc:
+                        break
+                    picked_idxs.add(pos)
+                chosen = [clist[i] for i in sorted(picked_idxs)]
 
             rep_lines = repeated_by_doc.get(doc_id, set())
             for ch in chosen:
@@ -145,7 +174,121 @@ def auto_sample_chunks(run_id: int, per_doc: Optional[int] = None):
                     )
                 sampled_count += 1
 
-    return {"ok": True, "sampled_chunks": sampled_count}
+    llm_judged = 0
+    try:
+        llm_res = await llm_judge_sampled_chunks(run_id, overwrite_manual=False)
+        llm_judged = int(llm_res.get("judged_count", 0))
+    except HTTPException:
+        pass
+    return {"ok": True, "sampled_chunks": sampled_count, "llm_judged": llm_judged}
+
+
+@router.post("/runs/{run_id}/llm-judge")
+async def llm_judge_sampled_chunks(run_id: int, overwrite_manual: bool = False):
+    """
+    Runs LLM-as-a-Judge across all sampled chunks in `run_id` (concurrently with Semaphore(6)),
+    merging semantic LLM verdicts (C1-C4 + Vietnamese reason) with deterministic mechanical rules (C5-C8).
+    """
+    llm_base = get_setting("llm_base_url", "").strip()
+    llm_key = get_setting("llm_api_key", "").strip()
+    llm_model = get_setting("llm_model", "").strip()
+    if not llm_base or not llm_model or (not llm_key and "localhost" not in llm_base and "127.0.0.1" not in llm_base):
+        raise HTTPException(
+            status_code=400,
+            detail="Chưa cấu hình LLM (Base URL, Model, API Key) trong Cài đặt để chấm Chunking bằng LLM.",
+        )
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT ce.*, c.id AS chunk_pk, c.document_id, c.chunk_index, c.content, d.filename
+            FROM chunk_evaluations ce
+            JOIN chunks c ON c.id = ce.chunk_id
+            LEFT JOIN documents d ON d.id = c.document_id
+            WHERE ce.run_id = ? AND ce.is_sampled = 1
+            ORDER BY d.doc_code, c.chunk_index
+            """,
+            (run_id,),
+        ).fetchall()
+        if not rows:
+            raise HTTPException(status_code=400, detail="Chưa có mẫu chunk nào. Hãy bấm 'Lấy mẫu & Quét' trước.")
+
+        all_pos = conn.execute(
+            "SELECT document_id, chunk_index, content FROM chunks WHERE run_id = ?", (run_id,)
+        ).fetchall()
+        pos_map = {(r["document_id"], r["chunk_index"]): r["content"] or "" for r in all_pos}
+
+    targets = [dict(r) for r in rows if overwrite_manual or r["judge_source"] != "MANUAL"]
+    if not targets:
+        return {"ok": True, "judged_count": 0, "skipped_manual": len(rows), "failed_count": 0}
+
+    sem = asyncio.Semaphore(6)
+    updates = []
+    errors = []
+
+    async def _judge_one(item: dict):
+        prev_txt = pos_map.get((item["document_id"], item["chunk_index"] - 1), "")
+        next_txt = pos_map.get((item["document_id"], item["chunk_index"] + 1), "")
+        async with sem:
+            try:
+                res = await llm_judge_chunk(
+                    llm_base,
+                    llm_key,
+                    llm_model,
+                    item["content"] or "",
+                    prev_txt,
+                    next_txt,
+                    item["filename"] or "",
+                )
+                try:
+                    existing_codes = set(json.loads(item["error_codes"] or "[]"))
+                except Exception:
+                    existing_codes = set()
+                mech_codes = existing_codes & {"DUPLICATE", "SIZE"}
+                merged_codes = sorted(mech_codes | set(res["error_codes"]))
+
+                integrity = 0 if "INTEGRITY" in merged_codes else res["integrity"]
+                ctx_suff = 0 if "CONTEXT" in merged_codes else res["context_sufficiency"]
+                no_noise = 0 if "NOISE" in merged_codes else res["no_noise"]
+                no_dup = 0 if "DUPLICATE" in mech_codes else (item["no_duplicate"] if item["no_duplicate"] is not None else 1)
+                valid_size = 0 if "SIZE" in mech_codes else (item["valid_size"] if item["valid_size"] is not None else 1)
+
+                updates.append((
+                    integrity,
+                    ctx_suff,
+                    no_noise,
+                    no_dup,
+                    valid_size,
+                    json.dumps(merged_codes),
+                    res["reason"],
+                    utc_now(),
+                    run_id,
+                    item["chunk_pk"],
+                ))
+            except Exception as e:
+                errors.append(str(e)[:160])
+
+    await asyncio.gather(*(_judge_one(t) for t in targets))
+
+    with get_db() as conn:
+        for u in updates:
+            conn.execute(
+                """
+                UPDATE chunk_evaluations
+                SET integrity=?, context_sufficiency=?, no_noise=?, no_duplicate=?, valid_size=?,
+                    error_codes=?, notes=?, judge_source='LLM', updated_at=?
+                WHERE run_id=? AND chunk_id=?
+                """,
+                u,
+            )
+
+    return {
+        "ok": True,
+        "judged_count": len(updates),
+        "skipped_manual": len(rows) - len(targets),
+        "failed_count": len(errors),
+        "model": llm_model,
+    }
 
 
 @router.get("/runs/{run_id}/evaluations")
@@ -264,4 +407,157 @@ def get_chunking_metrics(run_id: int):
         "size_compliance": size_comp,
         "answer_containment": round(ac_full / len(testcases), 4) if testcases else 0.0,
         "testcase_count": len(testcases),
+    }
+
+
+@router.get("/runs/{run_id}/chunks")
+def list_all_chunks(
+    run_id: int,
+    q: str = Query(default=""),
+    document_id: Optional[int] = Query(default=None),
+    format_group: Optional[str] = Query(default=None),
+    flag: Optional[str] = Query(default=None),
+    min_tokens: Optional[int] = Query(default=None),
+    max_tokens: Optional[int] = Query(default=None),
+    sort: str = Query(default="doc_chunk"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    """Browse and research all chunks in a run with search, filters, stats, and prev/next context."""
+    with get_db() as conn:
+        all_rows = conn.execute(
+            """
+            SELECT c.id, c.document_id, c.ragflow_doc_id, c.ragflow_chunk_id, c.chunk_index,
+                   c.content, c.char_count, c.token_est, c.page_num, c.important_keywords,
+                   c.available, c.rule_flags,
+                   d.doc_code, d.filename, d.format_group, d.file_path,
+                   COALESCE(ce.is_sampled, 0) AS is_sampled
+            FROM chunks c
+            LEFT JOIN documents d ON d.id = c.document_id
+            LEFT JOIN chunk_evaluations ce ON ce.run_id = c.run_id AND ce.chunk_id = c.id
+            WHERE c.run_id = ?
+            ORDER BY d.doc_code, c.chunk_index
+            """,
+            (run_id,),
+        ).fetchall()
+
+    pos_map = {}
+    doc_map = {}
+    flag_counts = {}
+    for r in all_rows:
+        txt = nfc(r["content"] or "")
+        pos_map[(r["document_id"], r["chunk_index"])] = txt
+        did = r["document_id"]
+        if did is not None:
+            if did not in doc_map:
+                doc_map[did] = {
+                    "id": did,
+                    "doc_code": r["doc_code"] or f"DOC{did}",
+                    "filename": r["filename"] or "",
+                    "format_group": r["format_group"] or "",
+                    "chunk_count": 0,
+                }
+            doc_map[did]["chunk_count"] += 1
+        try:
+            rflags = json.loads(r["rule_flags"] or "[]")
+        except Exception:
+            rflags = []
+        for f in rflags:
+            flag_counts[f] = flag_counts.get(f, 0) + 1
+
+    q_norm = nfc(q).strip().lower()
+    filtered = []
+    for r in all_rows:
+        if document_id is not None and r["document_id"] != document_id:
+            continue
+        if format_group and (r["format_group"] or "") != format_group:
+            continue
+        tok = r["token_est"] or 0
+        if min_tokens is not None and tok < min_tokens:
+            continue
+        if max_tokens is not None and tok > max_tokens:
+            continue
+        try:
+            rflags = json.loads(r["rule_flags"] or "[]")
+        except Exception:
+            rflags = []
+        if flag == "ANY" and len(rflags) == 0:
+            continue
+        elif flag == "NONE" and len(rflags) > 0:
+            continue
+        elif flag and flag not in ("ANY", "NONE") and flag not in rflags:
+            continue
+
+        txt = pos_map[(r["document_id"], r["chunk_index"])]
+        if q_norm:
+            hay = f"{txt}\n{r['doc_code'] or ''}\n{r['filename'] or ''}\n{r['important_keywords'] or ''}".lower()
+            if q_norm not in hay:
+                continue
+
+        filtered.append((r, txt, rflags))
+
+    if sort == "tokens_desc":
+        filtered.sort(key=lambda x: (-(x[0]["token_est"] or 0), x[0]["doc_code"] or "", x[0]["chunk_index"] or 0))
+    elif sort == "tokens_asc":
+        filtered.sort(key=lambda x: ((x[0]["token_est"] or 0), x[0]["doc_code"] or "", x[0]["chunk_index"] or 0))
+    elif sort == "chars_desc":
+        filtered.sort(key=lambda x: (-(x[0]["char_count"] or 0), x[0]["doc_code"] or "", x[0]["chunk_index"] or 0))
+    elif sort == "flags_desc":
+        filtered.sort(key=lambda x: (-len(x[2]), x[0]["doc_code"] or "", x[0]["chunk_index"] or 0))
+
+    total_filtered = len(filtered)
+    if total_filtered > 0:
+        toks = [x[0]["token_est"] or 0 for x in filtered]
+        stats = {
+            "avg_tokens": round(sum(toks) / total_filtered, 1),
+            "min_tokens": min(toks),
+            "max_tokens": max(toks),
+            "flagged_count": sum(1 for x in filtered if len(x[2]) > 0),
+        }
+    else:
+        stats = {"avg_tokens": 0, "min_tokens": 0, "max_tokens": 0, "flagged_count": 0}
+
+    page_slice = filtered[offset : offset + limit]
+    items = []
+    for r, txt, rflags in page_slice:
+        prev_txt = pos_map.get((r["document_id"], (r["chunk_index"] or 0) - 1), "")
+        next_txt = pos_map.get((r["document_id"], (r["chunk_index"] or 0) + 1), "")
+        try:
+            kws = json.loads(r["important_keywords"] or "[]")
+            if not isinstance(kws, list):
+                kws = []
+        except Exception:
+            kws = []
+        items.append(
+            {
+                "id": r["id"],
+                "document_id": r["document_id"],
+                "doc_code": r["doc_code"] or "",
+                "filename": r["filename"] or "",
+                "format_group": r["format_group"] or "",
+                "has_local_file": bool(r["file_path"] and os.path.exists(r["file_path"])),
+                "ragflow_chunk_id": r["ragflow_chunk_id"] or "",
+                "chunk_index": r["chunk_index"],
+                "content": txt,
+                "char_count": r["char_count"] or 0,
+                "token_est": r["token_est"] or 0,
+                "page_num": r["page_num"] or 1,
+                "important_keywords": kws,
+                "rule_flags": rflags,
+                "is_sampled": bool(r["is_sampled"]),
+                "prev_tail": prev_txt[-240:].strip() if prev_txt else "",
+                "next_head": next_txt[:240].strip() if next_txt else "",
+            }
+        )
+
+    docs_list = sorted(doc_map.values(), key=lambda d: d["doc_code"])
+    return {
+        "total": total_filtered,
+        "total_all": len(all_rows),
+        "limit": limit,
+        "offset": offset,
+        "stats": stats,
+        "documents": docs_list,
+        "flag_counts": flag_counts,
+        "items": items,
     }

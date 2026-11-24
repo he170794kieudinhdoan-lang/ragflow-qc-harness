@@ -2,9 +2,15 @@ import json
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 
-from database import get_db, get_float_setting, utc_now
+from database import get_current_account_key, get_db, get_float_setting
 from exporter import export_run_workbook
-from metrics import compute_contextual_precision, detect_chunk_rule_flags
+from metrics import (
+    CHUNKING_ERROR_CATALOG,
+    PARSING_ERROR_CATALOG,
+    RETRIEVAL_ERROR_CATALOG,
+    compute_contextual_precision,
+    compute_parsing_metrics,
+)
 
 router = APIRouter(prefix="/api/analytics", tags=["analytics"])
 
@@ -203,15 +209,12 @@ def get_run_overview(run_id: int):
         doc_cnt = conn.execute("SELECT COUNT(*) FROM run_documents WHERE run_id = ?", (run_id,)).fetchone()[0]
         chunk_cnt = conn.execute("SELECT COUNT(*) FROM chunks WHERE run_id = ?", (run_id,)).fetchone()[0]
 
-        # Parsing stats
-        p_rows = conn.execute("SELECT * FROM parsing_units WHERE run_id = ? AND verdict != 'UNRATED'", (run_id,)).fetchall()
-        p_text = [r for r in p_rows if r["unit_type"] != "table"]
-        p_tbl = [r for r in p_rows if r["unit_type"] == "table"]
+        # Parsing stats (Single Source of Truth via compute_parsing_metrics)
+        p_rows = conn.execute("SELECT * FROM parsing_units WHERE run_id = ?", (run_id,)).fetchall()
+        pm = compute_parsing_metrics(p_rows)
         parsing = {
-            "rated": len(p_rows),
-            "text_completeness": round(sum(1 for r in p_text if r["verdict"] == "PASS") / len(p_text), 4) if p_text else 0.0,
-            "table_accuracy": round(sum(1 for r in p_tbl if r["verdict"] == "PASS") / len(p_tbl), 4) if p_tbl else 0.0,
-            "character_error_rate": round(sum(1 for r in p_rows if r["char_error"] == 1) / len(p_rows), 4) if p_rows else 0.0,
+            **pm,
+            "rated": pm["rated_units"],
         }
 
         # Chunking stats
@@ -288,6 +291,258 @@ def compare_retrieval_runs(baseline_rr_id: int, candidate_rr_id: int):
     }
 
 
+@router.get("/runs-matrix")
+def get_runs_comparison_matrix():
+    """
+    Returns a unified 3-layer comparison table (Parsing + Chunking + Retrieval) across all runs
+    for the current account, enabling Week 5-6 Baseline vs >=4 Experiments comparison in one view.
+    """
+    acct = get_current_account_key()
+    with get_db() as conn:
+        runs = conn.execute(
+            "SELECT * FROM runs WHERE account_key = ? OR account_key = '' ORDER BY is_baseline DESC, id ASC",
+            (acct,),
+        ).fetchall()
+
+        matrix = []
+        for run in runs:
+            rid = run["id"]
+            p_rows = conn.execute("SELECT * FROM parsing_units WHERE run_id = ?", (rid,)).fetchall()
+            pm = compute_parsing_metrics(p_rows)
+
+            c_rows = conn.execute(
+                "SELECT * FROM chunk_evaluations WHERE run_id = ? AND is_sampled = 1", (rid,)
+            ).fetchall()
+
+            def _rate(field, inv=False):
+                vals = [r[field] for r in c_rows if r[field] is not None]
+                if not vals:
+                    return None
+                return round(sum(1 for v in vals if (v == 0 if inv else v == 1)) / len(vals), 4)
+
+            rr = conn.execute(
+                "SELECT * FROM retrieval_runs WHERE run_id = ? ORDER BY id DESC LIMIT 1", (rid,)
+            ).fetchone()
+            ret = _compute_retrieval_summary(conn, rr["id"]) if rr else None
+
+            try:
+                pc = json.loads(run["parser_config"] or "{}")
+            except Exception:
+                pc = {}
+            try:
+                rc = json.loads(run["retrieval_config"] or "{}")
+            except Exception:
+                rc = {}
+
+            chunk_token_size = pc.get("chunk_token_num")
+            overlap = pc.get("overlapped_percent")
+            for k, v in pc.items():
+                if isinstance(v, dict) and k.startswith("GeneralChunker:"):
+                    chunk_token_size = v.get("chunk_token_size", chunk_token_size)
+                    overlap = v.get("overlapped_percent", overlap)
+
+            ac_full_rate = None
+            if ret and ret["total_testcases"] > 0:
+                ac_full_rate = round(ret["answer_containment"].get("FULL", 0) / ret["total_testcases"], 4)
+
+            matrix.append({
+                "run_id": rid,
+                "name": run["name"],
+                "is_baseline": bool(run["is_baseline"]),
+                "config": {
+                    "chunk_method": pc.get("chunk_method") or "general",
+                    "chunk_token_size": chunk_token_size or 512,
+                    "overlap": overlap or 0,
+                    "vector_weight": rc.get("vector_similarity_weight", 0.3),
+                    "rerank": bool(rc.get("rerank_id")),
+                    "top_k": rc.get("top_k", 10),
+                },
+                "parsing": {
+                    "rated": pm["rated_units"],
+                    "text_completeness": pm["text_completeness"] if pm["rated_units"] > 0 else None,
+                    "table_accuracy": pm["table_accuracy"] if pm["table_total"] > 0 else None,
+                    "character_error_rate": pm["character_error_rate"] if pm["rated_units"] > 0 else None,
+                },
+                "chunking": {
+                    "sampled": len(c_rows),
+                    "chunk_integrity": _rate("integrity"),
+                    "context_sufficiency": _rate("context_sufficiency"),
+                    "noise_rate": _rate("no_noise", inv=True),
+                    "duplicate_rate": _rate("no_duplicate", inv=True),
+                    "size_compliance": _rate("valid_size"),
+                },
+                "retrieval": {
+                    "run_name": rr["name"] if rr else None,
+                    "answer_containment_full": ac_full_rate,
+                    "context_coverage": ret["avg_context_coverage"] if ret else None,
+                    "contextual_precision": ret["avg_contextual_precision"] if ret else None,
+                },
+            })
+
+    return {"runs": matrix}
+
+
+@router.get("/runs/{run_id}/bug-report")
+def get_run_bug_report(run_id: int, top_n: int = 5):
+    """
+    Aggregates the Top N most impactful bugs across Parsing, Chunking, and Retrieval for Week 6
+    Test Report & Bug Report deliverables, plus a ready-to-copy Markdown summary.
+    """
+    p_cat = {x["code"]: x for x in PARSING_ERROR_CATALOG}
+    c_cat = {x["code"]: x for x in CHUNKING_ERROR_CATALOG}
+    p_cat.update({
+        "TEXT": {"group": "Mất nội dung / Lỗi ký tự", "name": "Thiếu hoặc sai văn bản khi parse", "severity": "Nghiêm trọng"},
+        "TABLE": {"group": "Vỡ bảng", "name": "Vỡ cấu trúc bảng (hàng/cột/ô gộp)", "severity": "Nghiêm trọng"},
+        "ORDER": {"group": "Sai thứ tự", "name": "Đảo thứ tự đọc / trộn cột", "severity": "Nghiêm trọng"},
+        "LAYOUT": {"group": "Mất cấu trúc", "name": "Mất heading, danh sách hoặc ảnh/sơ đồ", "severity": "Trung bình"},
+    })
+
+    buckets = {}
+
+    def _add_bug(layer: str, code: str, group: str, title: str, severity: str, sample: str, fix: str):
+        key = (layer, code)
+        b = buckets.setdefault(key, {
+            "layer": layer,
+            "error_code": code,
+            "error_group": group,
+            "title": title,
+            "severity": severity,
+            "count": 0,
+            "samples": [],
+            "suggested_fix": fix,
+        })
+        b["count"] += 1
+        if sample and len(b["samples"]) < 4 and sample not in b["samples"]:
+            b["samples"].append(sample)
+
+    with get_db() as conn:
+        run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if not run:
+            raise HTTPException(status_code=404, detail="Run không tồn tại")
+
+        p_rows = conn.execute(
+            """
+            SELECT pu.*, d.doc_code, d.filename
+            FROM parsing_units pu
+            JOIN documents d ON d.id = pu.document_id
+            WHERE pu.run_id = ? AND pu.verdict IN ('FAIL', 'PARTIAL')
+            """,
+            (run_id,),
+        ).fetchall()
+        for u in p_rows:
+            try:
+                codes = json.loads(u["error_codes"] or "[]")
+            except Exception:
+                codes = []
+            if not codes:
+                codes = ["TABLE" if u["unit_type"] == "table" else "TEXT"]
+            for code in codes:
+                meta = p_cat.get(code, {"group": "Lỗi Parsing", "name": code, "severity": "Trung bình"})
+                fix = (
+                    "Bật DeepDOC + tăng Table Context Size hoặc dùng chunk_method='table'."
+                    if code in ("TABLE", "P9", "P10")
+                    else "Bật Vision Enhancement / OCR chất lượng cao (MinerU/VLM) cho file scan."
+                    if code in ("TEXT", "P1", "P2", "P4", "P5", "P6")
+                    else "Dùng layout-aware parser (DeepDOC) để giữ đúng thứ tự đọc & heading."
+                )
+                _add_bug(
+                    "PARSING", code, meta["group"], meta["name"],
+                    u["severity"] or meta["severity"],
+                    f"{u['doc_code']} (trang {u['page_num']}): {(u['title'] or u['source_text'] or '')[:70]}",
+                    fix,
+                )
+
+        c_rows = conn.execute(
+            """
+            SELECT ce.*, c.chunk_index, d.doc_code
+            FROM chunk_evaluations ce
+            JOIN chunks c ON c.id = ce.chunk_id
+            LEFT JOIN documents d ON d.id = c.document_id
+            WHERE ce.run_id = ? AND ce.is_sampled = 1
+            """,
+            (run_id,),
+        ).fetchall()
+        for ev in c_rows:
+            try:
+                codes = json.loads(ev["error_codes"] or "[]")
+            except Exception:
+                codes = []
+            if not codes:
+                if ev["integrity"] == 0:
+                    codes.append("INTEGRITY")
+                if ev["context_sufficiency"] == 0:
+                    codes.append("CONTEXT")
+                if ev["no_noise"] == 0:
+                    codes.append("NOISE")
+                if ev["no_duplicate"] == 0:
+                    codes.append("DUPLICATE")
+                if ev["valid_size"] == 0:
+                    codes.append("SIZE")
+            for code in codes:
+                meta = c_cat.get(code, {"group": "Lỗi Chunking", "name": code, "severity": "Trung bình"})
+                fix = (
+                    "Tăng chunk_token_size (512→768/1024), thêm overlap 10-15% hoặc bật Parent-Child / gắn heading vào đầu chunk."
+                    if code in ("INTEGRITY", "CONTEXT", "C1", "C2", "C3")
+                    else "Lọc boilerplate HTML (nav/footer/form), header/footer lặp lại và bỏ chunk rác < 30 ký tự."
+                    if code in ("NOISE", "C4", "C5")
+                    else "Chuyển Excel/bảng sang template 'Table' và giảm overlapped_percent để tránh lặp nội dung."
+                    if code in ("DUPLICATE", "C6", "C7")
+                    else "Chuẩn hóa lại chunk_token_size (min/max) và gộp các đoạn quá ngắn."
+                )
+                _add_bug(
+                    "CHUNKING", code, meta["group"], meta["name"], meta["severity"],
+                    f"{ev['doc_code'] or 'DOC'}#chunk-{ev['chunk_index']}: {(ev['notes'] or meta['name'])[:70]}",
+                    fix,
+                )
+
+        rr = conn.execute(
+            "SELECT * FROM retrieval_runs WHERE run_id = ? ORDER BY id DESC LIMIT 1", (run_id,)
+        ).fetchone()
+        if rr:
+            ret_sum = _compute_retrieval_summary(conn, rr["id"])
+            for code_tc, item in ret_sum["per_testcase"].items():
+                if not item["passed"]:
+                    rc_layer = item["root_cause_layer"] or "RETRIEVAL"
+                    _add_bug(
+                        "RETRIEVAL", rc_layer, f"Retrieval Fail ({rc_layer})",
+                        f"Truy xuất thất bại (CP < 0.5) · nguyên nhân {rc_layer}",
+                        "Nghiêm trọng",
+                        f"{code_tc} [{item['question_class']}]: {item['question'][:70]}",
+                        "Điều chỉnh tỷ trọng vector/keyword, bật Rerank hoặc tăng Top-K / giảm similarity_threshold.",
+                    )
+
+    sev_rank = {"Nghiêm trọng": 0, "Trung bình": 1, "Nhẹ": 2}
+    ranked = sorted(buckets.values(), key=lambda x: (sev_rank.get(x["severity"], 1), -x["count"]))[:top_n]
+    bugs = []
+    md_lines = [
+        f"# Test Report & Top {len(ranked)} Bug Reports — {run['name']}",
+        "",
+        "| Bug ID | Tầng phát sinh | Mã lỗi | Nhóm lỗi | Mức độ | Số lần gặp | Đề xuất khắc phục |",
+        "|---|---|---|---|---|---:|---|",
+    ]
+    for idx, b in enumerate(ranked, start=1):
+        bug_id = f"BUG-{idx:02d}"
+        entry = {"bug_id": bug_id, **b}
+        bugs.append(entry)
+        md_lines.append(
+            f"| {bug_id} | {b['layer']} | {b['error_code']} | {b['error_group']} | {b['severity']} | {b['count']} | {b['suggested_fix']} |"
+        )
+    md_lines.append("")
+    for b in bugs:
+        md_lines.append(f"### {b['bug_id']}: [{b['layer']}] {b['title']} ({b['severity']}, {b['count']} trường hợp)")
+        for s in b["samples"]:
+            md_lines.append(f"- Bằng chứng: {s}")
+        md_lines.append(f"- Khuyến nghị: {b['suggested_fix']}")
+        md_lines.append("")
+
+    return {
+        "run_id": run_id,
+        "run_name": run["name"],
+        "bugs": bugs,
+        "markdown_report": "\n".join(md_lines),
+    }
+
+
 @router.get("/runs/{run_id}/export-xlsx")
 def export_excel(run_id: int):
     try:
@@ -299,193 +554,6 @@ def export_excel(run_id: int):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="ragflow_qc_run_{run_id}.xlsx"'},
     )
-
-
-@router.post("/seed-demo")
-def seed_demo_data():
-    """Seeds a realistic HIV/AIDS RAGFlow QC workspace so the user can test all 6 screens immediately."""
-    now = utc_now()
-    with get_db() as conn:
-        exists = conn.execute("SELECT id FROM runs WHERE name = 'Baseline_General_512'").fetchone()
-        if exists:
-            return {"ok": True, "message": "Demo data already exists", "run_id": exists["id"]}
-
-        # Documents
-        docs_seed = [
-            ("DOC01", "DOC01_VAAC_Nhung-dieu-can-biet-ve-PrEP.pdf", "PDF văn bản", "https://vaac.gov.vn/prep", 18, 1, 1, 0),
-            ("DOC06", "DOC06_BYT_BC604_Scan.pdf", "PDF scan / ảnh", "https://moh.gov.vn/bc604", 12, 0, 1, 1),
-            ("DOC08", "DOC08_BYT_Huong-dan-chan-doan-HIV.docx", "DOCX có bảng", "https://moh.gov.vn/hd-hiv", 42, 1, 1, 0),
-            ("DOC17", "DOC17_Vinmec_HIV-AIDS-la-gi.html", "Trang web (HTML / MD)", "https://vinmec.com/hiv", 4, 0, 1, 0),
-            ("DOC11", "DOC11_GSO_Nien-giam-thong-ke-HIV.xlsx", "Slide / Excel", "https://gso.gov.vn/hiv", 6, 1, 0, 0),
-        ]
-        doc_ids = {}
-        for code, fname, grp, url, pgs, tbl, img, scn in docs_seed:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO documents (doc_code, filename, format_group, source_url, page_count, has_tables, has_images, is_scan, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (code, fname, grp, url, pgs, tbl, img, scn, now),
-            )
-            doc_ids[code] = conn.execute("SELECT id FROM documents WHERE doc_code = ?", (code,)).fetchone()["id"]
-
-        # Runs
-        cur = conn.execute(
-            """
-            INSERT INTO runs (name, description, is_baseline, ragflow_dataset_id, ragflow_dataset_name, parser_config, retrieval_config, status, created_at)
-            VALUES (?, ?, 1, 'demo_ds_baseline', 'HIV_Baseline', ?, ?, 'SYNCED', ?)
-            """,
-            (
-                "Baseline_General_512",
-                "Cấu hình chuẩn: General parser, chunk_token_size=512, overlap=0%, DeepDOC OCR",
-                json.dumps({"chunk_method": "naive", "chunk_token_num": 512, "overlap": 0, "layout_recognize": "DeepDOC"}),
-                json.dumps({"top_k": 10, "similarity_threshold": 0.2, "vector_similarity_weight": 0.3, "rerank_id": ""}),
-                now,
-            ),
-        )
-        run_id = cur.lastrowid
-
-        # Run documents
-        rd_seed = [
-            ("DOC01", "DONE", 1.0, 24, 9800, 14.2, []),
-            ("DOC06", "DONE", 1.0, 12, 4100, 48.5, ["OCR_LOW_CONF"]),
-            ("DOC08", "DONE", 1.0, 68, 29400, 32.1, []),
-            ("DOC17", "DONE", 1.0, 11, 3900, 5.4, []),
-            ("DOC11", "DONE", 1.0, 5, 1800, 6.1, []),
-        ]
-        for code, st, prog, ccnt, tcnt, dur, flags in rd_seed:
-            conn.execute(
-                """
-                INSERT INTO run_documents (run_id, document_id, ragflow_doc_id, parse_status, progress, chunk_count, token_count, parse_duration_sec, anomaly_flags, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (run_id, doc_ids[code], f"rf_{code.lower()}", st, prog, ccnt, tcnt, dur, json.dumps(flags), now),
-            )
-
-        # Sample chunks
-        chunks_seed = [
-            ("DOC01", "chk_d01_01", 1, "Hiệu quả của PrEP: Các thử nghiệm lâm sàng chứng minh sử dụng PrEP đúng cách làm giảm nguy cơ lây nhiễm HIV đến hơn 90% qua đường tình dục và hơn 70% đối với nhóm tiêm chích ma túy.", 3),
-            ("DOC01", "chk_d01_02", 2, "6", 4),
-            ("DOC06", "chk_d06_01", 1, "Báo c4o công tác ph0ng chong HIV/AIDS năm 2011: Ty le nhiem moi giam 12% so voi cung ky.", 1),
-            ("DOC08", "chk_d08_01", 1, "Bảng 4.2 Phác đồ điều trị dự phòng sau phơi nhiễm (PEP): Thời điểm vàng tốt nhất trong vòng 6 giờ và tối đa không quá 72 giờ. Điều trị ARV liên tục trong 28 ngày (4 tuần).", 15),
-            ("DOC17", "chk_d17_01", 1, "Trang chủ > Chuyên khoa > Truyền nhiễm | Đăng ký khám | HIV/AIDS là hội chứng suy giảm miễn dịch mắc phải do virus HIV gây ra.", 1),
-        ]
-        chunk_pks = {}
-        for code, cid, cidx, txt, pnum in chunks_seed:
-            flags = detect_chunk_rule_flags(txt)
-            cur_c = conn.execute(
-                """
-                INSERT INTO chunks (run_id, document_id, ragflow_doc_id, ragflow_chunk_id, chunk_index, content, char_count, token_est, page_num, rule_flags)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (run_id, doc_ids[code], f"rf_{code.lower()}", cid, cidx, txt, len(txt), max(1, len(txt)//4), pnum, json.dumps(flags)),
-            )
-            chunk_pks[cid] = cur_c.lastrowid
-
-        # Parsing units
-        p_units = [
-            ("DOC01", 1, "text", 3, "Câu 2 – Hiệu quả phòng ngừa PrEP", "Các thử nghiệm lâm sàng chứng minh sử dụng PrEP đúng cách làm giảm nguy cơ lây nhiễm HIV đến hơn 90% qua đường tình dục và hơn 70% đối với nhóm tiêm chích ma túy.", ["chk_d01_01"], 0.98, "PASS", [], 0, ""),
-            ("DOC06", 1, "text", 1, "Mục 1 – Báo cáo công tác 2011 (Scan)", "Báo cáo công tác phòng chống HIV/AIDS năm 2011: Tỷ lệ nhiễm mới giảm 12% so với cùng kỳ.", ["chk_d06_01"], 0.72, "FAIL", ["P6", "P4"], 1, "High"),
-            ("DOC08", 1, "table", 15, "Bảng 4.2 – Phác đồ PEP", "Thời điểm vàng bắt đầu PEP tốt nhất trong vòng 6 giờ, tối đa 72 giờ, uống ARV liên tục 28 ngày.", ["chk_d08_01"], 0.91, "PASS", [], 0, ""),
-            ("DOC17", 1, "text", 1, "Mục 1 – Định nghĩa HIV/AIDS", "HIV/AIDS là hội chứng suy giảm miễn dịch mắc phải do virus HIV gây ra.", ["chk_d17_01"], 0.85, "PARTIAL", ["P10"], 0, "Low"),
-        ]
-        for code, uidx, utype, pnum, title, stxt, mids, msc, verd, errs, cerr, sev in p_units:
-            conn.execute(
-                """
-                INSERT INTO parsing_units (run_id, document_id, unit_index, unit_type, page_num, title, source_text, matched_chunk_ids, match_score, verdict, error_codes, char_error, severity, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (run_id, doc_ids[code], uidx, utype, pnum, title, stxt, json.dumps(mids), msc, verd, json.dumps(errs), cerr, sev, now),
-            )
-
-        # Chunk evaluations
-        ce_seed = [
-            ("chk_d01_01", 1, 1, 1, 1, 1, [], "MANUAL", "Chunk trọn ý, có heading"),
-            ("chk_d01_02", 0, 0, 0, 1, 0, ["C4", "C8"], "RULE", "Chunk rác chỉ chứa số trang 6"),
-            ("chk_d06_01", 1, 1, 1, 1, 1, [], "MANUAL", "Ranh giới ổn nhưng text lỗi OCR từ tầng Parsing"),
-            ("chk_d08_01", 1, 1, 1, 1, 1, [], "MANUAL", "Giữ trọn nội dung bảng 4.2"),
-            ("chk_d17_01", 1, 1, 0, 1, 1, ["C4"], "RULE", "Dính breadcrumb và menu Đăng ký khám"),
-        ]
-        for cid, integ, csuf, nnoise, ndup, vsize, errs, src, note in ce_seed:
-            conn.execute(
-                """
-                INSERT INTO chunk_evaluations (run_id, chunk_id, is_sampled, integrity, context_sufficiency, no_noise, no_duplicate, valid_size, error_codes, judge_source, notes, updated_at)
-                VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (run_id, chunk_pks[cid], integ, csuf, nnoise, ndup, vsize, json.dumps(errs), src, note, now),
-            )
-
-        # Golden Testcases
-        tcs_seed = [
-            ("TC01", "Sử dụng PrEP đúng cách giúp giảm bao nhiêu phần trăm nguy cơ lây nhiễm HIV qua đường tình dục?", "Giảm hơn 90% qua đường tình dục.", "Các thử nghiệm lâm sàng chứng minh sử dụng PrEP đúng cách làm giảm nguy cơ lây nhiễm HIV đến hơn 90% qua đường tình dục.", "DOC01", "Local", "Factoid"),
-            ("TC02", "Thời điểm vàng bắt đầu điều trị dự phòng sau phơi nhiễm PEP là bao lâu và uống thuốc trong mấy ngày?", "Tốt nhất trong 6 giờ, tối đa 72 giờ, uống ARV liên tục 28 ngày.", "Thời điểm vàng tốt nhất trong vòng 6 giờ và tối đa không quá 72 giờ. Điều trị ARV liên tục trong 28 ngày (4 tuần).", "DOC08", "Local", "Procedural"),
-            ("TC03", "Theo báo cáo công tác năm 2011 của Bộ Y tế, tỷ lệ nhiễm HIV mới giảm bao nhiêu phần trăm?", "Giảm 12% so với cùng kỳ.", "Báo cáo công tác phòng chống HIV/AIDS năm 2011: Tỷ lệ nhiễm mới giảm 12% so với cùng kỳ.", "DOC06", "Local", "Factoid"),
-        ]
-        tc_ids = {}
-        for code, q, exp, ref, sfile, cls, intent in tcs_seed:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO golden_testcases (tc_code, input_question, expected_outcome, reference_context, source_file, question_class, intent_type, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (code, q, exp, ref, sfile, cls, intent, now),
-            )
-            tc_ids[code] = conn.execute("SELECT id FROM golden_testcases WHERE tc_code = ?", (code,)).fetchone()["id"]
-
-        # Two retrieval runs (Baseline vs Rerank) for A/B Compare Lab
-        rr1 = conn.execute(
-            "INSERT INTO retrieval_runs (run_id, name, top_k, similarity_threshold, vector_similarity_weight, rerank_id, keyword_enabled, created_at) VALUES (?, 'Baseline (No Rerank, vec=0.3)', 10, 0.2, 0.3, '', 1, ?)",
-            (run_id, now),
-        ).lastrowid
-        rr2 = conn.execute(
-            "INSERT INTO retrieval_runs (run_id, name, top_k, similarity_threshold, vector_similarity_weight, rerank_id, keyword_enabled, created_at) VALUES (?, 'Exp1 (BGE-Reranker, vec=0.5)', 10, 0.2, 0.5, 'BAAI/bge-reranker-v2-m3', 1, ?)",
-            (run_id, now),
-        ).lastrowid
-
-        # Populate retrieval results & cache
-        rr_hits = [
-            (rr1, "TC01", 1, "chk_d01_01", "DOC01_VAAC_PrEP.pdf", chunks_seed[0][3], 0.88, 0.91, 0.81, 1, "MANUAL", "Trúng trực tiếp số liệu 90%"),
-            (rr1, "TC01", 2, "chk_d17_01", "DOC17_Vinmec.html", chunks_seed[4][3], 0.41, 0.45, 0.32, 0, "MANUAL", "Chỉ định nghĩa chung"),
-            (rr1, "TC02", 1, "chk_d17_01", "DOC17_Vinmec.html", chunks_seed[4][3], 0.52, 0.55, 0.44, 0, "MANUAL", "Nhiễu rank 1"),
-            (rr1, "TC02", 2, "chk_d08_01", "DOC08_BYT_HD.docx", chunks_seed[3][3], 0.49, 0.48, 0.51, 1, "MANUAL", "Đúng bảng 4.2 PEP"),
-            (rr1, "TC03", 1, "chk_d17_01", "DOC17_Vinmec.html", chunks_seed[4][3], 0.36, 0.40, 0.25, 0, "MANUAL", "Miss do DOC06 bị lỗi OCR mất dấu"),
-
-            (rr2, "TC01", 1, "chk_d01_01", "DOC01_VAAC_PrEP.pdf", chunks_seed[0][3], 0.94, 0.91, 0.81, 1, "CACHED", "Trúng trực tiếp số liệu 90%"),
-            (rr2, "TC02", 1, "chk_d08_01", "DOC08_BYT_HD.docx", chunks_seed[3][3], 0.91, 0.72, 0.51, 1, "CACHED", "Đúng bảng 4.2 PEP"),
-            (rr2, "TC03", 1, "chk_d06_01", "DOC06_BYT_Scan.pdf", chunks_seed[2][3], 0.61, 0.65, 0.30, 1, "MANUAL", "Vector weight 0.5 cứu được ca OCR mất dấu"),
-        ]
-        for rrid, tcc, rk, cid, dname, txt, sim, vsim, tsim, rel, src, rsn in rr_hits:
-            conn.execute(
-                """
-                INSERT INTO retrieval_results (retrieval_run_id, testcase_id, rank, ragflow_chunk_id, doc_name, content, similarity, vector_similarity, term_similarity, relevant, relevancy_source, reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (rrid, tc_ids[tcc], rk, cid, dname, txt, sim, vsim, tsim, rel, src, rsn),
-            )
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO relevancy_cache (testcase_id, ragflow_chunk_id, relevant, reason, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (tc_ids[tcc], cid, rel, rsn, now),
-            )
-
-        # Meta for root cause
-        metas = [
-            (rr1, "TC01", "FULL", 1.0, "NONE", ""),
-            (rr1, "TC02", "FULL", 1.0, "RERANK", "Chunk đúng bị xếp sau chunk định nghĩa chung khi chưa có rerank"),
-            (rr1, "TC03", "FULL", 0.0, "PARSING", "DOC06 bị lỗi OCR mất dấu (P6/P4) làm nhánh BM25 không khớp từ khóa"),
-            (rr2, "TC01", "FULL", 1.0, "NONE", ""),
-            (rr2, "TC02", "FULL", 1.0, "NONE", ""),
-            (rr2, "TC03", "FULL", 1.0, "NONE", ""),
-        ]
-        for rrid, tcc, ac, cc, rc, rcn in metas:
-            conn.execute(
-                "INSERT OR REPLACE INTO testcase_eval_meta VALUES (?, ?, ?, ?, ?, ?)",
-                (rrid, tc_ids[tcc], ac, cc, rc, rcn),
-            )
-
-    return {"ok": True, "message": "Seeded realistic demo workspace", "run_id": run_id}
 
 
 @router.post("/seed-canonical")

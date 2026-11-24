@@ -175,10 +175,15 @@ def seed_full_canonical_dataset() -> dict:
             note = str(r[10] or "")
             code_str = str(r[11] or "")
 
-            err_codes = []
-            for c in ("C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8"):
-                if c in code_str or c in note:
-                    err_codes.append(c)
+            _legacy_c_map = {
+                "C1": "INTEGRITY", "C2": "INTEGRITY", "C3": "CONTEXT",
+                "C4": "NOISE", "C5": "NOISE", "C6": "DUPLICATE", "C7": "DUPLICATE", "C8": "SIZE",
+            }
+            err_set = set()
+            for c, mapped in _legacy_c_map.items():
+                if c in code_str or c in note or mapped in code_str:
+                    err_set.add(mapped)
+            err_codes = sorted(err_set)
 
             conn.execute(
                 """

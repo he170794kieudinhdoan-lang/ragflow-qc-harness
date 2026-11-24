@@ -1,8 +1,10 @@
 import React, { useMemo, useState } from 'react';
-import { ExternalLink, FileSpreadsheet, Filter, Search, Table2 } from 'lucide-react';
+import { Download, FileSpreadsheet, Filter, Search, Table2 } from 'lucide-react';
+import { api } from '../api/client';
 import { DocumentItem, ParsingUnit } from '../types';
 
 interface Props {
+  runId?: number;
   units: ParsingUnit[];
   docs: DocumentItem[];
   getUnitEffectiveState: (u: ParsingUnit) => 'PASS' | 'FAIL';
@@ -30,11 +32,10 @@ const PARSING_CODE_META: Record<string, CodeMeta> = {
   P8: { group: 'Mất cấu trúc', name: 'Mất cấu trúc danh sách (bullet/numbering)', severity: 'Trung bình' },
   P9: { group: 'Vỡ bảng', name: 'Vỡ cấu trúc bảng (mất hàng/cột/ô gộp)', severity: 'Nghiêm trọng' },
   P10: { group: 'Mất nội dung', name: 'Thiếu / sai số liệu trong bảng', severity: 'Nghiêm trọng' },
-  // Fallback for legacy coarse codes
-  TEXT: { group: 'Lỗi ký tự', name: 'Thiếu chữ / Lỗi dấu & OCR', severity: 'Nghiêm trọng' },
+  TEXT: { group: 'Thiếu chữ / OCR', name: 'Thiếu chữ / Lỗi dấu & OCR', severity: 'Nghiêm trọng' },
   TABLE: { group: 'Vỡ bảng', name: 'Vỡ cấu trúc bảng / Sai số liệu', severity: 'Nghiêm trọng' },
   ORDER: { group: 'Sai thứ tự', name: 'Sai thứ tự đọc / Đảo cột', severity: 'Trung bình' },
-  LAYOUT: { group: 'Mất nội dung', name: 'Mất nội dung ảnh / Sơ đồ / Scan', severity: 'Nghiêm trọng' },
+  LAYOUT: { group: 'Hình / Bố cục', name: 'Mất nội dung ảnh / Sơ đồ / Bố cục', severity: 'Nghiêm trọng' },
   FIDELITY: { group: 'Sai nội dung', name: 'Sai lệch số liệu / đảo nghĩa', severity: 'Nghiêm trọng' },
 };
 
@@ -80,16 +81,17 @@ function getGroupAndSeverity(codes: string[]): { groups: string[]; severity: str
   return { groups: Array.from(groupSet), severity: maxSev };
 }
 
-function pctColor(val: number | null, invert = false): string {
-  if (val === null) return 'text-[#a1a1aa]';
+/** Full-cell Excel conditional formatting fill */
+function excelCellTone(val: number | null, invert = false): string {
+  if (val === null) return 'text-[#9ca3af] bg-transparent';
   if (invert) {
-    if (val <= 5) return 'text-[#027a42] bg-[#f2f7f4]';
-    if (val <= 15) return 'text-[#b45309] bg-[#fffbeb]';
-    return 'text-[#b91c1c] bg-[#fef2f2]';
+    if (val <= 5) return 'text-[#166534] bg-[#dcfce7]/55 font-semibold';
+    if (val <= 15) return 'text-[#854d0e] bg-[#fef9c3]/75 font-semibold';
+    return 'text-[#991b1b] bg-[#fee2e2]/75 font-semibold';
   }
-  if (val >= 85) return 'text-[#027a42] bg-[#f2f7f4]';
-  if (val >= 65) return 'text-[#b45309] bg-[#fffbeb]';
-  return 'text-[#b91c1c] bg-[#fef2f2]';
+  if (val >= 85) return 'text-[#166534] bg-[#dcfce7]/55 font-semibold';
+  if (val >= 65) return 'text-[#854d0e] bg-[#fef9c3]/75 font-semibold';
+  return 'text-[#991b1b] bg-[#fee2e2]/75 font-semibold';
 }
 
 function fmtPct(val: number | null): string {
@@ -97,7 +99,11 @@ function fmtPct(val: number | null): string {
   return `${val.toFixed(1)}%`;
 }
 
+const SUMMARY_COL_LETTERS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O'];
+const DETAIL_COL_LETTERS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K'];
+
 export const ParsingTableView: React.FC<Props> = ({
+  runId,
   units,
   docs,
   getUnitEffectiveState,
@@ -109,7 +115,7 @@ export const ParsingTableView: React.FC<Props> = ({
   const [docCodeFilter, setDocCodeFilter] = useState<string>('ALL');
   const [searchQuery, setSearchQuery] = useState('');
 
-  // Per-document summary rows (mirrors "Tổng hợp điểm" sheet)
+  // Per-document summary rows (aligned with backend compute_parsing_metrics)
   const docSummaryRows = useMemo(() => {
     const byDoc = new Map<
       string,
@@ -138,12 +144,18 @@ export const ParsingTableView: React.FC<Props> = ({
         const all = d.units;
         const textU = all.filter((u) => u.unit_type !== 'table' && u.unit_type !== 'image' && u.unit_type !== 'diagram');
         const tableU = all.filter((u) => u.unit_type === 'table');
-        const layoutU = all.filter((u) => u.unit_type === 'image' || u.unit_type === 'diagram');
+        const layoutImgU = all.filter((u) => u.unit_type === 'image' || u.unit_type === 'diagram');
 
         const textPass = textU.filter((u) => getUnitEffectiveState(u) === 'PASS').length;
         const tablePass = tableU.filter((u) => getUnitEffectiveState(u) === 'PASS').length;
-        const layoutPass = layoutU.filter((u) => getUnitEffectiveState(u) === 'PASS').length;
-        const layoutTotal = layoutU.length;
+        const layoutImgPass = layoutImgU.filter((u) => getUnitEffectiveState(u) === 'PASS').length;
+
+        const layoutOk = all.filter((u) => {
+          const { codes } = getEffectiveCodes(u);
+          const hasLayoutErr = codes.some((c) => c === 'LAYOUT' || c === 'P2' || c === 'P7' || c === 'P8');
+          const failedImg = (u.unit_type === 'image' || u.unit_type === 'diagram') && getUnitEffectiveState(u) !== 'PASS';
+          return !hasLayoutErr && !failedImg;
+        }).length;
 
         const charErr = all.filter((u) => {
           const { codes } = getEffectiveCodes(u);
@@ -158,13 +170,13 @@ export const ParsingTableView: React.FC<Props> = ({
 
         const fidelityPass = all.filter((u) => {
           const { codes } = getEffectiveCodes(u);
-          return !codes.some((c) => c === 'P3' || c === 'P10' || c === 'FIDELITY');
+          return u.fidelity_error !== 1 && !codes.some((c) => c === 'P10' || c === 'FIDELITY');
         }).length;
 
         const textPct = textU.length ? (textPass / textU.length) * 100 : null;
         const tablePct = tableU.length ? (tablePass / tableU.length) * 100 : null;
         const cerPct = all.length ? (charErr / all.length) * 100 : 0;
-        const layoutPct = layoutTotal ? (layoutPass / layoutTotal) * 100 : null;
+        const layoutPct = all.length ? (layoutOk / all.length) * 100 : null;
         const orderPct = all.length ? (orderPass / all.length) * 100 : null;
         const fidelityPct = all.length ? (fidelityPass / all.length) * 100 : null;
 
@@ -193,8 +205,9 @@ export const ParsingTableView: React.FC<Props> = ({
           tablePct,
           charErr,
           cerPct,
-          layoutTotal,
-          layoutPass,
+          layoutTotal: layoutImgU.length,
+          layoutPass: layoutImgPass,
+          layoutOk,
           layoutPct,
           orderErr,
           orderPass,
@@ -206,7 +219,6 @@ export const ParsingTableView: React.FC<Props> = ({
       });
   }, [units, getUnitEffectiveState]);
 
-  // Overall totals for KPI bar & tfoot
   const overall = useMemo(() => {
     const sum = (fn: (r: (typeof docSummaryRows)[number]) => number) =>
       docSummaryRows.reduce((acc, r) => acc + fn(r), 0);
@@ -219,6 +231,7 @@ export const ParsingTableView: React.FC<Props> = ({
     const charErr = sum((r) => r.charErr);
     const layoutTotal = sum((r) => r.layoutTotal);
     const layoutPass = sum((r) => r.layoutPass);
+    const layoutOk = sum((r) => r.layoutOk);
     const orderErr = sum((r) => r.orderErr);
     const orderPass = sum((r) => r.orderPass);
     const fidelityPass = sum((r) => r.fidelityPass);
@@ -226,18 +239,21 @@ export const ParsingTableView: React.FC<Props> = ({
     const textPct = textTotal ? (textPass / textTotal) * 100 : null;
     const tablePct = tableTotal ? (tablePass / tableTotal) * 100 : null;
     const cerPct = totalUnits ? (charErr / totalUnits) * 100 : 0;
-    const layoutPct = layoutTotal ? (layoutPass / layoutTotal) * 100 : null;
+    const layoutPct = totalUnits ? (layoutOk / totalUnits) * 100 : null;
     const orderPct = totalUnits ? (orderPass / totalUnits) * 100 : null;
     const fidelityPct = totalUnits ? (fidelityPass / totalUnits) * 100 : null;
 
-    const vText = textPct ?? 0;
-    const vFid = fidelityPct ?? 0;
-    const vTbl = tablePct ?? vText;
-    const vLay = layoutPct ?? 0;
-    const vOrd = orderPct ?? 0;
-    const parsingScore = totalUnits
-      ? 0.25 * vText + 0.20 * vFid + 0.20 * vTbl + 0.15 * (100 - cerPct) + 0.10 * vLay + 0.10 * vOrd
-      : 0;
+    const weightedTerms: [number, number | null][] = [
+      [0.25, textPct],
+      [0.20, fidelityPct],
+      [0.20, tablePct],
+      [0.15, totalUnits ? 100 - cerPct : null],
+      [0.10, layoutPct],
+      [0.10, orderPct],
+    ];
+    const availTerms = weightedTerms.filter(([, v]) => v !== null) as [number, number][];
+    const wSum = availTerms.reduce((acc, [w]) => acc + w, 0);
+    const parsingScore = wSum > 0 ? availTerms.reduce((acc, [w, v]) => acc + w * v, 0) / wSum : 0;
 
     return {
       docCount: docSummaryRows.length,
@@ -252,6 +268,7 @@ export const ParsingTableView: React.FC<Props> = ({
       cerPct,
       layoutTotal,
       layoutPass,
+      layoutOk,
       layoutPct,
       orderErr,
       orderPass,
@@ -262,7 +279,7 @@ export const ParsingTableView: React.FC<Props> = ({
     };
   }, [docSummaryRows]);
 
-  // Filtered rows for Detail tab
+  // Filtered rows for Detail sheet
   const detailRows = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     return units.filter((u) => {
@@ -282,12 +299,12 @@ export const ParsingTableView: React.FC<Props> = ({
         metricTab === 'LAYOUT' &&
         u.unit_type !== 'image' &&
         u.unit_type !== 'diagram' &&
-        !codes.some((c) => c === 'P2' || c === 'LAYOUT')
+        !codes.some((c) => c === 'P2' || c === 'P7' || c === 'P8' || c === 'LAYOUT')
       ) {
         return false;
       }
       if (metricTab === 'ORDER' && !codes.some((c) => c === 'P3' || c === 'ORDER')) return false;
-      if (metricTab === 'FIDELITY' && !codes.some((c) => c === 'P3' || c === 'P10' || c === 'FIDELITY')) return false;
+      if (metricTab === 'FIDELITY' && u.fidelity_error !== 1 && !codes.some((c) => c === 'P10' || c === 'FIDELITY')) return false;
 
       if (q) {
         const hay = `${u.doc_code} ${u.title} ${u.source_text} ${u.notes || ''} ${codes.join(' ')}`.toLowerCase();
@@ -305,279 +322,281 @@ export const ParsingTableView: React.FC<Props> = ({
     [units]
   );
 
+  const cellBorder = 'border border-[#d1d5db]';
+  const hdrBorder = 'border border-[#cbd5e1]';
+
   return (
-    <div className="flex-1 flex flex-col min-h-0 overflow-hidden bg-[#fafaf9]">
-      {/* Sub-tab Switcher Bar */}
-      <div className="shrink-0 px-5 py-2.5 bg-white border-b border-[#e8e8e6] flex flex-wrap items-center justify-between gap-3">
-        <div className="inline-flex items-center p-0.5 rounded-lg bg-[#f4f4f2] border border-[#e6e4de]">
-          <button
-            type="button"
-            onClick={() => setSubTab('summary')}
-            className={`inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-md transition-colors ${
-              subTab === 'summary'
-                ? 'bg-white text-[#18181b] shadow-xs'
-                : 'text-[#71717a] hover:text-[#18181b]'
-            }`}
-          >
-            <FileSpreadsheet className="size-3.5" />
-            Tổng hợp điểm ({overall.docCount} tài liệu)
-          </button>
-          <button
-            type="button"
-            onClick={() => setSubTab('detail')}
-            className={`inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-md transition-colors ${
-              subTab === 'detail'
-                ? 'bg-white text-[#18181b] shadow-xs'
-                : 'text-[#71717a] hover:text-[#18181b]'
-            }`}
-          >
-            <Table2 className="size-3.5" />
-            Chi tiết từng đoạn ({units.length})
-          </button>
+    <div className="flex-1 flex flex-col min-h-0 overflow-hidden bg-white select-text">
+      {/* Compact Excel Formula / Summary Ribbon */}
+      <div className="shrink-0 bg-[#f8fafc] border-b border-[#cbd5e1] px-3 py-1.5 flex flex-wrap items-center justify-between gap-2 text-[11.5px]">
+        <div className="flex flex-wrap items-center divide-x divide-[#d1d5db] font-mono">
+          <div className="pr-2.5 flex items-center gap-1.5 font-sans">
+            <span className="inline-flex items-center justify-center px-1.5 py-0.5 bg-[#166534] text-white font-mono text-[10px] font-bold">
+              fx
+            </span>
+            <span className="font-semibold text-[#1e293b]">Score:</span>
+            <span className="font-mono font-bold text-[#166534] text-xs">{fmtPct(overall.parsingScore)}</span>
+          </div>
+          <div className="px-2.5 flex items-center gap-1">
+            <span className="text-[#64748b] font-sans">Text:</span>
+            <span className="font-semibold text-[#1e293b]">{fmtPct(overall.textPct)}</span>
+            <span className="text-[10px] text-[#94a3b8]">({overall.textPass}/{overall.textTotal})</span>
+          </div>
+          <div className="px-2.5 flex items-center gap-1">
+            <span className="text-[#64748b] font-sans">Table:</span>
+            <span className="font-semibold text-[#1e293b]">{fmtPct(overall.tablePct)}</span>
+            <span className="text-[10px] text-[#94a3b8]">({overall.tablePass}/{overall.tableTotal})</span>
+          </div>
+          <div className="px-2.5 flex items-center gap-1">
+            <span className="text-[#64748b] font-sans">CER:</span>
+            <span className="font-semibold text-[#1e293b]">{fmtPct(overall.cerPct)}</span>
+            <span className="text-[10px] text-[#94a3b8]">({overall.charErr})</span>
+          </div>
+          <div className="px-2.5 flex items-center gap-1">
+            <span className="text-[#64748b] font-sans">Layout:</span>
+            <span className="font-semibold text-[#1e293b]">{fmtPct(overall.layoutPct)}</span>
+            {overall.layoutTotal > 0 && (
+              <span className="text-[10px] text-[#94a3b8]">({overall.layoutPass}/{overall.layoutTotal} hình)</span>
+            )}
+          </div>
+          <div className="px-2.5 flex items-center gap-1">
+            <span className="text-[#64748b] font-sans">ROA:</span>
+            <span className="font-semibold text-[#1e293b]">{fmtPct(overall.orderPct)}</span>
+          </div>
+          <div className="pl-2.5 flex items-center gap-1">
+            <span className="text-[#64748b] font-sans">Fidelity:</span>
+            <span className="font-semibold text-[#1e293b]">{fmtPct(overall.fidelityPct)}</span>
+          </div>
         </div>
 
-        <div className="text-[11px] text-[#78716c]">
-          Click vào dòng bất kỳ để mở <span className="font-medium text-[#18181b]">đối chiếu Side-by-Side</span> &amp; sửa điểm
+        <div className="flex items-center gap-2.5">
+          <div className="text-[11px] text-[#64748b] font-sans hidden xl:block">
+            Click dòng để mở đối chiếu · {overall.docCount}/{docs.length || overall.docCount} tài liệu · {overall.totalUnits} đoạn
+          </div>
+          {runId && (
+            <a
+              href={api.exportXlsxUrl(runId)}
+              download={`ragflow_qc_run_${runId}.xlsx`}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-[#166534] hover:bg-[#15803d] text-white text-[11px] font-medium font-sans transition-colors"
+              title="Tải xuống toàn bộ bảng tổng hợp & chi tiết dạng file Excel (.xlsx)"
+            >
+              <Download className="size-3.5" />
+              Xuất Excel (.xlsx)
+            </a>
+          )}
         </div>
       </div>
 
+      {/* Main Spreadsheet Viewport */}
       {subTab === 'summary' ? (
-        <div className="flex-1 overflow-auto p-5 space-y-4">
-          {/* Top KPI Strip (matching sheet "Tổng hợp điểm") */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2.5">
-            {[
-              {
-                label: 'Text Completeness',
-                val: fmtPct(overall.textPct),
-                sub: `${overall.textPass}/${overall.textTotal} đoạn chữ`,
-                cls: pctColor(overall.textPct),
-              },
-              {
-                label: 'Table Accuracy',
-                val: fmtPct(overall.tablePct),
-                sub: `${overall.tablePass}/${overall.tableTotal} bảng`,
-                cls: pctColor(overall.tablePct),
-              },
-              {
-                label: 'Character Error',
-                val: fmtPct(overall.cerPct),
-                sub: `${overall.charErr}/${overall.totalUnits} đoạn lỗi`,
-                cls: pctColor(overall.cerPct, true),
-              },
-              {
-                label: 'Layout & Struct',
-                val: fmtPct(overall.layoutPct),
-                sub: `${overall.layoutPass}/${overall.layoutTotal} mục`,
-                cls: pctColor(overall.layoutPct),
-              },
-              {
-                label: 'Reading Order',
-                val: fmtPct(overall.orderPct),
-                sub: `${overall.orderPass}/${overall.totalUnits} đúng thứ tự`,
-                cls: pctColor(overall.orderPct),
-              },
-              {
-                label: 'Content Fidelity',
-                val: fmtPct(overall.fidelityPct),
-                sub: `${overall.fidelityPass}/${overall.totalUnits} trung thực`,
-                cls: pctColor(overall.fidelityPct),
-              },
-              {
-                label: 'Parsing Score',
-                val: fmtPct(overall.parsingScore),
-                sub: `${overall.docCount}/${docs.length || overall.docCount} tài liệu`,
-                cls: 'text-[#027a42] bg-[#f2f7f4] border-[#d6eadf]',
-              },
-            ].map((k) => (
-              <div
-                key={k.label}
-                className="bg-white border border-[#e6e4de] rounded-xl p-3 flex flex-col justify-between gap-1"
-              >
-                <div className="text-[10.5px] font-medium text-[#78716c] truncate">{k.label}</div>
-                <div className={`inline-flex self-start px-1.5 py-0.5 rounded font-mono text-sm font-bold ${k.cls}`}>
-                  {k.val}
-                </div>
-                <div className="text-[10px] text-[#a1a1aa] font-mono">{k.sub}</div>
-              </div>
-            ))}
-          </div>
-
-          {/* Summary Matrix Table */}
-          <div className="bg-white border border-[#e6e4de] rounded-xl overflow-hidden shadow-xs">
-            <div className="overflow-x-auto">
-              <table className="w-full text-xs border-collapse">
-                <thead>
-                  <tr className="bg-[#f7f7f5] border-b border-[#e6e4de] text-[10.5px] text-[#52525b] uppercase tracking-wider">
-                    <th className="sticky left-0 z-20 bg-[#f7f7f5] text-left px-3 py-2.5 font-semibold border-r border-[#e6e4de] whitespace-nowrap">
-                      Tài liệu
-                    </th>
-                    <th className="text-left px-3 py-2.5 font-semibold min-w-[200px] border-r border-[#efede8]">
-                      Tên tài liệu
-                    </th>
-                    <th className="text-left px-3 py-2.5 font-semibold whitespace-nowrap border-r border-[#efede8]">
-                      Nhóm định dạng
-                    </th>
-                    <th className="text-right px-2.5 py-2.5 font-semibold whitespace-nowrap">Đoạn chữ</th>
-                    <th className="text-right px-2.5 py-2.5 font-semibold whitespace-nowrap">Đúng</th>
-                    <th className="text-right px-2.5 py-2.5 font-semibold whitespace-nowrap border-r border-[#efede8]">
-                      Text %
-                    </th>
-                    <th className="text-right px-2.5 py-2.5 font-semibold whitespace-nowrap">Bảng</th>
-                    <th className="text-right px-2.5 py-2.5 font-semibold whitespace-nowrap">Đúng</th>
-                    <th className="text-right px-2.5 py-2.5 font-semibold whitespace-nowrap border-r border-[#efede8]">
-                      Table %
-                    </th>
-                    <th className="text-right px-2.5 py-2.5 font-semibold whitespace-nowrap">Lỗi KT</th>
-                    <th className="text-right px-2.5 py-2.5 font-semibold whitespace-nowrap border-r border-[#efede8]">
-                      CER %
-                    </th>
-                    <th className="text-right px-2.5 py-2.5 font-semibold whitespace-nowrap">Layout</th>
-                    <th className="text-right px-2.5 py-2.5 font-semibold whitespace-nowrap border-r border-[#efede8]">
-                      Layout %
-                    </th>
-                    <th className="text-right px-2.5 py-2.5 font-semibold whitespace-nowrap">Sai TT</th>
-                    <th className="text-right px-2.5 py-2.5 font-semibold whitespace-nowrap border-r border-[#efede8]">
-                      ROA %
-                    </th>
-                    <th className="text-right px-2.5 py-2.5 font-semibold whitespace-nowrap">Fidelity %</th>
-                    <th className="text-right px-3 py-2.5 font-semibold whitespace-nowrap bg-[#f2f7f4]/60 text-[#027a42]">
-                      Score
-                    </th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-[#efede8]">
-                  {docSummaryRows.map((r) => (
-                    <tr
-                      key={r.doc_code}
-                      onClick={() => {
-                        setDocCodeFilter(r.doc_code);
-                        setMetricTab('ALL');
-                        setVerdictFilter('ALL');
-                        setSubTab('detail');
-                      }}
-                      className="hover:bg-[#faf9f6] cursor-pointer transition-colors group"
-                    >
-                      <td className="sticky left-0 z-10 bg-white group-hover:bg-[#faf9f6] px-3 py-2 font-mono font-semibold text-[#18181b] border-r border-[#e6e4de] whitespace-nowrap">
-                        {r.doc_code}
-                      </td>
-                      <td className="px-3 py-2 text-[#18181b] border-r border-[#efede8] max-w-[260px] truncate" title={r.filename}>
-                        {r.filename}
-                      </td>
-                      <td className="px-3 py-2 text-[#71717a] border-r border-[#efede8] whitespace-nowrap text-[11px]">
-                        {r.format_group}
-                      </td>
-                      <td className="px-2.5 py-2 text-right font-mono text-[#52525b]">{r.textTotal}</td>
-                      <td className="px-2.5 py-2 text-right font-mono text-[#52525b]">{r.textPass}</td>
-                      <td className="px-2.5 py-2 text-right font-mono border-r border-[#efede8]">
-                        <span className={`px-1.5 py-0.5 rounded font-semibold ${pctColor(r.textPct)}`}>
-                          {fmtPct(r.textPct)}
-                        </span>
-                      </td>
-                      <td className="px-2.5 py-2 text-right font-mono text-[#52525b]">{r.tableTotal}</td>
-                      <td className="px-2.5 py-2 text-right font-mono text-[#52525b]">{r.tablePass}</td>
-                      <td className="px-2.5 py-2 text-right font-mono border-r border-[#efede8]">
-                        <span className={`px-1.5 py-0.5 rounded font-semibold ${pctColor(r.tablePct)}`}>
-                          {fmtPct(r.tablePct)}
-                        </span>
-                      </td>
-                      <td className="px-2.5 py-2 text-right font-mono text-[#52525b]">{r.charErr}</td>
-                      <td className="px-2.5 py-2 text-right font-mono border-r border-[#efede8]">
-                        <span className={`px-1.5 py-0.5 rounded font-semibold ${pctColor(r.cerPct, true)}`}>
-                          {fmtPct(r.cerPct)}
-                        </span>
-                      </td>
-                      <td className="px-2.5 py-2 text-right font-mono text-[#52525b]">
-                        {r.layoutPass}/{r.layoutTotal}
-                      </td>
-                      <td className="px-2.5 py-2 text-right font-mono border-r border-[#efede8]">
-                        <span className={`px-1.5 py-0.5 rounded font-semibold ${pctColor(r.layoutPct)}`}>
-                          {fmtPct(r.layoutPct)}
-                        </span>
-                      </td>
-                      <td className="px-2.5 py-2 text-right font-mono text-[#52525b]">{r.orderErr}</td>
-                      <td className="px-2.5 py-2 text-right font-mono border-r border-[#efede8]">
-                        <span className={`px-1.5 py-0.5 rounded font-semibold ${pctColor(r.orderPct)}`}>
-                          {fmtPct(r.orderPct)}
-                        </span>
-                      </td>
-                      <td className="px-2.5 py-2 text-right font-mono">
-                        <span className={`px-1.5 py-0.5 rounded font-semibold ${pctColor(r.fidelityPct)}`}>
-                          {fmtPct(r.fidelityPct)}
-                        </span>
-                      </td>
-                      <td className="px-3 py-2 text-right font-mono font-bold text-[#027a42] bg-[#f2f7f4]/40">
-                        {fmtPct(r.parsingScore)}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-                <tfoot>
-                  <tr className="bg-[#f7f7f5] border-t-2 border-[#dedede] font-semibold text-[#18181b]">
-                    <td className="sticky left-0 z-10 bg-[#f7f7f5] px-3 py-2.5 font-mono border-r border-[#e6e4de]">
-                      TỔNG
-                    </td>
-                    <td className="px-3 py-2.5 border-r border-[#efede8]">
-                      {overall.docCount} tài liệu ({overall.totalUnits} đoạn)
-                    </td>
-                    <td className="px-3 py-2.5 border-r border-[#efede8] text-[#71717a]">Toàn bộ</td>
-                    <td className="px-2.5 py-2.5 text-right font-mono">{overall.textTotal}</td>
-                    <td className="px-2.5 py-2.5 text-right font-mono">{overall.textPass}</td>
-                    <td className="px-2.5 py-2.5 text-right font-mono border-r border-[#efede8]">
-                      {fmtPct(overall.textPct)}
-                    </td>
-                    <td className="px-2.5 py-2.5 text-right font-mono">{overall.tableTotal}</td>
-                    <td className="px-2.5 py-2.5 text-right font-mono">{overall.tablePass}</td>
-                    <td className="px-2.5 py-2.5 text-right font-mono border-r border-[#efede8]">
-                      {fmtPct(overall.tablePct)}
-                    </td>
-                    <td className="px-2.5 py-2.5 text-right font-mono">{overall.charErr}</td>
-                    <td className="px-2.5 py-2.5 text-right font-mono border-r border-[#efede8]">
-                      {fmtPct(overall.cerPct)}
-                    </td>
-                    <td className="px-2.5 py-2.5 text-right font-mono">
-                      {overall.layoutPass}/{overall.layoutTotal}
-                    </td>
-                    <td className="px-2.5 py-2.5 text-right font-mono border-r border-[#efede8]">
-                      {fmtPct(overall.layoutPct)}
-                    </td>
-                    <td className="px-2.5 py-2.5 text-right font-mono">{overall.orderErr}</td>
-                    <td className="px-2.5 py-2.5 text-right font-mono border-r border-[#efede8]">
-                      {fmtPct(overall.orderPct)}
-                    </td>
-                    <td className="px-2.5 py-2.5 text-right font-mono">{fmtPct(overall.fidelityPct)}</td>
-                    <td className="px-3 py-2.5 text-right font-mono text-[#027a42] bg-[#f2f7f4]/70">
-                      {fmtPct(overall.parsingScore)}
-                    </td>
-                  </tr>
-                </tfoot>
-              </table>
-            </div>
-          </div>
+        <div className="flex-1 overflow-auto bg-white">
+          <table className="w-full border-collapse text-[12px] tabular-nums">
+            <thead className="sticky top-0 z-20">
+              {/* Excel Column Letters Row */}
+              <tr className="bg-[#f1f5f9] text-[#64748b] font-mono text-[10px]">
+                <th className={`sticky left-0 z-30 bg-[#e2e8f0] ${hdrBorder} w-8 py-0.5 text-center select-none`} />
+                {SUMMARY_COL_LETTERS.map((col, idx) => (
+                  <th
+                    key={col}
+                    className={`${hdrBorder} py-0.5 text-center font-normal select-none ${
+                      idx === 0 ? 'sticky left-8 z-30 bg-[#f1f5f9]' : ''
+                    }`}
+                  >
+                    {col}
+                  </th>
+                ))}
+              </tr>
+              {/* Tier 1 Grouped Headers */}
+              <tr className="bg-[#e6f0ea] text-[#1e293b] text-[11px] font-semibold">
+                <th
+                  rowSpan={2}
+                  className={`sticky left-0 z-30 bg-[#e2e8f0] ${hdrBorder} w-8 text-center font-mono text-[10px] text-[#64748b]`}
+                >
+                  #
+                </th>
+                <th
+                  rowSpan={2}
+                  className={`sticky left-8 z-30 bg-[#e6f0ea] ${hdrBorder} px-2 py-1.5 text-left whitespace-nowrap`}
+                >
+                  Mã
+                </th>
+                <th rowSpan={2} className={`${hdrBorder} px-2.5 py-1.5 text-left min-w-[230px]`}>
+                  Tên tài liệu
+                </th>
+                <th rowSpan={2} className={`${hdrBorder} px-2.5 py-1.5 text-left whitespace-nowrap`}>
+                  Nhóm định dạng
+                </th>
+                <th colSpan={2} className={`${hdrBorder} px-2 py-1 text-center whitespace-nowrap bg-[#e2ece7]`}>
+                  Văn bản (Text)
+                </th>
+                <th colSpan={2} className={`${hdrBorder} px-2 py-1 text-center whitespace-nowrap bg-[#e8eef5]`}>
+                  Bảng biểu (Table)
+                </th>
+                <th colSpan={2} className={`${hdrBorder} px-2 py-1 text-center whitespace-nowrap bg-[#f5efe6]`}>
+                  Lỗi ký tự (CER)
+                </th>
+                <th colSpan={2} className={`${hdrBorder} px-2 py-1 text-center whitespace-nowrap bg-[#eee9f5]`}>
+                  Hình &amp; Bố cục
+                </th>
+                <th colSpan={2} className={`${hdrBorder} px-2 py-1 text-center whitespace-nowrap bg-[#e6f0ea]`}>
+                  Thứ tự (ROA)
+                </th>
+                <th rowSpan={2} className={`${hdrBorder} px-2 py-1.5 text-right whitespace-nowrap`}>
+                  Fidelity %
+                </th>
+                <th
+                  rowSpan={2}
+                  className={`${hdrBorder} px-2.5 py-1.5 text-right whitespace-nowrap bg-[#d1fae5]/70 text-[#14532d]`}
+                >
+                  Score
+                </th>
+              </tr>
+              {/* Tier 2 Sub-headers */}
+              <tr className="bg-[#f8fafc] text-[#475569] text-[10.5px] font-semibold">
+                <th className={`${hdrBorder} px-2 py-1 text-right whitespace-nowrap`}>Đạt/Tổng</th>
+                <th className={`${hdrBorder} px-2 py-1 text-right whitespace-nowrap`}>Text %</th>
+                <th className={`${hdrBorder} px-2 py-1 text-right whitespace-nowrap`}>Đạt/Tổng</th>
+                <th className={`${hdrBorder} px-2 py-1 text-right whitespace-nowrap`}>Table %</th>
+                <th className={`${hdrBorder} px-2 py-1 text-right whitespace-nowrap`}>Số lỗi</th>
+                <th className={`${hdrBorder} px-2 py-1 text-right whitespace-nowrap`}>CER %</th>
+                <th className={`${hdrBorder} px-2 py-1 text-right whitespace-nowrap`}>Hình</th>
+                <th className={`${hdrBorder} px-2 py-1 text-right whitespace-nowrap`}>Layout %</th>
+                <th className={`${hdrBorder} px-2 py-1 text-right whitespace-nowrap`}>Sai TT</th>
+                <th className={`${hdrBorder} px-2 py-1 text-right whitespace-nowrap`}>ROA %</th>
+              </tr>
+            </thead>
+            <tbody>
+              {docSummaryRows.map((r, rowIdx) => (
+                <tr
+                  key={r.doc_code}
+                  onClick={() => {
+                    setDocCodeFilter(r.doc_code);
+                    setMetricTab('ALL');
+                    setVerdictFilter('ALL');
+                    setSubTab('detail');
+                  }}
+                  className="bg-white even:bg-[#f9fafb] hover:bg-[#eff6ff] cursor-pointer group"
+                >
+                  <td
+                    className={`sticky left-0 z-10 bg-[#f1f5f9] group-hover:bg-[#dbeafe] ${cellBorder} text-center font-mono text-[10.5px] text-[#64748b] py-1.5 select-none`}
+                  >
+                    {rowIdx + 1}
+                  </td>
+                  <td
+                    className={`sticky left-8 z-10 bg-white group-even:bg-[#f9fafb] group-hover:bg-[#eff6ff] ${cellBorder} px-2 py-1.5 font-mono font-semibold text-[#0f172a] whitespace-nowrap`}
+                  >
+                    {r.doc_code}
+                  </td>
+                  <td
+                    className={`${cellBorder} px-2.5 py-1.5 text-[#0f172a] max-w-[290px] truncate`}
+                    title={r.filename}
+                  >
+                    {r.filename}
+                  </td>
+                  <td className={`${cellBorder} px-2.5 py-1.5 text-[#475569] whitespace-nowrap text-[11px]`}>
+                    {r.format_group}
+                  </td>
+                  <td className={`${cellBorder} px-2 py-1.5 text-right font-mono text-[#475569] whitespace-nowrap`}>
+                    {r.textTotal > 0 ? `${r.textPass}/${r.textTotal}` : '—'}
+                  </td>
+                  <td className={`${cellBorder} px-2 py-1.5 text-right font-mono whitespace-nowrap ${excelCellTone(r.textPct)}`}>
+                    {fmtPct(r.textPct)}
+                  </td>
+                  <td className={`${cellBorder} px-2 py-1.5 text-right font-mono text-[#475569] whitespace-nowrap`}>
+                    {r.tableTotal > 0 ? `${r.tablePass}/${r.tableTotal}` : '—'}
+                  </td>
+                  <td className={`${cellBorder} px-2 py-1.5 text-right font-mono whitespace-nowrap ${excelCellTone(r.tablePct)}`}>
+                    {fmtPct(r.tablePct)}
+                  </td>
+                  <td className={`${cellBorder} px-2 py-1.5 text-right font-mono text-[#475569] whitespace-nowrap`}>
+                    {r.charErr}
+                  </td>
+                  <td className={`${cellBorder} px-2 py-1.5 text-right font-mono whitespace-nowrap ${excelCellTone(r.cerPct, true)}`}>
+                    {fmtPct(r.cerPct)}
+                  </td>
+                  <td className={`${cellBorder} px-2 py-1.5 text-right font-mono text-[#475569] whitespace-nowrap`}>
+                    {r.layoutTotal > 0 ? `${r.layoutPass}/${r.layoutTotal}` : '—'}
+                  </td>
+                  <td className={`${cellBorder} px-2 py-1.5 text-right font-mono whitespace-nowrap ${excelCellTone(r.layoutPct)}`}>
+                    {fmtPct(r.layoutPct)}
+                  </td>
+                  <td className={`${cellBorder} px-2 py-1.5 text-right font-mono text-[#475569] whitespace-nowrap`}>
+                    {r.orderErr}
+                  </td>
+                  <td className={`${cellBorder} px-2 py-1.5 text-right font-mono whitespace-nowrap ${excelCellTone(r.orderPct)}`}>
+                    {fmtPct(r.orderPct)}
+                  </td>
+                  <td className={`${cellBorder} px-2 py-1.5 text-right font-mono whitespace-nowrap ${excelCellTone(r.fidelityPct)}`}>
+                    {fmtPct(r.fidelityPct)}
+                  </td>
+                  <td
+                    className={`${cellBorder} px-2.5 py-1.5 text-right font-mono font-bold whitespace-nowrap ${excelCellTone(r.parsingScore)}`}
+                  >
+                    {fmtPct(r.parsingScore)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+            <tfoot className="sticky bottom-0 z-20">
+              <tr className="bg-[#e6f0ea] font-semibold text-[#0f172a] shadow-[0_-1px_0_#94a3b8]">
+                <td className={`sticky left-0 z-30 bg-[#cbd5e1] ${hdrBorder} text-center font-mono text-[10px] text-[#334155] py-2`}>
+                  Σ
+                </td>
+                <td className={`sticky left-8 z-30 bg-[#e6f0ea] ${hdrBorder} px-2 py-2 font-mono whitespace-nowrap`}>
+                  TỔNG
+                </td>
+                <td className={`${hdrBorder} px-2.5 py-2 whitespace-nowrap`}>
+                  {overall.docCount} tài liệu ({overall.totalUnits} đoạn)
+                </td>
+                <td className={`${hdrBorder} px-2.5 py-2 text-[#475569] text-[11px]`}>Toàn bộ</td>
+                <td className={`${hdrBorder} px-2 py-2 text-right font-mono`}>
+                  {overall.textPass}/{overall.textTotal}
+                </td>
+                <td className={`${hdrBorder} px-2 py-2 text-right font-mono`}>{fmtPct(overall.textPct)}</td>
+                <td className={`${hdrBorder} px-2 py-2 text-right font-mono`}>
+                  {overall.tablePass}/{overall.tableTotal}
+                </td>
+                <td className={`${hdrBorder} px-2 py-2 text-right font-mono`}>{fmtPct(overall.tablePct)}</td>
+                <td className={`${hdrBorder} px-2 py-2 text-right font-mono`}>{overall.charErr}</td>
+                <td className={`${hdrBorder} px-2 py-2 text-right font-mono`}>{fmtPct(overall.cerPct)}</td>
+                <td className={`${hdrBorder} px-2 py-2 text-right font-mono`}>
+                  {overall.layoutTotal > 0 ? `${overall.layoutPass}/${overall.layoutTotal}` : '—'}
+                </td>
+                <td className={`${hdrBorder} px-2 py-2 text-right font-mono`}>{fmtPct(overall.layoutPct)}</td>
+                <td className={`${hdrBorder} px-2 py-2 text-right font-mono`}>{overall.orderErr}</td>
+                <td className={`${hdrBorder} px-2 py-2 text-right font-mono`}>{fmtPct(overall.orderPct)}</td>
+                <td className={`${hdrBorder} px-2 py-2 text-right font-mono`}>{fmtPct(overall.fidelityPct)}</td>
+                <td className={`${hdrBorder} px-2.5 py-2 text-right font-mono font-bold text-[#14532d] bg-[#bbf7d0]/70`}>
+                  {fmtPct(overall.parsingScore)}
+                </td>
+              </tr>
+            </tfoot>
+          </table>
         </div>
       ) : (
-        <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-          {/* Detail Filter Bar */}
-          <div className="shrink-0 px-5 py-2.5 bg-white border-b border-[#e8e8e6] flex flex-wrap items-center justify-between gap-2">
-            <div className="flex flex-wrap items-center gap-1.5">
-              <Filter className="size-3.5 text-[#78716c] mr-0.5" />
+        <div className="flex-1 flex flex-col min-h-0 overflow-hidden bg-white">
+          {/* Excel AutoFilter Bar */}
+          <div className="shrink-0 px-3 py-1.5 bg-[#f8fafc] border-b border-[#cbd5e1] flex flex-wrap items-center justify-between gap-2 text-[11.5px]">
+            <div className="flex flex-wrap items-center gap-1">
+              <Filter className="size-3.5 text-[#64748b] mr-1" />
               {(
                 [
                   { id: 'ALL', label: 'Tất cả' },
-                  { id: 'TEXT', label: 'Text Completeness' },
-                  { id: 'TABLE', label: 'Table Accuracy' },
-                  { id: 'LAYOUT', label: 'Layout & Struct' },
+                  { id: 'TEXT', label: 'Text' },
+                  { id: 'TABLE', label: 'Table' },
+                  { id: 'LAYOUT', label: 'Hình & Layout' },
                   { id: 'ORDER', label: 'Reading Order' },
-                  { id: 'FIDELITY', label: 'Content Fidelity' },
+                  { id: 'FIDELITY', label: 'Fidelity' },
                 ] as { id: MetricTab; label: string }[]
               ).map((t) => (
                 <button
                   key={t.id}
                   type="button"
                   onClick={() => setMetricTab(t.id)}
-                  className={`px-2.5 py-1 text-[11px] rounded-md transition-colors ${
+                  className={`px-2 py-0.5 text-[11px] border transition-colors ${
                     metricTab === t.id
-                      ? 'bg-[#18181b] text-white font-medium'
-                      : 'bg-[#f4f4f2] text-[#52525b] hover:bg-[#e8e8e5]'
+                      ? 'bg-[#166534] text-white border-[#166534] font-medium'
+                      : 'bg-white text-[#334155] border-[#cbd5e1] hover:bg-[#f1f5f9]'
                   }`}
                 >
                   {t.label}
@@ -585,11 +604,11 @@ export const ParsingTableView: React.FC<Props> = ({
               ))}
             </div>
 
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-center gap-1.5">
               <select
                 value={docCodeFilter}
                 onChange={(e) => setDocCodeFilter(e.target.value)}
-                className="py-1 px-2 text-xs bg-white border border-[#e4e4e2] rounded-md text-[#18181b]"
+                className="py-0.5 px-2 text-[11.5px] bg-white border border-[#cbd5e1] text-[#0f172a]"
               >
                 <option value="ALL">Tất cả tài liệu</option>
                 {docCodes.map((c) => (
@@ -602,7 +621,7 @@ export const ParsingTableView: React.FC<Props> = ({
               <select
                 value={verdictFilter}
                 onChange={(e) => setVerdictFilter(e.target.value as VerdictFilter)}
-                className="py-1 px-2 text-xs bg-white border border-[#e4e4e2] rounded-md text-[#18181b]"
+                className="py-0.5 px-2 text-[11.5px] bg-white border border-[#cbd5e1] text-[#0f172a]"
               >
                 <option value="ALL">Mọi kết luận</option>
                 <option value="PASS">Đúng (PASS)</option>
@@ -611,187 +630,200 @@ export const ParsingTableView: React.FC<Props> = ({
               </select>
 
               <div className="relative">
-                <Search className="size-3.5 text-[#a1a1aa] absolute left-2 top-1/2 -translate-y-1/2" />
+                <Search className="size-3 text-[#94a3b8] absolute left-2 top-1/2 -translate-y-1/2" />
                 <input
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Tìm nội dung, mã lỗi..."
-                  className="pl-7 pr-2.5 py-1 text-xs bg-white border border-[#e4e4e2] rounded-md w-48 focus:outline-none focus:border-[#18181b]"
+                  placeholder="Lọc nội dung, mã lỗi..."
+                  className="pl-6 pr-2 py-0.5 text-[11.5px] bg-white border border-[#cbd5e1] w-48 focus:outline-none focus:border-[#166534]"
                 />
               </div>
 
-              <span className="text-[11px] font-mono text-[#78716c]">
+              <span className="text-[11px] font-mono text-[#475569] pl-1">
                 {detailRows.length}/{units.length} dòng
               </span>
             </div>
           </div>
 
-          {/* 11-Column Detail Table */}
-          <div className="flex-1 overflow-auto p-4">
-            <div className="bg-white border border-[#e6e4de] rounded-xl overflow-hidden shadow-xs">
-              <div className="overflow-x-auto">
-                <table className="w-full text-xs border-collapse">
-                  <thead>
-                    <tr className="bg-[#f7f7f5] border-b border-[#e6e4de] text-[10.5px] text-[#52525b] uppercase tracking-wider">
-                      <th className="text-left px-2.5 py-2.5 font-semibold whitespace-nowrap">Tài liệu</th>
-                      <th className="text-right px-2 py-2.5 font-semibold whitespace-nowrap">STT</th>
-                      <th className="text-left px-2.5 py-2.5 font-semibold min-w-[160px]">Đoạn / Tiêu đề</th>
-                      <th className="text-center px-2 py-2.5 font-semibold whitespace-nowrap">Trang</th>
-                      <th className="text-left px-2.5 py-2.5 font-semibold min-w-[240px]">Nội dung gốc</th>
-                      <th className="text-left px-2.5 py-2.5 font-semibold whitespace-nowrap">Chunk đối chiếu</th>
-                      <th className="text-center px-2.5 py-2.5 font-semibold whitespace-nowrap">Kết luận</th>
-                      <th className="text-left px-2.5 py-2.5 font-semibold whitespace-nowrap">Nhóm lỗi</th>
-                      <th className="text-left px-2.5 py-2.5 font-semibold whitespace-nowrap">Mã lỗi</th>
-                      <th className="text-left px-2.5 py-2.5 font-semibold whitespace-nowrap">Mức độ</th>
-                      <th className="text-left px-2.5 py-2.5 font-semibold min-w-[180px]">Ghi chú lỗi</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-[#efede8]">
-                    {detailRows.length === 0 ? (
-                      <tr>
-                        <td colSpan={11} className="text-center py-10 text-[#78716c]">
-                          Không có dòng nào khớp bộ lọc hiện tại.
+          {/* Excel Detail Grid */}
+          <div className="flex-1 overflow-auto bg-white">
+            <table className="w-full border-collapse text-[12px] tabular-nums">
+              <thead className="sticky top-0 z-20">
+                <tr className="bg-[#f1f5f9] text-[#64748b] font-mono text-[10px]">
+                  <th className={`sticky left-0 z-30 bg-[#e2e8f0] ${hdrBorder} w-9 py-0.5 text-center select-none`} />
+                  {DETAIL_COL_LETTERS.map((col, idx) => (
+                    <th
+                      key={col}
+                      className={`${hdrBorder} py-0.5 text-center font-normal select-none ${
+                        idx === 0 ? 'sticky left-9 z-30 bg-[#f1f5f9]' : ''
+                      }`}
+                    >
+                      {col}
+                    </th>
+                  ))}
+                </tr>
+                <tr className="bg-[#e6f0ea] text-[#1e293b] text-[11px] font-semibold">
+                  <th className={`sticky left-0 z-30 bg-[#e2e8f0] ${hdrBorder} w-9 py-1.5 text-center font-mono text-[10px] text-[#64748b]`}>
+                    #
+                  </th>
+                  <th className={`sticky left-9 z-30 bg-[#e6f0ea] ${hdrBorder} px-2 py-1.5 text-left whitespace-nowrap`}>
+                    Tài liệu
+                  </th>
+                  <th className={`${hdrBorder} px-2 py-1.5 text-right whitespace-nowrap`}>STT</th>
+                  <th className={`${hdrBorder} px-2 py-1.5 text-center whitespace-nowrap`}>Loại</th>
+                  <th className={`${hdrBorder} px-2 py-1.5 text-center whitespace-nowrap`}>Trang</th>
+                  <th className={`${hdrBorder} px-2.5 py-1.5 text-left min-w-[170px]`}>Đoạn / Tiêu đề</th>
+                  <th className={`${hdrBorder} px-2.5 py-1.5 text-left min-w-[240px]`}>Nội dung gốc</th>
+                  <th className={`${hdrBorder} px-2 py-1.5 text-left whitespace-nowrap`}>Chunk khớp</th>
+                  <th className={`${hdrBorder} px-2 py-1.5 text-center whitespace-nowrap`}>Kết luận</th>
+                  <th className={`${hdrBorder} px-2 py-1.5 text-left whitespace-nowrap`}>Mã lỗi</th>
+                  <th className={`${hdrBorder} px-2 py-1.5 text-left whitespace-nowrap`}>Nhóm / Mức độ</th>
+                  <th className={`${hdrBorder} px-2.5 py-1.5 text-left min-w-[200px]`}>Ghi chú lỗi</th>
+                </tr>
+              </thead>
+              <tbody>
+                {detailRows.length === 0 ? (
+                  <tr>
+                    <td colSpan={12} className={`${cellBorder} text-center py-10 text-[#64748b]`}>
+                      Không có dòng nào khớp bộ lọc hiện tại.
+                    </td>
+                  </tr>
+                ) : (
+                  detailRows.map((u, idx) => {
+                    const effectiveState = getUnitEffectiveState(u);
+                    const { codes, isAuto } = getEffectiveCodes(u);
+                    const { groups, severity } = getGroupAndSeverity(codes);
+                    const displaySeverity = u.severity || severity;
+                    const topChunk = u.matched_chunks?.[0];
+                    const simPct =
+                      topChunk?.alignment?.text_similarity !== undefined
+                        ? Math.round(topChunk.alignment.text_similarity)
+                        : Math.round((u.match_score || 0) * 100);
+                    const autoNote =
+                      !u.notes && isAuto && topChunk?.alignment?.risk_flags?.length
+                        ? topChunk.alignment.risk_flags.map((f) => f.label).join('; ')
+                        : '';
+                    const typeLabel =
+                      u.unit_type === 'table' ? 'TABLE' : u.unit_type === 'image' || u.unit_type === 'diagram' ? 'IMAGE' : 'TEXT';
+
+                    return (
+                      <tr
+                        key={u.id}
+                        onClick={() => onSelectUnit(u)}
+                        className="bg-white even:bg-[#f9fafb] hover:bg-[#eff6ff] cursor-pointer align-top group"
+                      >
+                        <td
+                          className={`sticky left-0 z-10 bg-[#f1f5f9] group-hover:bg-[#dbeafe] ${cellBorder} text-center font-mono text-[10.5px] text-[#64748b] py-1.5 select-none`}
+                        >
+                          {idx + 1}
+                        </td>
+                        <td
+                          className={`sticky left-9 z-10 bg-white group-even:bg-[#f9fafb] group-hover:bg-[#eff6ff] ${cellBorder} px-2 py-1.5 font-mono font-semibold text-[#0f172a] whitespace-nowrap`}
+                        >
+                          {u.doc_code}
+                        </td>
+                        <td className={`${cellBorder} px-2 py-1.5 text-right font-mono text-[#64748b] whitespace-nowrap`}>
+                          {u.unit_index}
+                        </td>
+                        <td className={`${cellBorder} px-2 py-1.5 text-center font-mono text-[10px] font-semibold text-[#475569] whitespace-nowrap`}>
+                          {typeLabel}
+                        </td>
+                        <td className={`${cellBorder} px-2 py-1.5 text-center font-mono text-[#475569] whitespace-nowrap`}>
+                          {u.page_num || '—'}
+                        </td>
+                        <td className={`${cellBorder} px-2.5 py-1.5 text-[#0f172a] max-w-[200px]`} title={u.title}>
+                          <div className="line-clamp-2 font-medium text-[11.5px]">{u.title || `Đoạn #${u.unit_index}`}</div>
+                        </td>
+                        <td className={`${cellBorder} px-2.5 py-1.5 text-[#334155] max-w-[280px]`} title={u.source_text}>
+                          <div className="line-clamp-2 text-[11.5px] leading-snug">{u.source_text}</div>
+                        </td>
+                        <td className={`${cellBorder} px-2 py-1.5 font-mono text-[11px] text-[#475569] whitespace-nowrap`}>
+                          {u.matched_chunks && u.matched_chunks.length > 0 ? (
+                            <span>
+                              {u.matched_chunks
+                                .slice(0, 2)
+                                .map((c) => `#${c.chunk_index}`)
+                                .join(', ')}{' '}
+                              <span className="text-[#94a3b8]">({simPct}%)</span>
+                            </span>
+                          ) : (
+                            <span className="text-[#991b1b] font-semibold">Không khớp</span>
+                          )}
+                        </td>
+                        <td
+                          className={`${cellBorder} px-2 py-1.5 text-center font-mono text-[11px] font-bold whitespace-nowrap ${
+                            effectiveState === 'PASS'
+                              ? 'bg-[#dcfce7]/70 text-[#166534]'
+                              : 'bg-[#fee2e2]/75 text-[#991b1b]'
+                          }`}
+                        >
+                          {effectiveState === 'PASS' ? 'ĐẠT' : 'LỖI'}
+                        </td>
+                        <td className={`${cellBorder} px-2 py-1.5 font-mono text-[11px] font-semibold text-[#991b1b] whitespace-nowrap`}>
+                          {codes.length > 0 ? codes.join(', ') : <span className="text-[#cbd5e1] font-normal">—</span>}
+                        </td>
+                        <td className={`${cellBorder} px-2 py-1.5 text-[11px] text-[#475569] whitespace-nowrap`}>
+                          {groups.length > 0 ? (
+                            <span>
+                              {groups[0]}
+                              {displaySeverity ? ` · ${displaySeverity}` : ''}
+                            </span>
+                          ) : (
+                            <span className="text-[#cbd5e1]">—</span>
+                          )}
+                        </td>
+                        <td className={`${cellBorder} px-2.5 py-1.5 text-[11.5px] text-[#334155] max-w-[260px]`}>
+                          {u.notes ? (
+                            <div className="line-clamp-2">{u.notes}</div>
+                          ) : autoNote ? (
+                            <div className="line-clamp-2 italic text-[#94a3b8]">{autoNote}</div>
+                          ) : (
+                            <span className="text-[#cbd5e1]">—</span>
+                          )}
                         </td>
                       </tr>
-                    ) : (
-                      detailRows.map((u) => {
-                        const effectiveState = getUnitEffectiveState(u);
-                        const { codes, isAuto } = getEffectiveCodes(u);
-                        const { groups, severity } = getGroupAndSeverity(codes);
-                        const displaySeverity = u.severity || severity;
-                        const topChunk = u.matched_chunks?.[0];
-                        const simPct =
-                          topChunk?.alignment?.text_similarity !== undefined
-                            ? Math.round(topChunk.alignment.text_similarity)
-                            : Math.round((u.match_score || 0) * 100);
-                        const autoNote =
-                          !u.notes && isAuto && topChunk?.alignment?.risk_flags?.length
-                            ? topChunk.alignment.risk_flags.map((f) => f.label).join('; ')
-                            : '';
-
-                        return (
-                          <tr
-                            key={u.id}
-                            onClick={() => onSelectUnit(u)}
-                            className="hover:bg-[#faf9f6] cursor-pointer transition-colors align-top group"
-                          >
-                            <td className="px-2.5 py-2 font-mono font-semibold text-[#18181b] whitespace-nowrap">
-                              <span className="inline-flex items-center gap-1">
-                                {u.doc_code}
-                                <ExternalLink className="size-3 text-[#a1a1aa] opacity-0 group-hover:opacity-100 transition-opacity" />
-                              </span>
-                            </td>
-                            <td className="px-2 py-2 text-right font-mono text-[#71717a] whitespace-nowrap">
-                              {u.unit_index}
-                            </td>
-                            <td className="px-2.5 py-2 text-[#18181b]">
-                              <div className="font-medium line-clamp-2">{u.title || `Đoạn #${u.unit_index}`}</div>
-                              <span className="inline-block mt-0.5 px-1.5 py-0.2 text-[9.5px] font-mono uppercase rounded bg-[#f4f4f2] text-[#71717a]">
-                                {u.unit_type}
-                              </span>
-                            </td>
-                            <td className="px-2 py-2 text-center font-mono text-[#52525b] whitespace-nowrap">
-                              {u.page_num || '—'}
-                            </td>
-                            <td className="px-2.5 py-2 text-[#3f3f46] max-w-[300px]" title={u.source_text}>
-                              <div className="line-clamp-2 text-[11.5px] leading-relaxed">{u.source_text}</div>
-                            </td>
-                            <td className="px-2.5 py-2 font-mono text-[11px] text-[#52525b] whitespace-nowrap">
-                              {u.matched_chunks && u.matched_chunks.length > 0 ? (
-                                <div className="flex flex-col gap-0.5">
-                                  <span>
-                                    {u.matched_chunks
-                                      .slice(0, 3)
-                                      .map((c) => `#${c.chunk_index}`)
-                                      .join(', ')}
-                                  </span>
-                                  <span className="text-[10px] text-[#a1a1aa]">{simPct}% khớp</span>
-                                </div>
-                              ) : (
-                                <span className="text-[#b91c1c]">Không khớp</span>
-                              )}
-                            </td>
-                            <td className="px-2.5 py-2 text-center whitespace-nowrap">
-                              <div className="inline-flex flex-col items-center gap-0.5">
-                                <span
-                                  className={`px-2 py-0.5 rounded-full text-[10.5px] font-medium ${
-                                    effectiveState === 'PASS'
-                                      ? 'bg-[#f2f7f4] text-[#027a42] border border-[#d6eadf]'
-                                      : 'bg-[#fef2f2] text-[#b91c1c] border border-[#f5d0d3]'
-                                  }`}
-                                >
-                                  {effectiveState === 'PASS' ? 'Đúng' : 'Lỗi'}
-                                </span>
-                                {isAuto && (
-                                  <span className="text-[9px] font-mono text-[#a1a1aa]">auto</span>
-                                )}
-                              </div>
-                            </td>
-                            <td className="px-2.5 py-2 text-[11px] text-[#52525b] whitespace-nowrap">
-                              {groups.length > 0 ? groups.join(', ') : <span className="text-[#d4d4d8]">—</span>}
-                            </td>
-                            <td className="px-2.5 py-2 whitespace-nowrap">
-                              {codes.length > 0 ? (
-                                <div className="flex flex-wrap gap-1">
-                                  {codes.map((code) => {
-                                    const meta = PARSING_CODE_META[code];
-                                    return (
-                                      <span
-                                        key={code}
-                                        title={meta ? `${code}: ${meta.name}` : code}
-                                        className={`px-1.5 py-0.5 rounded font-mono text-[10.5px] font-semibold ${
-                                          isAuto
-                                            ? 'border border-dashed border-[#d97706]/60 bg-[#fffbeb] text-[#b45309]'
-                                            : 'border border-[#f5d0d3] bg-[#fef2f2] text-[#b91c1c]'
-                                        }`}
-                                      >
-                                        {code}
-                                      </span>
-                                    );
-                                  })}
-                                </div>
-                              ) : (
-                                <span className="text-[#d4d4d8]">—</span>
-                              )}
-                            </td>
-                            <td className="px-2.5 py-2 whitespace-nowrap text-[11px]">
-                              {displaySeverity ? (
-                                <span
-                                  className={`px-1.5 py-0.5 rounded font-medium ${
-                                    displaySeverity === 'Nghiêm trọng'
-                                      ? 'bg-[#fef2f2] text-[#b91c1c]'
-                                      : displaySeverity === 'Trung bình'
-                                      ? 'bg-[#fffbeb] text-[#b45309]'
-                                      : 'bg-[#f4f4f2] text-[#52525b]'
-                                  }`}
-                                >
-                                  {displaySeverity}
-                                </span>
-                              ) : (
-                                <span className="text-[#d4d4d8]">—</span>
-                              )}
-                            </td>
-                            <td className="px-2.5 py-2 text-[11px] text-[#52525b] max-w-[240px]">
-                              {u.notes ? (
-                                <div className="line-clamp-2">{u.notes}</div>
-                              ) : autoNote ? (
-                                <div className="line-clamp-2 italic text-[#a1a1aa]">{autoNote}</div>
-                              ) : (
-                                <span className="text-[#d4d4d8]">—</span>
-                              )}
-                            </td>
-                          </tr>
-                        );
-                      })
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
           </div>
         </div>
       )}
+
+      {/* Authentic Excel Bottom Sheet Tabs Bar */}
+      <div className="shrink-0 bg-[#e2e8f0] border-t border-[#cbd5e1] px-2 flex items-end justify-between gap-2 select-none">
+        <div className="flex items-end gap-0.5 pt-1">
+          <button
+            type="button"
+            onClick={() => setSubTab('summary')}
+            className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-[11.5px] border-x border-t transition-colors ${
+              subTab === 'summary'
+                ? 'bg-white text-[#166534] font-semibold border-[#cbd5e1] border-t-2 border-t-[#166534] -mb-px'
+                : 'bg-[#f1f5f9] text-[#475569] border-transparent hover:bg-[#f8fafc] hover:text-[#0f172a]'
+            }`}
+          >
+            <FileSpreadsheet className="size-3.5" />
+            Tong_hop_diem ({overall.docCount})
+          </button>
+          <button
+            type="button"
+            onClick={() => setSubTab('detail')}
+            className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-[11.5px] border-x border-t transition-colors ${
+              subTab === 'detail'
+                ? 'bg-white text-[#166534] font-semibold border-[#cbd5e1] border-t-2 border-t-[#166534] -mb-px'
+                : 'bg-[#f1f5f9] text-[#475569] border-transparent hover:bg-[#f8fafc] hover:text-[#0f172a]'
+            }`}
+          >
+            <Table2 className="size-3.5" />
+            Chi_tiet_tung_doan ({units.length})
+          </button>
+        </div>
+        <div className="pb-1 pr-2 text-[10.5px] font-mono text-[#64748b]">
+          Sheet: {subTab === 'summary' ? `A1:O${docSummaryRows.length + 3}` : `A1:K${detailRows.length + 2}`}
+        </div>
+      </div>
     </div>
   );
 };

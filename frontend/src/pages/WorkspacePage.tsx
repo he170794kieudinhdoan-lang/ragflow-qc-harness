@@ -365,10 +365,17 @@ export const WorkspacePage: React.FC<Props> = ({
   const isLocked = !!busy || polling;
 
   return (
-    <div className="min-h-[calc(100dvh-48px)] bg-[#fefefe]">
-    <div className="max-w-5xl mx-auto px-8 py-7 space-y-5">
+    <div
+      className="min-h-[calc(100dvh-90px)]"
+      style={{
+        backgroundColor: '#f8f7f4',
+        backgroundImage: 'radial-gradient(#e4e2dc 0.8px, transparent 0.8px)',
+        backgroundSize: '18px 18px',
+      }}
+    >
+    <div className="w-full max-w-[1600px] mx-auto px-6 py-5 space-y-5">
       {/* Clean Page Header */}
-      <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-[#ededeb]">
+      <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-[#e4e2dc]">
         <div className="min-w-0">
           <div className="flex items-center gap-2.5">
             <h1 className="text-xl font-semibold text-[#18181b] tracking-tight">Tài liệu & Parse</h1>
@@ -441,15 +448,22 @@ export const WorkspacePage: React.FC<Props> = ({
               Cấu hình Parse
             </button>
           )}
-          <button onClick={openNewRunModal} className="ts-btn-primary text-xs">
+          <button onClick={openNewRunModal} className="ts-btn-secondary text-xs">
             <Plus className="size-3.5" />
             Tạo phiên mới
           </button>
+          {activeRun && (activeRun.chunk_count ?? 0) > 0 && (
+            <button onClick={onNextStep} className="ts-btn-primary text-xs">
+              Sang Bước 2: Chấm đọc file
+              <ArrowRight className="size-3.5" />
+            </button>
+          )}
         </div>
       </div>
 
-      {/* Unified Documents Workbench Card */}
-      <div className="border border-[#e6e4de] rounded-xl overflow-hidden bg-white shadow-xs">
+      {/* 2-Column Full-Width Workspace: Left = Documents Table (8/12), Right = Distribution & Alerts Rail (4/12) */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+      <div className="lg:col-span-8 border border-[#e6e4de] rounded-xl overflow-hidden bg-white shadow-xs">
         {/* Compact KPI Summary Strip */}
         {docs.length > 0 && (
           <div className="grid grid-cols-2 sm:grid-cols-4 border-b border-[#ededeb] divide-y sm:divide-y-0 sm:divide-x divide-[#ededeb] bg-white">
@@ -765,14 +779,174 @@ export const WorkspacePage: React.FC<Props> = ({
         )}
       </div>
 
-      {activeRun && (activeRun.chunk_count ?? 0) > 0 && (
-        <div className="flex justify-end">
-          <button onClick={onNextStep} className="ts-btn-primary text-xs">
-            Sang Bước 2: Chấm đọc file
-            <ArrowRight className="size-3.5" />
-          </button>
-        </div>
-      )}
+      {/* Right Summary Rail: Format Distribution + Parse Warnings + Dataset Snapshot */}
+      <aside className="lg:col-span-4 space-y-4">
+        {/* 1. Format Group Distribution */}
+        {(() => {
+          const totalDocs = Math.max(docs.length, 1);
+          const byFmt = Object.values(
+            docs.reduce<Record<string, { label: string; count: number; chunks: number }>>((acc, d) => {
+              const lbl = d.format_group || 'Khác';
+              if (!acc[lbl]) acc[lbl] = { label: lbl, count: 0, chunks: 0 };
+              acc[lbl].count += 1;
+              const rd = runDocs.find((x) => x.document_id === d.id);
+              acc[lbl].chunks += rd?.chunk_count || 0;
+              return acc;
+            }, {})
+          ).sort((a, b) => b.count - a.count);
+
+          const warnedDocs = docs
+            .map((d) => ({ doc: d, rd: runDocs.find((x) => x.document_id === d.id) }))
+            .filter(({ rd }) => (rd?.anomaly_flags?.length || 0) > 0 || rd?.parse_status === 'FAIL');
+
+          const totalTokens = runDocs.reduce((s, rd) => s + (rd.token_count || 0), 0);
+          const totalChunks = runDocs.reduce((s, rd) => s + (rd.chunk_count || 0), 0);
+
+          return (
+            <>
+              <div className="bg-white border border-[#e6e4de] rounded-xl shadow-xs p-4 space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-[#18181b]">Phân bố theo định dạng</span>
+                  <span className="font-mono text-[11px] text-[#78716c]">{docs.length} tài liệu</span>
+                </div>
+                {byFmt.length === 0 ? (
+                  <div className="text-xs text-[#a1a1aa] py-2">Chưa có tài liệu nào.</div>
+                ) : (() => {
+                  // Monochrome + Emerald Green tonal palette
+                  const palette = ['#027a42', '#03aa5c', '#52a478', '#64748b', '#cbd5e1'];
+                  const r = 42;
+                  const circ = 2 * Math.PI * r;
+                  let accFrac = 0;
+                  const slices = byFmt.map((g, idx) => {
+                    const frac = g.count / totalDocs;
+                    const dash = Math.max(0, frac * circ - (byFmt.length > 1 ? 2.5 : 0));
+                    const offset = -accFrac * circ;
+                    accFrac += frac;
+                    return {
+                      ...g,
+                      pct: Math.round(frac * 100),
+                      color: palette[idx % palette.length],
+                      dash,
+                      offset,
+                    };
+                  });
+                  return (
+                    <div className="flex items-center gap-4 pt-1">
+                      <svg viewBox="0 0 112 112" className="size-[112px] shrink-0 select-none">
+                        <circle cx="56" cy="56" r={r} fill="none" stroke="#f1f5f9" strokeWidth="14" />
+                        <g transform="rotate(-90 56 56)">
+                          {slices.map((s) => (
+                            <circle
+                              key={s.label}
+                              cx="56"
+                              cy="56"
+                              r={r}
+                              fill="none"
+                              stroke={s.color}
+                              strokeWidth="14"
+                              strokeDasharray={`${s.dash.toFixed(2)} ${circ.toFixed(2)}`}
+                              strokeDashoffset={s.offset.toFixed(2)}
+                              className="transition-all duration-500"
+                            >
+                              <title>{`${s.label}: ${s.count} file (${s.pct}%) · ${s.chunks} chunks`}</title>
+                            </circle>
+                          ))}
+                        </g>
+                        <text x="56" y="53" textAnchor="middle" className="fill-[#18181b] text-[16px] font-mono font-bold">
+                          {docs.length}
+                        </text>
+                        <text x="56" y="66" textAnchor="middle" className="fill-[#78716c] text-[9.5px] font-sans">
+                          tài liệu
+                        </text>
+                      </svg>
+                      <div className="flex-1 min-w-0 space-y-2">
+                        {slices.map((s) => (
+                          <div key={s.label} className="flex items-center justify-between gap-2 text-xs">
+                            <div className="flex items-center gap-2 min-w-0">
+                              <span
+                                className="size-2.5 rounded-[2px] shrink-0"
+                                style={{ backgroundColor: s.color }}
+                              />
+                              <span className="text-[#3f3f46] font-medium truncate" title={s.label}>
+                                {s.label}
+                              </span>
+                            </div>
+                            <span className="font-mono text-[11px] text-[#71717a] shrink-0 tabular-nums">
+                              <strong className="text-[#18181b]">{s.pct}%</strong> · {s.count}f
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+
+              <div className="bg-white border border-[#e6e4de] rounded-xl shadow-xs p-4 space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-[#18181b]">Cảnh báo Parse</span>
+                  <span className={`font-mono text-[11px] px-1.5 py-0.5 rounded-full ${warnedDocs.length > 0 ? 'bg-amber-50 text-amber-700 border border-amber-200' : 'bg-[#f2f7f4] text-[#027a42]'}`}>
+                    {warnedDocs.length} file
+                  </span>
+                </div>
+                {warnedDocs.length === 0 ? (
+                  <div className="text-xs text-[#027a42] py-1">Không có cảnh báo bất thường nào.</div>
+                ) : (
+                  <div className="space-y-1.5">
+                    {warnedDocs.map(({ doc, rd }) => (
+                      <div
+                        key={doc.id}
+                        className="px-2.5 py-2 rounded-lg bg-[#fafaf9] border border-[#efede8] space-y-1"
+                      >
+                        <div className="flex items-center justify-between gap-2 text-xs">
+                          <span className="font-mono font-semibold text-[#18181b] shrink-0">{doc.doc_code}</span>
+                          <span className="text-[#52525b] truncate flex-1">{doc.filename}</span>
+                        </div>
+                        <div className="flex flex-wrap gap-1">
+                          {(rd?.anomaly_flags || []).map((flag) => (
+                            <span
+                              key={flag}
+                              className="font-mono text-[10px] px-1.5 py-0.5 bg-amber-50 text-amber-800 border border-amber-200 rounded"
+                            >
+                              {flag}
+                            </span>
+                          ))}
+                          {rd?.parse_status === 'FAIL' && (
+                            <span className="font-mono text-[10px] px-1.5 py-0.5 bg-rose-50 text-rose-700 border border-rose-200 rounded">
+                              PARSE_FAIL
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {activeRun && (
+                <div className="bg-white border border-[#e6e4de] rounded-xl shadow-xs p-4 space-y-2 text-xs">
+                  <div className="text-xs font-semibold text-[#18181b]">Thông số phiên hiện tại</div>
+                  <div className="grid grid-cols-2 gap-2 pt-1 font-mono text-[11px]">
+                    <div className="p-2 rounded-lg bg-[#fafaf9] border border-[#efede8]">
+                      <div className="text-[10px] text-[#78716c] font-sans">Tổng Tokens</div>
+                      <div className="text-sm font-semibold text-[#18181b] mt-0.5">
+                        {totalTokens.toLocaleString()}
+                      </div>
+                    </div>
+                    <div className="p-2 rounded-lg bg-[#fafaf9] border border-[#efede8]">
+                      <div className="text-[10px] text-[#78716c] font-sans">TB Token / Chunk</div>
+                      <div className="text-sm font-semibold text-[#18181b] mt-0.5">
+                        {totalChunks > 0 ? Math.round(totalTokens / totalChunks) : 0}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </>
+          );
+        })()}
+      </aside>
+      </div>
 
       {/* Modal: 2-Step Dataset Picker & RAGFlow Create */}
       {showNewRun && (

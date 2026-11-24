@@ -147,6 +147,7 @@ def init_db():
                 verdict TEXT DEFAULT 'UNRATED', -- PASS | FAIL | PARTIAL | UNRATED
                 error_codes TEXT DEFAULT '[]',  -- P1..P10
                 char_error INTEGER DEFAULT 0,
+                fidelity_error INTEGER DEFAULT 0,
                 severity TEXT DEFAULT '',
                 notes TEXT DEFAULT '',
                 updated_at TEXT NOT NULL
@@ -249,6 +250,13 @@ def init_db():
         if "account_key" not in cols:
             conn.execute("ALTER TABLE runs ADD COLUMN account_key TEXT DEFAULT ''")
 
+        # Ensure parsing_units.judge_source and fidelity_error columns exist
+        pu_cols = {r["name"] for r in conn.execute("PRAGMA table_info(parsing_units)").fetchall()}
+        if "judge_source" not in pu_cols:
+            conn.execute("ALTER TABLE parsing_units ADD COLUMN judge_source TEXT DEFAULT ''")
+        if "fidelity_error" not in pu_cols:
+            conn.execute("ALTER TABLE parsing_units ADD COLUMN fidelity_error INTEGER DEFAULT 0")
+
 
 DEFAULT_SETTINGS: dict[str, str] = {
     # Connection
@@ -257,6 +265,9 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "llm_base_url": "https://api.openai.com/v1",
     "llm_api_key": "",
     "llm_model": "gpt-4o-mini",
+    "vision_base_url": "",
+    "vision_api_key": "",
+    "vision_model": "",
     # Step 1: Workspace / Sync
     "slow_parse_threshold_sec": "180",
     # Step 2: Parsing

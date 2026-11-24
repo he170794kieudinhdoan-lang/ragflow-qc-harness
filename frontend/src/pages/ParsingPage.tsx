@@ -35,6 +35,7 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
   const [errCodes, setErrCodes] = useState<string[]>([]);
   const [autoSuggested, setAutoSuggested] = useState(false);
   const [charErr, setCharErr] = useState(false);
+  const [fidErr, setFidErr] = useState(false);
   const [notes, setNotes] = useState('');
   const [loading, setLoading] = useState(false);
   const [scoring, setScoring] = useState(false);
@@ -46,6 +47,7 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
   const [showErrPopover, setShowErrPopover] = useState(false);
   const [bulkApproving, setBulkApproving] = useState(false);
   const [ocrRunning, setOcrRunning] = useState(false);
+  const [batchOcrRunning, setBatchOcrRunning] = useState(false);
   const [samplePerDoc, setSamplePerDoc] = useState<number>(25);
   const [reExtracting, setReExtracting] = useState(false);
 
@@ -74,6 +76,63 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
       toast.error(e.message);
     } finally {
       setOcrRunning(false);
+    }
+  };
+
+  const pendingOcrCount = units.filter(
+    (u) => u.source_text.startsWith('[Trang ') || u.source_text.startsWith('[Hình ảnh / Sơ đồ')
+  ).length;
+
+  const handleBatchVisionOcr = async () => {
+    if (!activeRun || batchOcrRunning || pendingOcrCount === 0) return;
+    setBatchOcrRunning(true);
+    try {
+      const res = await api.batchVisionOcr(activeRun.id);
+      await load();
+      toast.success(`Vision OCR hoàn tất: ${res.done}/${res.total} trang/ảnh${res.failed ? ` (${res.failed} lỗi)` : ''}.`);
+    } catch (e: any) {
+      toast.error(e.message);
+    } finally {
+      setBatchOcrRunning(false);
+    }
+  };
+
+  const [llmJudging, setLlmJudging] = useState(false);
+  const [docOcrRunningId, setDocOcrRunningId] = useState<number | null>(null);
+
+  const handleDocVisionEnhance = async (documentId: number, docCode: string) => {
+    if (!activeRun || docOcrRunningId !== null) return;
+    setDocOcrRunningId(documentId);
+    try {
+      const res = await api.visionOcrDocument(activeRun.id, documentId);
+      await load();
+      if (res.done > 0) {
+        toast.success(
+          `Vision Enhancement (${res.vision_model}) xong ${docCode}: ${res.done}/${res.total} trang · LLM đã chấm lại ${res.llm_judged} đoạn.`
+        );
+      } else {
+        toast.error(`Vision Enhancement thất bại cho ${docCode}: ${res.last_error || 'Không đọc được ảnh'}`);
+      }
+    } catch (e: any) {
+      toast.error(e.message);
+    } finally {
+      setDocOcrRunningId(null);
+    }
+  };
+
+  const handleLlmJudgeParsing = async (onlyUnrated = true) => {
+    if (!activeRun || llmJudging) return;
+    setLlmJudging(true);
+    try {
+      const res = await api.llmJudgeParsing(activeRun.id, onlyUnrated);
+      await load();
+      toast.success(
+        `LLM (${res.model || 'AI'}) đã chấm ${res.judged} đoạn Parsing: ${res.pass_count} Đạt · ${res.fail_count} Không đạt.`
+      );
+    } catch (e: any) {
+      toast.error(e.message);
+    } finally {
+      setLlmJudging(false);
     }
   };
 
@@ -157,27 +216,45 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
     return getUnitEffectiveState(u) === colorFilter;
   });
 
+  const normalizeParsingCodes = (raw: string[], unitType: string): string[] => {
+    const map: Record<string, string> = {
+      P1: 'TEXT', P4: 'TEXT', P5: 'TEXT', P6: 'TEXT',
+      P2: 'LAYOUT', P7: 'LAYOUT', P8: 'LAYOUT',
+      P3: 'ORDER',
+      P9: 'TABLE', P10: 'TABLE',
+      TEXT: 'TEXT', TABLE: 'TABLE', ORDER: 'ORDER', LAYOUT: 'LAYOUT',
+    };
+    const out = Array.from(new Set(raw.map((c) => map[c]).filter(Boolean)));
+    if (out.length === 0) {
+      return [unitType === 'table' ? 'TABLE' : unitType === 'image' || unitType === 'diagram' ? 'LAYOUT' : 'TEXT'];
+    }
+    return out;
+  };
+
   const selectUnit = (u: ParsingUnit) => {
     setSelectedUnit(u);
     if (u.verdict === 'UNRATED') {
-      const suggested =
+      const rawSuggested =
         u.matched_chunks && u.matched_chunks.length > 0
           ? u.matched_chunks[0]?.alignment?.suggested_error_codes || []
-          : [u.unit_type === 'image' || u.unit_type === 'diagram' ? 'P2' : 'P1'];
+          : [u.unit_type === 'image' || u.unit_type === 'diagram' ? 'LAYOUT' : 'TEXT'];
+      const suggested = rawSuggested.length > 0 ? normalizeParsingCodes(rawSuggested, u.unit_type) : [];
       setErrCodes(suggested);
       setAutoSuggested(suggested.length > 0);
-      setCharErr(suggested.some((c) => c === 'P4' || c === 'P5' || c === 'P6'));
+      setCharErr(rawSuggested.some((c) => c === 'P4' || c === 'P5' || c === 'P6'));
+      setFidErr(rawSuggested.some((c) => c === 'P10' || c === 'FIDELITY'));
     } else {
       setErrCodes(u.error_codes || []);
       setAutoSuggested(false);
       setCharErr(Boolean(u.char_error));
+      setFidErr(Boolean(u.fidelity_error));
     }
     setNotes(u.notes || '');
   };
 
-  const load = async (advanceFromId?: number) => {
+  const load = async (advanceFromId?: number, silent = false) => {
     if (!activeRun) return;
-    setLoading(true);
+    if (!silent) setLoading(true);
     try {
       const [dRes, uRes, mRes] = await Promise.all([
         api.listDocuments(activeRun.id),
@@ -202,8 +279,10 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
       } else {
         setSelectedUnit(null);
       }
+    } catch (e: any) {
+      if (!silent) toast.error(`Không tải được dữ liệu Parsing: ${e?.message || e}`);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
@@ -214,20 +293,42 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
     load();
   }, [activeRun?.id]);
 
+  // Auto-poll every 2.5s while background unit extraction from Step 1 sync is still running
+  const bgSyncing = Boolean(metrics?.unit_sync_status?.running);
+  const bgSyncDone = Number(metrics?.unit_sync_status?.done || 0);
+  const bgSyncTotal = Number(metrics?.unit_sync_status?.total || 0);
+
+  useEffect(() => {
+    if (!activeRun?.id || !bgSyncing) return;
+    const timer = window.setInterval(() => {
+      load(undefined, true);
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [activeRun?.id, bgSyncing]);
+
   const handleScore = async (verdict: 'PASS' | 'PARTIAL' | 'FAIL') => {
     if (!selectedUnit || scoring) return;
     setScoring(true);
     setShowErrPopover(false);
     const savedCodes = verdict === 'PASS' ? [] : errCodes;
     const savedCharErr = verdict === 'PASS' ? false : charErr || savedCodes.some((c) => c === 'P4' || c === 'P5' || c === 'P6');
-    const savedSeverity = verdict === 'FAIL' ? 'High' : verdict === 'PARTIAL' ? 'Medium' : '';
+    const savedFidErr = verdict === 'PASS' ? false : fidErr || savedCodes.some((c) => c === 'FIDELITY' || c === 'P10');
+    const savedSeverity = verdict === 'FAIL' ? 'Nghiêm trọng' : verdict === 'PARTIAL' ? 'Trung bình' : '';
     const scoredId = selectedUnit.id;
     const prevUnits = units;
 
     // 1. Optimistic UI: đổi màu ô ngay lập tức và nhảy tới ô chưa chấm kế tiếp
     const updatedUnits = units.map((u) =>
       u.id === scoredId
-        ? { ...u, verdict, error_codes: savedCodes, char_error: savedCharErr ? 1 : 0, severity: savedSeverity, notes }
+        ? {
+            ...u,
+            verdict,
+            error_codes: savedCodes,
+            char_error: savedCharErr ? 1 : 0,
+            fidelity_error: savedFidErr ? 1 : 0,
+            severity: savedSeverity,
+            notes,
+          }
         : u
     );
     setUnits(updatedUnits);
@@ -259,6 +360,7 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
         verdict,
         error_codes: savedCodes,
         char_error: savedCharErr,
+        fidelity_error: savedFidErr,
         severity: savedSeverity,
         notes,
       });
@@ -287,13 +389,13 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
     setBulkApproving(true);
     const prevUnits = units;
     const payloadItems = unratedRedUnits.map((u) => {
-      const suggested =
+      const rawSuggested =
         u.matched_chunks && u.matched_chunks.length > 0
           ? u.matched_chunks[0]?.alignment?.suggested_error_codes || []
-          : [u.unit_type === 'image' || u.unit_type === 'diagram' ? 'P2' : 'P1'];
-      const codes = suggested.length > 0 ? suggested : ['P1'];
-      const hasChar = codes.some((c) => c === 'P4' || c === 'P5' || c === 'P6');
-      const sev = codes.some((c) => ['P1', 'P2', 'P3', 'P9', 'P10'].includes(c))
+          : [u.unit_type === 'image' || u.unit_type === 'diagram' ? 'LAYOUT' : 'TEXT'];
+      const codes = normalizeParsingCodes(rawSuggested, u.unit_type);
+      const hasChar = rawSuggested.some((c) => c === 'P4' || c === 'P5' || c === 'P6');
+      const sev = codes.some((c) => ['TEXT', 'TABLE', 'LAYOUT'].includes(c))
         ? 'Nghiêm trọng'
         : 'Trung bình';
       return {
@@ -457,10 +559,23 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
   );
 
   const groupedUnits = filteredUnits.reduce<
-    Record<string, { doc_code: string; filename: string; items: ParsingUnit[] }>
+    Record<string, { doc_code: string; document_id: number; filename: string; isOcr: boolean; items: ParsingUnit[] }>
   >((acc, u) => {
     if (!acc[u.doc_code]) {
-      acc[u.doc_code] = { doc_code: u.doc_code, filename: u.filename, items: [] };
+      const docMeta = docs.find((d) => d.id === u.document_id);
+      const isOcr =
+        docMeta?.format_group === 'PDF scan / ảnh' ||
+        (u.filename || '').toLowerCase().includes('scan');
+      acc[u.doc_code] = {
+        doc_code: u.doc_code,
+        document_id: u.document_id,
+        filename: u.filename,
+        isOcr,
+        items: [],
+      };
+    }
+    if (u.source_text.startsWith('[Trang scan') || u.source_text.startsWith('[Hình ảnh')) {
+      acc[u.doc_code].isOcr = true;
     }
     acc[u.doc_code].items.push(u);
     return acc;
@@ -575,7 +690,6 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
   const effectiveMetrics = (() => {
     const textU = units.filter((u) => u.unit_type !== 'table' && u.unit_type !== 'image' && u.unit_type !== 'diagram');
     const tableU = units.filter((u) => u.unit_type === 'table');
-    const layoutU = units.filter((u) => u.unit_type === 'image' || u.unit_type === 'diagram');
     const getCodes = (u: ParsingUnit) =>
       u.verdict !== 'UNRATED'
         ? u.error_codes || []
@@ -584,15 +698,23 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
       u.char_error === 1 || getCodes(u).some((c) => c === 'P4' || c === 'P5' || c === 'P6')
     ).length;
     const orderOkCnt = units.filter((u) => !getCodes(u).some((c) => c === 'P3' || c === 'ORDER')).length;
-    const fidelityOkCnt = units.filter((u) => !getCodes(u).some((c) => c === 'P3' || c === 'P10' || c === 'FIDELITY')).length;
+    const fidelityOkCnt = units.filter((u) => {
+      const codes = getCodes(u);
+      return u.fidelity_error !== 1 && !codes.some((c) => c === 'P10' || c === 'FIDELITY');
+    }).length;
 
     const textCompleteness = textU.length ? (textU.filter((u) => getUnitEffectiveState(u) === 'PASS').length / textU.length) * 100 : null;
     const tableAccuracy = tableU.length ? (tableU.filter((u) => getUnitEffectiveState(u) === 'PASS').length / tableU.length) * 100 : null;
     const charErrorRate = units.length ? (charErrCnt / units.length) * 100 : 0;
-    // Never fake 100% Layout Accuracy when no image/diagram units exist
-    const layoutAccuracy = layoutU.length
-      ? (layoutU.filter((u) => getUnitEffectiveState(u) === 'PASS').length / layoutU.length) * 100
-      : null;
+    // Unified Layout & Structure metric matching backend compute_parsing_metrics:
+    // penalizes LAYOUT / P2 (unread diagram/image) / P7 (heading merged) / P8 (list merged) and any non-PASS image/diagram unit.
+    const layoutOkCnt = units.filter((u) => {
+      const codes = getCodes(u);
+      const hasLayoutErr = codes.some((c) => c === 'LAYOUT' || c === 'P2' || c === 'P7' || c === 'P8');
+      const failedImg = (u.unit_type === 'image' || u.unit_type === 'diagram') && getUnitEffectiveState(u) !== 'PASS';
+      return !hasLayoutErr && !failedImg;
+    }).length;
+    const layoutAccuracy = units.length ? (layoutOkCnt / units.length) * 100 : null;
     const readingOrder = units.length ? (orderOkCnt / units.length) * 100 : null;
     const contentFidelity = units.length ? (fidelityOkCnt / units.length) * 100 : null;
 
@@ -678,24 +800,26 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
           </select>
 
           <div className="inline-flex items-center border border-[#e4e4e2] bg-white rounded-md overflow-hidden">
-            <select
-              className="py-1 px-2 text-xs bg-white text-[#18181b] focus:outline-none"
+            <input
+              type="number"
+              min={1}
+              max={500}
+              className="w-14 py-1 px-2 text-xs font-mono text-right bg-white text-[#18181b] focus:outline-none"
               value={samplePerDoc}
-              onChange={(e) => setSamplePerDoc(Number(e.target.value))}
+              onChange={(e) => {
+                const v = parseInt(e.target.value, 10);
+                setSamplePerDoc(Number.isFinite(v) ? Math.max(1, Math.min(500, v)) : 25);
+              }}
               disabled={loading || reExtracting}
-              title="Số đoạn mẫu trích mỗi tài liệu"
-            >
-              <option value={5}>5 đoạn/file</option>
-              <option value={15}>15 đoạn/file</option>
-              <option value={25}>25 đoạn/file</option>
-              <option value={50}>50 đoạn/file</option>
-            </select>
+              title="Nhập số đoạn mẫu tối đa muốn tách cho mỗi tài liệu (1–500)"
+            />
+            <span className="pr-2 text-[11px] text-[#71717a] select-none">đoạn/file</span>
             <button
               type="button"
               onClick={handleReExtract}
               disabled={loading || reExtracting}
               className="px-2 py-1 text-xs font-medium bg-[#f7f7f6] hover:bg-[#ededeb] text-[#18181b] border-l border-[#e4e4e2] disabled:opacity-45 transition-colors"
-              title="Tách lại toàn bộ đoạn đối chiếu theo số mẫu đã chọn"
+              title="Tách lại toàn bộ đoạn đối chiếu theo số mẫu đã nhập"
             >
               {reExtracting ? 'Đang tách...' : 'Tách lại'}
             </button>
@@ -757,31 +881,22 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
             <Maximize2 className="size-3" />
             Chế độ chấm
           </button>
-          {onNextStep && (() => {
-            const ratedNow = units.filter((u) => u.verdict !== 'UNRATED').length;
-            const isParsingComplete = units.length > 0 && ratedNow >= units.length;
-            return (
-              <button
-                onClick={onNextStep}
-                disabled={!isParsingComplete}
-                title={
-                  isParsingComplete
-                    ? 'Sang Bước 3: Chấm cắt đoạn'
-                    : `Cần chấm xong toàn bộ đoạn Parsing (${ratedNow}/${units.length}) để mở khóa Bước 3`
-                }
-                className="ts-btn-secondary py-1 px-2.5 text-xs rounded-md"
-              >
-                {!isParsingComplete && <Lock className="size-3" />}
-                Bước 3
-                {isParsingComplete && <ArrowRight className="size-3" />}
-              </button>
-            );
-          })()}
+          {onNextStep && (
+            <button
+              onClick={onNextStep}
+              title="Sang Bước 3: Chấm cắt đoạn"
+              className="ts-btn-secondary py-1 px-2.5 text-xs rounded-md"
+            >
+              Bước 3
+              <ArrowRight className="size-3" />
+            </button>
+          )}
         </div>
       </div>
 
       {pageViewMode === 'table' ? (
         <ParsingTableView
+          runId={activeRun?.id}
           units={units}
           docs={docs}
           getUnitEffectiveState={getUnitEffectiveState}
@@ -820,6 +935,20 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
                 <span className="font-mono tabular-nums">{f.label}</span>
               </button>
             ))}
+            <button
+              type="button"
+              onClick={() => handleLlmJudgeParsing(counts.UNRATED > 0)}
+              disabled={llmJudging || units.length === 0}
+              className="ml-1 inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium bg-[#161616] text-white border border-[#161616] hover:bg-[#03aa5c] hover:border-[#03aa5c] transition-colors disabled:opacity-45"
+              title="Dùng LLM-as-a-Judge đối chiếu ngữ nghĩa đoạn gốc với chunk RAGFlow (bỏ qua lỗi giả như thiếu số đề mục)"
+            >
+              {llmJudging ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5" />}
+              {llmJudging
+                ? 'LLM đang đối chiếu...'
+                : counts.UNRATED > 0
+                ? `Chấm LLM (${counts.UNRATED} ô chưa chấm)`
+                : 'Chấm lại bằng LLM'}
+            </button>
             {unratedGreenIds.length > 0 && (
               <button
                 type="button"
@@ -844,10 +973,41 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
                 {bulkApproving ? 'Đang duyệt...' : `Duyệt nhanh ô đỏ (${unratedRedUnits.length})`}
               </button>
             )}
+            {pendingOcrCount > 0 && (
+              <button
+                type="button"
+                onClick={handleBatchVisionOcr}
+                disabled={batchOcrRunning}
+                className="ml-1 inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium bg-[#f2fbf6] text-[#027a42] border border-[#03aa5c]/35 hover:bg-[#03aa5c] hover:text-white transition-colors disabled:opacity-45"
+                title="Dùng Vision LLM đọc toàn bộ trang scan / ảnh chưa có bản chuẩn"
+              >
+                {batchOcrRunning ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5" />}
+                {batchOcrRunning ? 'Đang Vision OCR...' : `Vision OCR ảnh/scan (${pendingOcrCount})`}
+              </button>
+            )}
           </div>
         </div>
 
-        {loading && units.length === 0 ? (
+        {bgSyncing && (
+          <div className="mb-3 flex items-center justify-between gap-3 px-3.5 py-2.5 bg-[#eff6ff] border border-[#bfdbfe] text-[#1d4ed8] text-xs">
+            <div className="flex items-center gap-2 min-w-0">
+              <Loader2 className="size-4 animate-spin shrink-0" />
+              <span className="font-medium truncate">
+                Đang tách đoạn &amp; đối chiếu dữ liệu nền từ RAGFlow ({bgSyncDone}/{bgSyncTotal || '?'} tài liệu)... Trang sẽ tự cập nhật.
+              </span>
+            </div>
+            {bgSyncTotal > 0 && (
+              <div className="w-28 h-1.5 bg-[#dbeafe] overflow-hidden shrink-0">
+                <div
+                  className="h-full bg-[#2563eb] transition-all duration-300"
+                  style={{ width: `${Math.min(100, Math.round((bgSyncDone / bgSyncTotal) * 100))}%` }}
+                />
+              </div>
+            )}
+          </div>
+        )}
+
+        {(loading || bgSyncing || reExtracting) && units.length === 0 ? (
           <div className="space-y-2.5 py-0.5">
             {[25, 25, 25, 25, 25, 25, 3, 25, 10, 13, 1, 9, 25, 25].map((cnt, rowIdx) => (
               <div
@@ -885,10 +1045,20 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
             {Object.values(groupedUnits).map((grp) => (
               <div key={grp.doc_code} className="flex items-start gap-3">
                 <div
-                  className="w-20 shrink-0 font-mono text-[11px] font-medium text-[#52525b] pt-0.5 truncate"
+                  className="w-24 shrink-0 pt-0.5 flex items-center gap-1.5"
                   title={grp.filename}
                 >
-                  {grp.doc_code}
+                  <span className="font-mono text-[11px] font-medium text-[#52525b] shrink-0">
+                    {grp.doc_code}
+                  </span>
+                  {grp.isOcr && (
+                    <span
+                      className="font-mono text-[9px] font-bold px-1 py-0.5 bg-amber-50 text-amber-800 border border-amber-300 leading-none shrink-0"
+                      title="Tài liệu scan / tự động OCR khi chấm"
+                    >
+                      OCR
+                    </span>
+                  )}
                 </div>
                 <div className="flex flex-wrap gap-[3px]">
                   {grp.items.map((u) => {
@@ -1297,7 +1467,7 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
             <div className="p-5 overflow-y-auto space-y-3">
               <div className="flex items-center justify-between gap-2">
                 <div className="ts-eyebrow">ĐOẠN TRÍCH GỐC</div>
-                {selectedUnit.has_local_file && selectedUnit.filename.toLowerCase().endsWith('.pdf') && (
+                {selectedUnit.has_local_file && /\.(pdf|png|jpe?g|webp|bmp)$/i.test(selectedUnit.filename) && (
                   <button
                     type="button"
                     onClick={handleVisionOcr}
@@ -1329,6 +1499,45 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="ts-eyebrow">ĐOẠN SO SÁNH & KẾT QUẢ</span>
               </div>
+
+              {(selectedUnit.verdict !== 'UNRATED' || selectedUnit.notes) && (
+                <div
+                  className={`p-3 border text-xs space-y-1.5 ${
+                    selectedUnit.verdict === 'PASS'
+                      ? 'bg-[#f2fbf6] border-[#03aa5c]/35 text-[#027a42]'
+                      : 'bg-[#fef2f2] border-[#f5d0d3] text-[#991b1b]'
+                  }`}
+                >
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="font-mono text-[10px] font-bold uppercase px-1.5 py-0.5 bg-white border border-current/20">
+                      {selectedUnit.verdict === 'PASS' ? 'ĐẠT' : 'KHÔNG ĐẠT'}
+                    </span>
+                    {(selectedUnit.error_codes || []).map((code) => (
+                      <span
+                        key={code}
+                        className="font-mono text-[10px] font-semibold px-1.5 py-0.5 bg-[#161616] text-white"
+                      >
+                        {code}
+                      </span>
+                    ))}
+                    {selectedUnit.char_error === 1 && (
+                      <span className="font-mono text-[10px] font-semibold px-1.5 py-0.5 bg-amber-100 text-amber-800 border border-amber-300">
+                        LỖI KÝ TỰ
+                      </span>
+                    )}
+                    {selectedUnit.fidelity_error === 1 && (
+                      <span className="font-mono text-[10px] font-semibold px-1.5 py-0.5 bg-rose-100 text-rose-800 border border-rose-300">
+                        SAI NGHĨA / SỐ LIỆU
+                      </span>
+                    )}
+                  </div>
+                  {selectedUnit.notes && (
+                    <div className="text-[13px] leading-relaxed text-[#161616] font-normal">
+                      {selectedUnit.notes}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {selectedUnit.matched_chunks.map((ch) => {
                 const aln = ch.alignment;
@@ -1613,7 +1822,12 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
                     </button>
                   </div>
                   <div className="flex flex-wrap gap-1.5">
-                    {errorCatalog.map((ec) => {
+                    {[
+                      { code: 'TEXT', name: 'Thiếu chữ / sai số liệu / lỗi OCR' },
+                      { code: 'TABLE', name: 'Vỡ bảng / lệch hàng cột' },
+                      { code: 'ORDER', name: 'Sai thứ tự đọc / đảo cột' },
+                      { code: 'LAYOUT', name: 'Mất heading / danh sách / ảnh' },
+                    ].map((ec) => {
                       const active = errCodes.includes(ec.code);
                       return (
                         <button
@@ -1621,8 +1835,8 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
                           type="button"
                           disabled={scoring}
                           onClick={() => toggleCode(ec.code)}
-                          title={`${ec.code} · ${ec.name} (${ec.severity})`}
-                          className={`font-mono text-[11px] px-2 py-1 rounded-md border transition-colors disabled:opacity-45 ${
+                          title={`${ec.code} · ${ec.name}`}
+                          className={`font-mono text-[11px] px-2.5 py-1 rounded-md border transition-colors disabled:opacity-45 ${
                             active
                               ? 'bg-[#18181b] text-white border-[#18181b] font-semibold'
                               : 'bg-white text-[#52525b] border-[#e4e4e2] hover:border-[#18181b]'
@@ -1639,10 +1853,16 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
                     value={notes}
                     onChange={(e) => setNotes(e.target.value)}
                   />
-                  <label className="flex items-center gap-1.5 text-xs text-[#52525b] cursor-pointer select-none">
-                    <input type="checkbox" checked={charErr} onChange={(e) => setCharErr(e.target.checked)} />
-                    Lỗi ký tự
-                  </label>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <label className="flex items-center gap-1.5 text-xs text-[#52525b] cursor-pointer select-none">
+                      <input type="checkbox" checked={charErr} onChange={(e) => setCharErr(e.target.checked)} />
+                      Lỗi ký tự
+                    </label>
+                    <label className="flex items-center gap-1.5 text-xs text-[#52525b] cursor-pointer select-none">
+                      <input type="checkbox" checked={fidErr} onChange={(e) => setFidErr(e.target.checked)} />
+                      Sai nghĩa / số liệu
+                    </label>
+                  </div>
                 </div>
               )}
             </div>

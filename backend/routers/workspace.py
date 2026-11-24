@@ -6,10 +6,10 @@ from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Uploa
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from database import UPLOAD_DIR, get_current_account_key, get_db, get_float_setting, get_setting, repair_chunk_document_links, utc_now
+from database import UPLOAD_DIR, get_bool_setting, get_current_account_key, get_db, get_float_setting, get_setting, repair_chunk_document_links, utc_now
 from ragflow_client import RAGFlowClient, RAGFlowError
 from metrics import detect_chunk_rule_flags
-from unit_sync import ensure_units_for_document_async
+from unit_sync import UNIT_SYNC_STATUS, ensure_units_for_document_async
 
 router = APIRouter(prefix="/api/workspace", tags=["workspace"])
 
@@ -694,6 +694,11 @@ async def _bg_ensure_units(
     import logging
 
     logger = logging.getLogger(__name__)
+    if not docs_for_units:
+        UNIT_SYNC_STATUS[run_id] = {"running": False, "done": 0, "total": 0}
+        return
+
+    UNIT_SYNC_STATUS[run_id] = {"running": True, "done": 0, "total": len(docs_for_units)}
     sem = asyncio.Semaphore(4)
 
     async def _run_one(item: tuple) -> None:
@@ -712,9 +717,24 @@ async def _bg_ensure_units(
                 )
             except Exception as e:
                 logger.warning("_bg_ensure_units failed for %s (%s): %s", doc_code, r_name, e)
+            finally:
+                st = UNIT_SYNC_STATUS.get(run_id)
+                if st:
+                    st["done"] = int(st.get("done", 0)) + 1
 
-    if docs_for_units:
+    try:
         await asyncio.gather(*(_run_one(item) for item in docs_for_units))
+        # Auto OCR any scanned/image units (RapidOCR local + LLM restore or Vision LLM), then judge all with LLM
+        try:
+            from routers.parsing import run_batch_llm_judge_parsing, run_batch_vision_ocr_for_run
+            await run_batch_vision_ocr_for_run(run_id, update_sync_status=False)
+            await run_batch_llm_judge_parsing(run_id, only_unrated=True, update_sync_status=True)
+        except Exception as e:
+            logger.warning("Auto OCR + LLM Parsing judge after sync failed for run %s: %s", run_id, e)
+    finally:
+        st = UNIT_SYNC_STATUS.get(run_id)
+        if st:
+            st["running"] = False
 
 
 @router.post("/runs/{run_id}/sync-from-ragflow")
@@ -759,6 +779,7 @@ async def sync_run_from_ragflow(
 
     min_chars = int(get_setting("min_chunk_chars", "50") or "50")
     max_chars = int(get_setting("max_chunk_chars", "2600") or "2600")
+    exempt_intact_table = get_bool_setting("exempt_intact_table_from_max_chars", True)
 
     # ---- Phase 1: map every remote document to a local document row (no DB writes yet) ----
     by_filename = {d["filename"].lower(): d for d in existing_docs}
@@ -773,7 +794,8 @@ async def sync_run_from_ragflow(
         if not local_doc:
             ext = os.path.splitext(r_name)[1].lower()
             fmt_group = (
-                "PDF văn bản" if ext == ".pdf"
+                "PDF scan / ảnh" if (ext == ".pdf" and "scan" in r_name.lower())
+                else "PDF văn bản" if ext == ".pdf"
                 else "DOCX có bảng" if ext in (".docx", ".doc")
                 else "Trang web (HTML / MD)" if ext in (".html", ".htm", ".md")
                 else "Slide / Excel" if ext in (".pptx", ".ppt", ".xlsx", ".xls", ".csv")
@@ -888,7 +910,9 @@ async def sync_run_from_ragflow(
             for idx_c, ch in enumerate(remote_chunks, start=1):
                 cid = ch.get("id") or ch.get("chunk_id") or f"{r_doc_id}_{idx_c}"
                 content = ch.get("content") or ch.get("content_with_weight") or ""
-                flags = detect_chunk_rule_flags(content, min_chars=min_chars, max_chars=max_chars)
+                flags = detect_chunk_rule_flags(
+                    content, min_chars=min_chars, max_chars=max_chars, exempt_intact_table=exempt_intact_table
+                )
                 positions = ch.get("positions", []) or []
                 page_num = 0
                 if positions and isinstance(positions[0], list) and len(positions[0]) > 0:

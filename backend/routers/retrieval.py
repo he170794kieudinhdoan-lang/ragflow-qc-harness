@@ -1,4 +1,6 @@
+import asyncio
 import json
+import os
 import re
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException
@@ -37,7 +39,7 @@ class RetrievalRunCreate(BaseModel):
     vector_similarity_weight: float = 0.3
     rerank_id: str = ""
     keyword_enabled: bool = True
-    use_llm: bool = False
+    use_llm: bool = True
 
 
 class ResultScoreUpdate(BaseModel):
@@ -93,73 +95,54 @@ def delete_testcase(tc_id: int):
     return {"ok": True}
 
 
+@router.delete("/testcases")
+def clear_all_testcases():
+    with get_db() as conn:
+        cur = conn.execute("DELETE FROM golden_testcases")
+        deleted = cur.rowcount
+    return {"ok": True, "deleted": deleted}
+
+
 class AutoGenRequest(BaseModel):
     run_id: int
-    per_doc: int = 3
-    replace_existing: bool = False
-    use_llm: bool = False
+    total_count: int = 40
+    replace_existing: bool = True
 
 
-def _build_question_from_text(text: str, filename: str) -> tuple:
-    """0-LLM Vietnamese question generator from document headings, tables, numbers, or paragraphs."""
-    clean = nfc(text).strip()
-    lines = [re.sub(r"\s+", " ", ln).strip() for ln in clean.splitlines() if ln.strip()]
-    first = lines[0] if lines else clean[:100]
-    short_doc = re.sub(r"\.(pdf|docx|html|md|pptx)$", "", filename or "", flags=re.IGNORECASE)
-    short_doc = re.sub(r"^DOC\d+_", "", short_doc).replace("_", " ").replace("-", " ")[:48].strip()
-
-    m_tbl = re.search(r"(Bảng\s*\d+[^<\n]{0,80})", clean, flags=re.IGNORECASE)
-    if m_tbl or "<table" in clean.lower():
-        tbl_title = re.sub(r"<[^>]+>", "", m_tbl.group(1)).strip() if m_tbl else first[:80]
-        q = f"Nội dung chi tiết trong {tbl_title} (tài liệu {short_doc}) quy định những gì?"
-        return q, "Local", "Table"
-
-    m_art = re.search(r"(Điều\s+\d+\.?[^\n]{0,90})", clean)
-    if m_art:
-        art = m_art.group(1).strip().rstrip(".:")
-        q = f"Theo tài liệu {short_doc}, {art} quy định những nội dung nào?"
-        return q, "Local", "Keyword"
-
-    m_sec = re.match(r"^(?:\d+(?:\.\d+)*\.?|[IVXLC]+\.)\s+(.{8,95})$", first)
-    if m_sec:
-        topic = m_sec.group(1).strip().rstrip(".:")
-        q = f"{topic} trong {short_doc} được trình bày như thế nào?"
-        return q, "Local", "Factoid"
-
-    m_code = re.search(r"\b(\d+/[A-ZĐ0-9\-]+|\d+[.,]\d+\s*(?:%|mg|ml|người|trường hợp)|CD4\s*[<>≤≥]?\s*\d+)\b", clean)
-    if m_code:
-        kw = m_code.group(1)
-        q = f"Thông tin liên quan đến '{kw}' trong tài liệu {short_doc} là gì?"
-        return q, "Local", "Keyword"
-
-    sent = re.split(r"[.!?]", first)[0].strip()[:95]
-    q = f"Tài liệu {short_doc} nêu những thông tin gì về: \"{sent}\"?"
-    return q, "Global", "Factoid"
+def _clean_chunk_text(raw: str, max_len: int = 1200) -> str:
+    txt = nfc(raw or "").strip()
+    txt = re.sub(r"<[^>]+>", " ", txt)
+    txt = re.sub(r"[ \t]+", " ", txt)
+    return txt.strip()[:max_len]
 
 
 @router.post("/testcases/auto-generate")
 async def auto_generate_golden_testcases(payload: AutoGenRequest):
     """
-    Automatically generates a Golden Dataset from the documents/chunks already synced
-    in `run_id`. Supports both 0-LLM (fast, free regex) and optional LLM mode.
+    Mandatory LLM Golden Dataset generator with exact spec class distribution:
+    Local 50%, Global 35%, Multi-hop 15% (default 40 testcases = 20 / 14 / 6).
     """
     llm_base = get_setting("llm_base_url", "").strip()
     llm_key = get_setting("llm_api_key", "").strip()
     llm_model = get_setting("llm_model", "").strip()
-    if payload.use_llm and (not llm_base or not llm_model or (not llm_key and "localhost" not in llm_base and "127.0.0.1" not in llm_base)):
+    if not llm_base or not llm_model or (not llm_key and "localhost" not in llm_base and "127.0.0.1" not in llm_base):
         raise HTTPException(
             status_code=400,
-            detail="Chưa cấu hình LLM API Key / Model trong Cài đặt API. Hãy nhập key (vd: Gemini Free / OpenAI) hoặc tắt tùy chọn Dùng LLM.",
+            detail="Bắt buộc phải cấu hình LLM (Base URL, Model, API Key) trong Cài đặt trước khi sinh Golden Dataset.",
         )
 
-    per_doc = max(1, min(payload.per_doc, 15))
+    total_count = max(5, min(payload.total_count, 100))
+    n_local = round(total_count * 0.50)
+    n_global = round(total_count * 0.35)
+    n_multihop = max(0, total_count - n_local - n_global)
+
     with get_db() as conn:
         rows = conn.execute(
             """
             SELECT c.document_id, c.chunk_index, c.content, d.doc_code, d.filename
             FROM chunks c
             JOIN documents d ON d.id = c.document_id
-            WHERE c.run_id = ? AND LENGTH(TRIM(c.content)) >= 120
+            WHERE c.run_id = ? AND LENGTH(TRIM(c.content)) >= 140
             ORDER BY d.doc_code, c.chunk_index
             """,
             (payload.run_id,),
@@ -175,79 +158,117 @@ async def auto_generate_golden_testcases(payload: AutoGenRequest):
 
         existing_codes = {r["tc_code"] for r in conn.execute("SELECT tc_code FROM golden_testcases").fetchall()}
 
-    next_idx = 1
     by_doc: dict = {}
     for r in rows:
         by_doc.setdefault(r["document_id"], []).append(dict(r))
+    doc_lists = list(by_doc.values())
+    num_docs = len(doc_lists)
 
-    to_insert = []
-    created = []
-    llm_used_count = 0
-    now = utc_now()
+    jobs = []
 
-    for doc_id, clist in by_doc.items():
-        n = len(clist)
-        if n <= per_doc:
-            chosen = clist
-        elif per_doc == 1:
-            chosen = [clist[0]]
+    # 1. Local (50%): 1 chunk per job, round-robin across documents
+    doc_cursor = {i: 0 for i in range(num_docs)}
+    for k in range(n_local):
+        d_idx = k % num_docs
+        clist = doc_lists[d_idx]
+        pos = (doc_cursor[d_idx] * max(1, len(clist) // 3)) % len(clist)
+        doc_cursor[d_idx] += 1
+        ch = clist[pos]
+        jobs.append((
+            "Local",
+            _clean_chunk_text(ch["content"], 1600),
+            ch["filename"],
+            f"{ch['doc_code']} #{ch['chunk_index']}",
+        ))
+
+    # 2. Global (35%): 2-3 spread-out chunks from same doc (or 2 docs if doc is short)
+    for k in range(n_global):
+        d_idx = k % num_docs
+        clist = doc_lists[d_idx]
+        if len(clist) >= 3:
+            picks = [clist[0], clist[len(clist) // 2], clist[-1]]
+            src_name = clist[0]["filename"]
+            ref_tag = f"{clist[0]['doc_code']} (tổng hợp 3 đoạn)"
+        elif len(clist) == 2:
+            picks = clist
+            src_name = clist[0]["filename"]
+            ref_tag = f"{clist[0]['doc_code']} (tổng hợp 2 đoạn)"
         else:
-            idxs = sorted(set(round(i * (n - 1) / (per_doc - 1)) for i in range(per_doc)))
-            chosen = [clist[i] for i in idxs]
+            other = doc_lists[(d_idx + 1) % num_docs]
+            picks = [clist[0], other[0]]
+            src_name = f"{clist[0]['filename']}; {other[0]['filename']}"
+            ref_tag = f"{clist[0]['doc_code']}+{other[0]['doc_code']}"
+        combined = "\n\n".join(
+            f"[Đoạn {i+1} - {c['filename']} #{c['chunk_index']}]\n{_clean_chunk_text(c['content'], 950)}"
+            for i, c in enumerate(picks)
+        )
+        jobs.append(("Global", combined, src_name, ref_tag))
 
-        for ch in chosen:
+    # 3. Multi-hop (15%): 2 distinct chunks from different sections/docs for A -> B -> C reasoning
+    for k in range(n_multihop):
+        d1 = doc_lists[(k * 2) % num_docs]
+        d2 = doc_lists[(k * 2 + 1) % num_docs] if num_docs > 1 else d1
+        c1 = d1[min(len(d1) - 1, k % len(d1))]
+        c2 = d2[min(len(d2) - 1, (k + len(d2) // 2) % len(d2))]
+        src_name = c1["filename"] if c1["filename"] == c2["filename"] else f"{c1['filename']}; {c2['filename']}"
+        combined = (
+            f"[Đoạn A - {c1['filename']} #{c1['chunk_index']}]\n{_clean_chunk_text(c1['content'], 1300)}\n\n"
+            f"[Đoạn B - {c2['filename']} #{c2['chunk_index']}]\n{_clean_chunk_text(c2['content'], 1300)}"
+        )
+        jobs.append(("Multi-hop", combined, src_name, f"{c1['doc_code']}→{c2['doc_code']}"))
+
+    sem = asyncio.Semaphore(6)
+    results = []
+    errors = []
+
+    async def _run_job(idx_job: int, job: tuple):
+        target_class, ctx_text, src_file, ref_tag = job
+        async with sem:
+            try:
+                q, expected, q_class, intent, ref_ctx = await llm_generate_question(
+                    llm_base, llm_key, llm_model, ctx_text, src_file, target_class=target_class
+                )
+                results.append((idx_job, q, expected, ref_ctx[:600], src_file, q_class, intent, f"LLM ({llm_model}) · {ref_tag}"))
+            except Exception as e:
+                errors.append(str(e)[:180])
+
+    await asyncio.gather(*(_run_job(i, j) for i, j in enumerate(jobs)))
+
+    if not results:
+        raise HTTPException(
+            status_code=502,
+            detail=f"LLM không sinh được câu hỏi nào. Lỗi gần nhất: {errors[0] if errors else 'Không rõ'}",
+        )
+
+    results.sort(key=lambda x: x[0])
+    next_idx = 1
+    now = utc_now()
+    created = []
+    class_counts = {"Local": 0, "Global": 0, "Multi-hop": 0}
+
+    with get_db() as conn:
+        for _, q, expected, ref_ctx, src_file, q_class, intent, note in results:
             while f"TC{next_idx:02d}" in existing_codes:
                 next_idx += 1
             tc_code = f"TC{next_idx:02d}"
             existing_codes.add(tc_code)
             next_idx += 1
-
-            raw_txt = nfc(ch["content"]).strip()
-            clean_ref = re.sub(r"<[^>]+>", " ", raw_txt)
-            clean_ref = re.sub(r"[ \t]+", " ", clean_ref).strip()[:500]
-            note_prefix = "Auto-gen"
-
-            if payload.use_llm:
-                try:
-                    question, q_class, intent, ref_ctx = await llm_generate_question(
-                        llm_base, llm_key, llm_model, clean_ref, ch["filename"]
-                    )
-                    clean_ref = ref_ctx[:500]
-                    note_prefix = f"LLM ({llm_model})"
-                    llm_used_count += 1
-                except Exception:
-                    question, q_class, intent = _build_question_from_text(raw_txt, ch["filename"])
-            else:
-                question, q_class, intent = _build_question_from_text(raw_txt, ch["filename"])
-
-            to_insert.append(
-                (
-                    tc_code,
-                    question,
-                    clean_ref,
-                    ch["filename"],
-                    q_class,
-                    intent,
-                    f"{note_prefix} từ {ch['doc_code']} #{ch['chunk_index']}",
-                    now,
-                )
-            )
-            created.append({"tc_code": tc_code, "input_question": question, "source_file": ch["filename"]})
-
-    with get_db() as conn:
-        for row_vals in to_insert:
             conn.execute(
                 """
                 INSERT INTO golden_testcases (tc_code, input_question, expected_outcome, reference_context, source_file, question_class, intent_type, notes, created_at)
-                VALUES (?, ?, '', ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                row_vals,
+                (tc_code, q, expected, ref_ctx, src_file, q_class, intent, note, now),
             )
+            class_counts[q_class] = class_counts.get(q_class, 0) + 1
+            created.append({"tc_code": tc_code, "input_question": q, "question_class": q_class, "source_file": src_file})
 
     return {
         "ok": True,
         "generated_count": len(created),
-        "llm_used_count": llm_used_count,
+        "llm_used_count": len(created),
+        "class_counts": class_counts,
+        "failed_count": len(errors),
         "testcases": created,
     }
 
@@ -329,73 +350,97 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
 
     cache_hits = 0
     total_retrieved = 0
+    use_full_ac = bool(snap_chunks) and (len(testcases) * len(snap_chunks) <= 40000)
+    sem = asyncio.Semaphore(1)
 
-    for tc in testcases:
-        try:
-            resp = await client.retrieve(
-                question=tc["input_question"],
-                dataset_ids=[dataset_id],
-                top_k=payload.top_k,
-                similarity_threshold=payload.similarity_threshold,
-                vector_similarity_weight=payload.vector_similarity_weight,
-                rerank_id=payload.rerank_id.strip() or None,
-                keyword=payload.keyword_enabled,
-                page=1,
-                page_size=payload.top_k,
-            )
-            chunks = resp.get("chunks", [])[: payload.top_k]
-        except RAGFlowError as e:
-            raise HTTPException(status_code=400, detail=f"Lỗi Retrieval tại {tc['tc_code']}: {e}")
-
-        ac = compute_answer_containment(tc["reference_context"], snap_chunks) if snap_chunks else "UNCHECKED"
-        cov = compute_context_coverage(tc["reference_context"], chunks)
-
-        scored_hits = []
-        for rank, ch in enumerate(chunks, start=1):
-            cid = ch.get("id") or ch.get("chunk_id") or f"unk_{rank}"
-            ch_content = ch.get("content") or ch.get("content_with_weight") or ""
-            ch_doc_name = ch.get("document_keyword") or ch.get("document_name") or ch.get("docnm_kwd", "")
-            cached = cache_map.get((tc["id"], cid))
-            if cached is not None:
-                rel_val, reason = cached
-                src = "CACHED"
-                cache_hits += 1
-            elif payload.use_llm:
+    async def process_one(tc):
+        async with sem:
+            last_err = None
+            chunks = []
+            for attempt in range(6):
                 try:
-                    rel_val, reason = await llm_judge_relevance(
-                        llm_base, llm_key, llm_model, tc["input_question"], tc["reference_context"], ch_content
+                    resp = await client.retrieve(
+                        question=tc["input_question"],
+                        dataset_ids=[dataset_id],
+                        top_k=payload.top_k,
+                        similarity_threshold=payload.similarity_threshold,
+                        vector_similarity_weight=payload.vector_similarity_weight,
+                        rerank_id=payload.rerank_id.strip() or None,
+                        keyword=payload.keyword_enabled,
+                        page=1,
+                        page_size=payload.top_k,
                     )
-                    src = "LLM_DRAFT"
-                except Exception:
+                    chunks = resp.get("chunks", [])[: payload.top_k]
+                    last_err = None
+                    await asyncio.sleep(0.25)
+                    break
+                except RAGFlowError as e:
+                    last_err = e
+                    msg = str(e)
+                    if ("429" in msg or "CONCURRENCY" in msg.upper() or "RATE" in msg.upper()) and attempt < 5:
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                        continue
+                    raise HTTPException(status_code=400, detail=f"Lỗi Retrieval tại {tc['tc_code']}: {e}")
+            if last_err is not None:
+                raise HTTPException(status_code=400, detail=f"Lỗi Retrieval tại {tc['tc_code']}: {last_err}")
+
+            ac_pool = snap_chunks if use_full_ac else chunks
+            ac = compute_answer_containment(tc["reference_context"], ac_pool) if ac_pool else "UNCHECKED"
+            cov = compute_context_coverage(tc["reference_context"], chunks)
+
+            scored_hits = []
+            local_cache_hits = 0
+            for rank, ch in enumerate(chunks, start=1):
+                cid = ch.get("id") or ch.get("chunk_id") or f"unk_{rank}"
+                ch_content = ch.get("content") or ch.get("content_with_weight") or ""
+                ch_doc_name = ch.get("document_keyword") or ch.get("document_name") or ch.get("docnm_kwd", "")
+                cached = cache_map.get((tc["id"], cid))
+                if cached is not None:
+                    rel_val, reason = cached
+                    src = "CACHED"
+                    local_cache_hits += 1
+                elif payload.use_llm:
+                    try:
+                        rel_val, reason = await llm_judge_relevance(
+                            llm_base, llm_key, llm_model, tc["input_question"], tc["reference_context"], ch_content
+                        )
+                        src = "LLM_DRAFT"
+                    except Exception:
+                        rel_val, reason = score_chunk_relevance(tc["reference_context"], ch_content)
+                        src = "RULE"
+                else:
                     rel_val, reason = score_chunk_relevance(tc["reference_context"], ch_content)
                     src = "RULE"
-            else:
-                rel_val, reason = score_chunk_relevance(tc["reference_context"], ch_content)
-                src = "RULE"
-            scored_hits.append((rank, cid, ch, ch_content, ch_doc_name, rel_val, src, reason))
+                scored_hits.append((rank, cid, ch, ch_content, ch_doc_name, rel_val, src, reason))
 
-        rel_ranks = [h[0] for h in scored_hits if h[5] == 1]
-        src_file = (tc["source_file"] or "").lower()
-        suggested_layer = "NONE"
-        if not rel_ranks:
-            if ac == "FULL":
-                suggested_layer = "THRESHOLD"
-            elif ac == "SPLIT":
-                suggested_layer = "CHUNKING"
-            else:
-                suggested_layer = "KEYWORD" if tc["intent_type"] == "Keyword" else "VECTOR"
-        elif rel_ranks[0] > 1 and src_file:
-            top_wrong_docs = [h[4].lower() for h in scored_hits if h[0] < rel_ranks[0] and h[5] == 0]
-            if any(d and d != src_file for d in top_wrong_docs):
-                suggested_layer = "SIMILAR_DOC"
+            rel_ranks = [h[0] for h in scored_hits if h[5] == 1]
+            src_file = (tc["source_file"] or "").lower()
+            suggested_layer = "NONE"
+            if not rel_ranks:
+                if ac == "FULL":
+                    suggested_layer = "THRESHOLD"
+                elif ac == "SPLIT":
+                    suggested_layer = "CHUNKING"
+                else:
+                    suggested_layer = "KEYWORD" if tc["intent_type"] == "Keyword" else "VECTOR"
+            elif rel_ranks[0] > 1 and src_file:
+                top_wrong_docs = [h[4].lower() for h in scored_hits if h[0] < rel_ranks[0] and h[5] == 0]
+                if any(d and d != src_file for d in top_wrong_docs):
+                    suggested_layer = "SIMILAR_DOC"
 
-        with get_db() as conn:
+            return tc["id"], ac, cov, suggested_layer, scored_hits, local_cache_hits
+
+    results = await asyncio.gather(*(process_one(tc) for tc in testcases))
+
+    with get_db() as conn:
+        for tc_id, ac, cov, suggested_layer, scored_hits, local_cache_hits in results:
+            cache_hits += local_cache_hits
             conn.execute(
                 """
                 INSERT OR REPLACE INTO testcase_eval_meta (retrieval_run_id, testcase_id, answer_containment, context_coverage, root_cause_layer, root_cause_notes)
                 VALUES (?, ?, ?, ?, ?, '')
                 """,
-                (rr_id, tc["id"], ac, cov, suggested_layer),
+                (rr_id, tc_id, ac, cov, suggested_layer),
             )
             for rank, cid, ch, ch_content, ch_doc_name, rel_val, src, reason in scored_hits:
                 conn.execute(
@@ -405,7 +450,7 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        rr_id, tc["id"], rank, cid, ch.get("document_id", "") or ch.get("doc_id", ""),
+                        rr_id, tc_id, rank, cid, ch.get("document_id", "") or ch.get("doc_id", ""),
                         ch_doc_name,
                         ch_content,
                         float(ch.get("similarity", 0) or 0),
@@ -512,3 +557,146 @@ def update_testcase_meta(retrieval_run_id: int, testcase_id: int, payload: Testc
             ),
         )
     return {"ok": True}
+
+
+@router.get("/runs/{retrieval_run_id}/testcases/{testcase_id}/diagnose")
+def diagnose_testcase(retrieval_run_id: int, testcase_id: int):
+    """
+    White-box 1-click Root-Cause Triage for a testcase in a retrieval run:
+    Searches all chunks in the run to determine whether the failure is in
+    PARSING (missing/corrupt text), CHUNKING (fragmented/flagged), or RETRIEVAL (exists cleanly but missed Top-K).
+    """
+    from rapidfuzz import fuzz
+
+    with get_db() as conn:
+        rr = conn.execute("SELECT * FROM retrieval_runs WHERE id = ?", (retrieval_run_id,)).fetchone()
+        if not rr:
+            raise HTTPException(status_code=404, detail="Retrieval run không tồn tại")
+        tc = conn.execute("SELECT * FROM golden_testcases WHERE id = ?", (testcase_id,)).fetchone()
+        if not tc:
+            raise HTTPException(status_code=404, detail="Testcase không tồn tại")
+
+        hits = conn.execute(
+            "SELECT ragflow_chunk_id, rank, similarity, relevant FROM retrieval_results WHERE retrieval_run_id = ? AND testcase_id = ? ORDER BY rank",
+            (retrieval_run_id, testcase_id),
+        ).fetchall()
+        hit_map = {h["ragflow_chunk_id"]: dict(h) for h in hits}
+
+        chunk_rows = conn.execute(
+            """
+            SELECT c.id, c.document_id, c.ragflow_chunk_id, c.chunk_index, c.content,
+                   c.char_count, c.token_est, c.page_num, c.rule_flags,
+                   d.doc_code, d.filename, d.format_group, d.file_path
+            FROM chunks c
+            LEFT JOIN documents d ON d.id = c.document_id
+            WHERE c.run_id = ?
+            """,
+            (rr["run_id"],),
+        ).fetchall()
+
+    ref_text = nfc((tc["reference_context"] or "").strip())
+    q_text = nfc((tc["input_question"] or "").strip())
+    target = ref_text if len(ref_text) >= 12 else q_text
+    target_low = target.lower()
+
+    pos_map = {(c["document_id"], c["chunk_index"]): nfc(c["content"] or "") for c in chunk_rows}
+
+    scored = []
+    for c in chunk_rows:
+        txt = pos_map[(c["document_id"], c["chunk_index"])]
+        txt_low = txt.lower()
+        if not target_low or not txt_low:
+            score = 0.0
+        else:
+            p_ratio = fuzz.partial_ratio(target_low[:500], txt_low[:2500])
+            ts_ratio = fuzz.token_set_ratio(target_low[:500], txt_low[:2500])
+            score = round(0.65 * p_ratio + 0.35 * ts_ratio, 1)
+        try:
+            rflags = json.loads(c["rule_flags"] or "[]")
+        except Exception:
+            rflags = []
+        scored.append((score, c, txt, rflags))
+
+    scored.sort(key=lambda x: -x[0])
+    top_matches = scored[:5]
+
+    best_score = top_matches[0][0] if top_matches else 0.0
+    best_flags = top_matches[0][3] if top_matches else []
+    best_hit = hit_map.get(top_matches[0][1]["ragflow_chunk_id"]) if top_matches else None
+    has_relevant_hit = any(h["relevant"] == 1 for h in hits)
+
+    if has_relevant_hit and best_hit and best_hit.get("relevant") == 1:
+        suggested_layer = "OK"
+        summary = f"Chunk chứa đáp án (khớp {best_score}%) đã lọt Top-{best_hit['rank']} và được đánh dấu liên quan."
+        config_hints = []
+    elif best_score < 45.0:
+        suggested_layer = "PARSING"
+        summary = (
+            f"Không tìm thấy đoạn chứa đáp án trong toàn bộ {len(chunk_rows)} chunks (độ khớp cao nhất chỉ {best_score}%). "
+            "Khả năng cao RAGFlow bị mất nội dung khi đọc file (PDF scan, bảng biểu phức tạp hoặc OCR lỗi)."
+        )
+        config_hints = [
+            "Đổi Layout Recognize sang DeepDOC / MinerU hoặc bật VLM (Vision) cho tài liệu scan/bảng.",
+            "Kiểm tra trang PDF gốc xem đoạn này có nằm trong ảnh hoặc bảng không.",
+        ]
+    elif best_score < 72.0 or len(best_flags) > 0:
+        suggested_layer = "CHUNKING"
+        flag_str = f" (cờ: {', '.join(best_flags)})" if best_flags else ""
+        summary = (
+            f"Nội dung có xuất hiện trong kho chunk (khớp {best_score}%){flag_str}, "
+            "nhưng bị cắt vỡ, thiếu ngữ cảnh hoặc dính nhiễu nên khó khớp truy vấn."
+        )
+        config_hints = [
+            "Tăng chunk_token_num hoặc chỉnh delimiter để tránh cắt ngang đoạn/bảng.",
+            "Thử bật Parent-Child Chunking hoặc Auto-Keywords / Auto-Questions trên RAGFlow.",
+        ]
+    else:
+        suggested_layer = "RETRIEVAL"
+        rank_note = (
+            f"Chunk khớp {best_score}% nằm ở hạng #{best_hit['rank']} nhưng chưa được chấm liên quan."
+            if best_hit
+            else f"Chunk chứa đáp án tồn tại rõ ràng trong kho (khớp {best_score}%), nhưng KHÔNG lọt vào Top-K trả về."
+        )
+        summary = rank_note
+        config_hints = [
+            "Tăng Top-K hoặc hạ Similarity Threshold trong cấu hình truy xuất.",
+            "Điều chỉnh Vector Similarity Weight (tăng trọng số từ khóa BM25 cho câu hỏi có mã/thuật ngữ chính xác).",
+            "Bật Reranker hoặc dùng model Embedding tiếng Việt tốt hơn.",
+        ]
+
+    matching_chunks = []
+    for score, c, txt, rflags in top_matches:
+        h = hit_map.get(c["ragflow_chunk_id"])
+        prev_txt = pos_map.get((c["document_id"], (c["chunk_index"] or 0) - 1), "")
+        next_txt = pos_map.get((c["document_id"], (c["chunk_index"] or 0) + 1), "")
+        matching_chunks.append(
+            {
+                "id": c["id"],
+                "document_id": c["document_id"],
+                "doc_code": c["doc_code"] or "",
+                "filename": c["filename"] or "",
+                "format_group": c["format_group"] or "",
+                "has_local_file": bool(c["file_path"] and os.path.exists(c["file_path"])),
+                "ragflow_chunk_id": c["ragflow_chunk_id"] or "",
+                "chunk_index": c["chunk_index"],
+                "page_num": c["page_num"] or 1,
+                "token_est": c["token_est"] or 0,
+                "char_count": c["char_count"] or 0,
+                "content": txt,
+                "rule_flags": rflags,
+                "match_score": score,
+                "in_retrieved_rank": h["rank"] if h else None,
+                "in_retrieved_similarity": h["similarity"] if h else None,
+                "prev_tail": prev_txt[-200:].strip() if prev_txt else "",
+                "next_head": next_txt[:200].strip() if next_txt else "",
+            }
+        )
+
+    return {
+        "suggested_layer": suggested_layer,
+        "diagnosis_summary": summary,
+        "config_hints": config_hints,
+        "best_match_score": best_score,
+        "total_chunks_searched": len(chunk_rows),
+        "matching_chunks": matching_chunks,
+    }

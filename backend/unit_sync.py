@@ -17,10 +17,21 @@ from metrics import align_unit_to_chunks
 
 logger = logging.getLogger(__name__)
 
+# In-memory tracker for background unit extraction per run_id so Step 2 can display
+# live loading/progress animations and auto-poll until extraction finishes.
+UNIT_SYNC_STATUS: Dict[int, Dict[str, Any]] = {}
+
+
+def get_unit_sync_status(run_id: int) -> Dict[str, Any]:
+    st = UNIT_SYNC_STATUS.get(run_id)
+    if not st:
+        return {"running": False, "done": 0, "total": 0}
+    return dict(st)
+
 
 def _load_chunks(conn, run_id: int, document_id: int) -> list:
     rows = conn.execute(
-        "SELECT ragflow_chunk_id, content FROM chunks WHERE run_id = ? AND document_id = ?",
+        "SELECT ragflow_chunk_id, content, page_num FROM chunks WHERE run_id = ? AND document_id = ? ORDER BY chunk_index",
         (run_id, document_id),
     ).fetchall()
     return [dict(r) for r in rows]
@@ -31,7 +42,7 @@ def realign_units(conn, run_id: int, document_id: Optional[int] = None) -> int:
     where = "run_id = ?" + (" AND document_id = ?" if document_id else "")
     params = (run_id, document_id) if document_id else (run_id,)
     units = conn.execute(
-        f"SELECT id, document_id, source_text, matched_chunk_ids, match_score FROM parsing_units WHERE {where}",
+        f"SELECT id, document_id, page_num, source_text, matched_chunk_ids, match_score FROM parsing_units WHERE {where}",
         params,
     ).fetchall()
     if not units:
@@ -47,7 +58,7 @@ def realign_units(conn, run_id: int, document_id: Optional[int] = None) -> int:
         chunks = chunk_cache[doc_id]
         if not chunks:
             continue
-        ids, score = align_unit_to_chunks(u["source_text"], chunks)
+        ids, score = align_unit_to_chunks(u["source_text"], chunks, page_num=u["page_num"])
         current = json.loads(u["matched_chunk_ids"] or "[]")
         if ids == current and abs(float(u["match_score"] or 0) - score) < 0.001:
             continue
@@ -160,7 +171,7 @@ async def ensure_units_for_document_async(
         now = utc_now()
         rows: List[Tuple[Any, ...]] = []
         for idx, (utype, pnum, title, stxt) in enumerate(extracted, start=1):
-            matched_ids, score = align_unit_to_chunks(stxt, chunks_list)
+            matched_ids, score = align_unit_to_chunks(stxt, chunks_list, page_num=pnum)
             rows.append(
                 (
                     run_id,

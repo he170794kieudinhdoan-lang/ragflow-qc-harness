@@ -90,6 +90,7 @@ export interface ParsingUnit {
   verdict: 'PASS' | 'FAIL' | 'PARTIAL' | 'UNRATED';
   error_codes: string[];
   char_error: number;
+  fidelity_error?: number;
   severity: string;
   notes: string;
   has_local_file: boolean;

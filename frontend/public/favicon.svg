@@ -1,22 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
-  <!-- Dark base badge -->
-  <rect width="32" height="32" rx="7" fill="#161616"/>
-  <!-- Hexagon frame from current QC logo -->
-  <polygon
-    points="16 4.5 26 10.25 26 21.75 16 27.5 6 21.75 6 10.25 16 4.5"
-    stroke="#fefefe"
-    stroke-width="1.6"
-    stroke-linejoin="round"
-    fill="none"
-    opacity="0.92"
-  />
-  <!-- RAGFlow signature diagonal flow bars (#1570EF, #53B1FD, #B2DDFF) -->
-  <g stroke-linecap="round">
-    <line x1="10.2" y1="15.2" x2="15.2" y2="10.2" stroke="#B2DDFF" stroke-width="2.5"/>
-    <line x1="10.8" y1="20.4" x2="20.4" y2="10.8" stroke="#1570EF" stroke-width="2.7"/>
-    <line x1="16.2" y1="21.0" x2="21.5" y2="15.7" stroke="#53B1FD" stroke-width="2.5"/>
-  </g>
-  <!-- QC Pass green badge -->
-  <circle cx="24.5" cy="23.5" r="4.2" fill="#03aa5c" stroke="#161616" stroke-width="1.5"/>
-  <path d="M22.7 23.5l1.2 1.2 2.4-2.4" stroke="#fefefe" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect width="32" height="32" rx="6" fill="#141414"/>
+  <!-- Precision QC viewfinder brackets -->
+  <path d="M5.5 11.5V6.5C5.5 5.95 5.95 5.5 6.5 5.5H11.5" stroke="#FAFAFA" stroke-width="2" stroke-linecap="square"/>
+  <path d="M26.5 20.5V25.5C26.5 26.05 26.05 26.5 25.5 26.5H20.5" stroke="#FAFAFA" stroke-width="2" stroke-linecap="square"/>
+  <!-- 3-Layer RAG pipeline bars: monochrome white + single Emerald Green (#03aa5c) accent -->
+  <rect x="8.5" y="9.5" width="11" height="2.4" rx="0.5" fill="#FAFAFA"/>
+  <rect x="21" y="9.5" width="2.5" height="2.4" rx="0.5" fill="#FAFAFA" opacity="0.35"/>
+  <rect x="8.5" y="14.8" width="15" height="2.6" rx="0.5" fill="#03aa5c"/>
+  <rect x="12.5" y="20.1" width="11" height="2.4" rx="0.5" fill="#FAFAFA"/>
+  <circle cx="9.8" cy="21.3" r="1.35" fill="#03aa5c"/>
 </svg>

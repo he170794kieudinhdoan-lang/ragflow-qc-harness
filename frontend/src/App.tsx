@@ -1,12 +1,18 @@
 import React, { useEffect, useRef, useState } from 'react';
+import gsap from 'gsap';
 import { Toaster, toast } from 'sonner';
 import {
   ArrowLeft,
   Check,
   CheckCircle2,
   ChevronDown,
+  Database,
+  FileSearch,
   FlaskConical,
+  GitCompare,
+  Layers,
   Lock,
+  Search,
   Settings,
   X,
 } from 'lucide-react';
@@ -19,6 +25,7 @@ import { ChunkingPage } from './pages/ChunkingPage';
 import { RetrievalPage } from './pages/RetrievalPage';
 import { CompareLabPage } from './pages/CompareLabPage';
 import SettingsModal from './components/SettingsModal';
+import { PageLoader } from './components/PageLoader';
 
 type StepId = 'workspace' | 'parsing' | 'chunking' | 'retrieval' | 'compare';
 
@@ -31,20 +38,23 @@ interface WorkflowStepDef {
 const WORKFLOW_STEPS: Record<WorkflowModeId, WorkflowStepDef[]> = {
   full_pipeline: [
     { id: 'workspace', num: '01', label: 'Dataset & Đồng bộ' },
-    { id: 'parsing', num: '02', label: 'Chấm Parsing' },
-    { id: 'chunking', num: '03', label: 'Chấm Chunking' },
+    { id: 'parsing', num: '02', label: 'Parsing' },
+    { id: 'chunking', num: '03', label: 'Chunking' },
     { id: 'retrieval', num: '04', label: 'Golden & Retrieval' },
-    { id: 'compare', num: '05', label: 'Tinh chỉnh & A/B' },
+    { id: 'compare', num: '05', label: 'So sánh A/B' },
   ],
   retrieval_only: [
     { id: 'retrieval', num: '01', label: 'Golden & Retrieval' },
-    { id: 'compare', num: '02', label: 'Tinh chỉnh & A/B' },
+    { id: 'compare', num: '02', label: 'So sánh A/B' },
   ],
-  parsing_only: [
-    { id: 'workspace', num: '01', label: 'Dataset & Đồng bộ' },
-    { id: 'parsing', num: '02', label: 'Chấm Parsing' },
-  ],
-  compare_only: [{ id: 'compare', num: '01', label: 'So sánh A/B Lab' }],
+};
+
+const MODULE_ICONS: Record<StepId, React.FC<{ className?: string }>> = {
+  workspace: Database,
+  parsing: FileSearch,
+  chunking: Layers,
+  retrieval: Search,
+  compare: GitCompare,
 };
 
 export default function App() {
@@ -63,15 +73,32 @@ export default function App() {
       return 'overview';
     }
   });
-  const [visitedTabs, setVisitedTabs] = useState<Record<string, boolean>>(() => {
-    try {
-      const saved = localStorage.getItem('ragflow_qc_active_tab') || 'overview';
-      return { overview: true, [saved]: true };
-    } catch {
-      return { overview: true };
-    }
-  });
   const [parsingProgress, setParsingProgress] = useState<{ rated: number; total: number }>({ rated: 0, total: 0 });
+  const mainRef = useRef<HTMLElement>(null);
+  const logoBeamRef = useRef<SVGRectElement>(null);
+
+  useEffect(() => {
+    if (!mainRef.current) return;
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    const tween = gsap.fromTo(
+      mainRef.current,
+      { opacity: 0.35, y: 6 },
+      { opacity: 1, y: 0, duration: 0.22, ease: 'power2.out', clearProps: 'transform' }
+    );
+    return () => {
+      tween.kill();
+    };
+  }, [tab]);
+
+  const pulseLogoBeam = () => {
+    if (!logoBeamRef.current) return;
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    gsap.fromTo(
+      logoBeamRef.current,
+      { scaleX: 0.35, transformOrigin: 'left center' },
+      { scaleX: 1, duration: 0.32, ease: 'power3.out' }
+    );
+  };
 
   const setWorkflowMode = (mode: WorkflowModeId | null) => {
     setWorkflowModeState(mode);
@@ -85,7 +112,6 @@ export default function App() {
 
   const setTab = (next: string) => {
     setTabState(next);
-    setVisitedTabs((prev) => (prev[next] ? prev : { ...prev, [next]: true }));
     try {
       localStorage.setItem('ragflow_qc_active_tab', next);
     } catch {
@@ -93,10 +119,16 @@ export default function App() {
     }
   };
 
+  const [transitionKey, setTransitionKey] = useState(0);
+  const pendingNavRef = useRef<(() => void) | null>(null);
+
   const startWorkflow = (mode: WorkflowModeId) => {
-    setWorkflowMode(mode);
     const firstStep = WORKFLOW_STEPS[mode][0].id;
-    setTab(firstStep);
+    pendingNavRef.current = () => {
+      setWorkflowMode(mode);
+      setTab(firstStep);
+    };
+    setTransitionKey((k) => k + 1);
   };
 
   const goHome = () => {
@@ -248,28 +280,11 @@ export default function App() {
   const isParsingComplete = parsingProgress.total > 0 && parsingProgress.rated >= parsingProgress.total;
 
   const isStepLocked = (stepId: StepId): { locked: boolean; reason: string } => {
-    if (workflowMode !== 'full_pipeline') {
-      if (stepId === 'parsing' && !hasSyncedChunks) {
-        return { locked: true, reason: 'Cần đồng bộ chunks từ RAGFlow ở Bước 1 trước' };
-      }
+    if (stepId === 'workspace' || stepId === 'retrieval' || stepId === 'compare') {
       return { locked: false, reason: '' };
     }
-    if (stepId === 'workspace') return { locked: false, reason: '' };
-    if (stepId === 'parsing') {
-      return hasSyncedChunks
-        ? { locked: false, reason: '' }
-        : { locked: true, reason: 'Cần tạo/chọn Dataset và đồng bộ chunks ở Bước 1 trước' };
-    }
-    if (stepId === 'chunking' || stepId === 'retrieval' || stepId === 'compare') {
-      if (!hasSyncedChunks) {
-        return { locked: true, reason: 'Cần hoàn tất Bước 1 (Dataset & Đồng bộ) trước' };
-      }
-      if (!isParsingComplete) {
-        return {
-          locked: true,
-          reason: `Cần chấm xong toàn bộ đoạn Parsing (${parsingProgress.rated}/${parsingProgress.total}) để mở khóa`,
-        };
-      }
+    if ((stepId === 'parsing' || stepId === 'chunking') && !hasSyncedChunks) {
+      return { locked: true, reason: 'Cần tạo/chọn Dataset và đồng bộ chunks ở Bước 1 trước' };
     }
     return { locked: false, reason: '' };
   };
@@ -279,6 +294,13 @@ export default function App() {
 
   return (
     <div className="h-dvh w-screen flex flex-col bg-[#fefefe] text-[#161616] overflow-hidden">
+      <PageLoader
+        transitionKey={transitionKey}
+        onMidpoint={() => {
+          pendingNavRef.current?.();
+          pendingNavRef.current = null;
+        }}
+      />
       <Toaster
         position="bottom-right"
         richColors
@@ -291,27 +313,24 @@ export default function App() {
         <div className="flex items-center gap-3 min-w-0">
           <button
             onClick={goHome}
-            className="flex items-center gap-2 text-[#161616] hover:opacity-75 transition-opacity shrink-0"
+            onMouseEnter={pulseLogoBeam}
+            className="flex items-center gap-2.5 text-[#141414] hover:opacity-85 transition-opacity shrink-0"
             title="Về Trang chủ"
           >
             <svg viewBox="0 0 32 32" className="size-6 shrink-0" fill="none" aria-hidden="true">
-              <rect width="32" height="32" rx="7" fill="#161616" />
-              <polygon
-                points="16 4.5 26 10.25 26 21.75 16 27.5 6 21.75 6 10.25 16 4.5"
-                stroke="#fefefe"
-                strokeWidth="1.6"
-                strokeLinejoin="round"
-                opacity="0.92"
-              />
-              <g strokeLinecap="round">
-                <line x1="10.2" y1="15.2" x2="15.2" y2="10.2" stroke="#B2DDFF" strokeWidth="2.5" />
-                <line x1="10.8" y1="20.4" x2="20.4" y2="10.8" stroke="#1570EF" strokeWidth="2.7" />
-                <line x1="16.2" y1="21.0" x2="21.5" y2="15.7" stroke="#53B1FD" strokeWidth="2.5" />
-              </g>
-              <circle cx="24.5" cy="23.5" r="4.2" fill="#03aa5c" stroke="#161616" strokeWidth="1.5" />
-              <path d="M22.7 23.5l1.2 1.2 2.4-2.4" stroke="#fefefe" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              {/* Precision QC viewfinder brackets (monochrome) */}
+              <path d="M4.5 11V5.5C4.5 4.95 4.95 4.5 5.5 4.5H11" stroke="#141414" strokeWidth="2.2" strokeLinecap="square" />
+              <path d="M27.5 21V26.5C27.5 27.05 27.05 27.5 26.5 27.5H21" stroke="#141414" strokeWidth="2.2" strokeLinecap="square" />
+              {/* 3-Layer RAG pipeline bars: monochrome charcoal + single Emerald Green (#03aa5c) focal slice */}
+              <rect x="8" y="9" width="11.5" height="2.6" rx="0.6" fill="#141414" />
+              <rect x="21.5" y="9" width="2.5" height="2.6" rx="0.6" fill="#141414" opacity="0.35" />
+              <rect ref={logoBeamRef} x="8" y="14.7" width="16" height="2.8" rx="0.6" fill="#03aa5c" />
+              <rect x="12.5" y="20.4" width="11.5" height="2.6" rx="0.6" fill="#141414" />
+              <circle cx="9.3" cy="21.7" r="1.4" fill="#03aa5c" />
             </svg>
-            <span className="font-mono text-[12px] font-semibold tracking-wider whitespace-nowrap">RAGFLOW QC</span>
+            <span className="font-mono text-[12px] font-bold tracking-[0.12em] whitespace-nowrap text-[#141414]">
+              RAGFLOW<span className="text-[#027a42] ml-1 font-semibold">QC</span>
+            </span>
           </button>
 
           {activeWorkflowMeta && (
@@ -425,82 +444,75 @@ export default function App() {
         </div>
       </header>
 
-      {/* Unified Gated Horizontal Workflow Stepper */}
+      {/* Independent Module Navigation Tabs (Monochrome + Sky Blue accent) */}
       {workflowMode && currentSteps.length > 1 && (
-        <nav className="shrink-0 px-5 py-2 border-b border-[#dedede] bg-[#f7f7f6] flex items-center gap-1 overflow-x-auto">
-          {currentSteps.map((step, idx) => {
+        <nav className="shrink-0 px-5 border-b border-[#e4e4e2] bg-[#fafaf9] flex items-center gap-1 overflow-x-auto">
+          {currentSteps.map((step) => {
             const active = tab === step.id;
             const gate = isStepLocked(step.id);
+            const Icon = MODULE_ICONS[step.id];
             const isDone =
               (step.id === 'workspace' && hasSyncedChunks) ||
               (step.id === 'parsing' && isParsingComplete);
             return (
-              <React.Fragment key={step.id}>
-                {idx > 0 && <span className="text-[#d4d4d2] font-mono text-xs px-1">→</span>}
-                <button
-                  type="button"
-                  disabled={gate.locked}
-                  onClick={() => !gate.locked && setTab(step.id)}
-                  title={gate.locked ? gate.reason : step.label}
-                  className={`inline-flex items-center gap-1.5 px-2 py-2 text-xs transition-colors shrink-0 border-b-2 -mb-px ${
-                    active
-                      ? 'text-[#18181b] border-[#18181b] font-semibold'
-                      : gate.locked
-                      ? 'text-[#a1a1aa] border-transparent cursor-not-allowed'
-                      : 'text-[#52525b] border-transparent hover:text-[#18181b] hover:border-[#d4d4d8]'
+              <button
+                key={step.id}
+                type="button"
+                disabled={gate.locked}
+                onClick={() => !gate.locked && setTab(step.id)}
+                title={gate.locked ? gate.reason : step.label}
+                className={`inline-flex items-center gap-1.5 px-3 py-2.5 text-xs transition-colors shrink-0 border-b-2 -mb-px ${
+                  active
+                    ? 'text-[#141414] border-[#027a42] font-semibold bg-white'
+                    : gate.locked
+                    ? 'text-[#a1a1aa] border-transparent cursor-not-allowed'
+                    : 'text-[#52525b] border-transparent hover:text-[#141414] hover:bg-white/60'
+                }`}
+              >
+                <Icon
+                  className={`size-3.5 ${
+                    active ? 'text-[#027a42]' : gate.locked ? 'text-[#d4d4d8]' : 'text-[#71717a]'
                   }`}
-                >
-                  <span
-                    className={`font-mono text-[10px] ${
-                      active ? 'text-[#52a478] font-bold' : gate.locked ? 'text-[#a1a1aa]' : 'text-[#a1a1aa]'
-                    }`}
-                  >
-                    {step.num}
-                  </span>
-                  <span>{step.label}</span>
-                  {gate.locked ? (
-                    <Lock className="size-3 text-[#a1a1aa]" />
-                  ) : isDone ? (
-                    <Check className="size-3 text-[#52a478]" />
-                  ) : null}
-                </button>
-              </React.Fragment>
+                />
+                <span>{step.label}</span>
+                {gate.locked ? (
+                  <Lock className="size-3 text-[#a1a1aa]" />
+                ) : isDone ? (
+                  <Check className="size-3 text-[#03aa5c]" />
+                ) : null}
+              </button>
             );
           })}
         </nav>
       )}
 
-      <main className="flex-1 overflow-y-auto bg-[#fefefe]">
-        {visitedTabs.overview && (
-          <div className={tab === 'overview' ? '' : 'hidden'}>
-            <OverviewPage activeRun={activeRun} onStartWorkflow={startWorkflow} />
-          </div>
+      <main ref={mainRef} className="flex-1 overflow-y-auto bg-[#fefefe]">
+        {tab === 'overview' && (
+          <OverviewPage activeRun={activeRun} onStartWorkflow={startWorkflow} />
         )}
-        {visitedTabs.workspace && (
-          <div className={tab === 'workspace' ? '' : 'hidden'}>
-            <WorkspacePage
-              activeRun={activeRun}
-              runs={runs}
-              refreshKey={refreshKey}
-              onReloadRuns={loadRuns}
-              onSelectRun={persistActiveRun}
-              onOpenSettings={() => setShowSettings(true)}
-              onNextStep={() => setTab('parsing')}
-            />
-          </div>
+        {tab === 'workspace' && (
+          <WorkspacePage
+            activeRun={activeRun}
+            runs={runs}
+            refreshKey={refreshKey}
+            onReloadRuns={loadRuns}
+            onSelectRun={persistActiveRun}
+            onOpenSettings={() => setShowSettings(true)}
+            onNextStep={() => setTab('parsing')}
+          />
         )}
-        {visitedTabs.parsing && (
-          <div className={tab === 'parsing' ? 'h-full' : 'hidden'}>
+        {tab === 'parsing' && (
+          <div className="h-full">
             <ParsingPage
               activeRun={activeRun}
               errorCatalog={catalogs.parsing_errors}
               onProgressChange={(rated, total) => setParsingProgress({ rated, total })}
-              onNextStep={workflowMode === 'parsing_only' ? undefined : () => setTab('chunking')}
+              onNextStep={() => setTab('chunking')}
             />
           </div>
         )}
-        {visitedTabs.chunking && (
-          <div className={tab === 'chunking' ? 'h-full' : 'hidden'}>
+        {tab === 'chunking' && (
+          <div className="h-full">
             <ChunkingPage
               activeRun={activeRun}
               errorCatalog={catalogs.chunking_errors}
@@ -508,15 +520,13 @@ export default function App() {
             />
           </div>
         )}
-        {visitedTabs.retrieval && (
-          <div className={tab === 'retrieval' ? 'h-full' : 'hidden'}>
+        {tab === 'retrieval' && (
+          <div className="h-full">
             <RetrievalPage activeRun={activeRun} />
           </div>
         )}
-        {visitedTabs.compare && (
-          <div className={tab === 'compare' ? '' : 'hidden'}>
-            <CompareLabPage activeRun={activeRun} />
-          </div>
+        {tab === 'compare' && (
+          <CompareLabPage activeRun={activeRun} />
         )}
       </main>
 

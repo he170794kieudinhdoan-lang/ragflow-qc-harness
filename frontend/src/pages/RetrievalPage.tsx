@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { toast } from 'sonner';
-import { Check, Loader2, Play, Plus, Sparkles, Wand2, X } from 'lucide-react';
+import { AlertTriangle, Check, FileImage, Loader2, Play, Plus, Search, Sparkles, Wand2, X } from 'lucide-react';
 import { api } from '../api/client';
 import { RetrievalResultGroup, RetrievalRun, RunItem } from '../types';
 
@@ -24,9 +24,8 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
   const [showRunModal, setShowRunModal] = useState(false);
   const [busy, setBusy] = useState(false);
   const [generating, setGenerating] = useState(false);
-  const [genPerDoc, setGenPerDoc] = useState(3);
-  const [useLlmGen, setUseLlmGen] = useState(false);
-  const [useLlmJudge, setUseLlmJudge] = useState(false);
+  const [genTotalCount, setGenTotalCount] = useState(40);
+  const [useLlmJudge, setUseLlmJudge] = useState(true);
 
   const [tcCode, setTcCode] = useState('TC04');
   const [tcClass, setTcClass] = useState('Local');
@@ -39,6 +38,28 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
   const [threshold, setThreshold] = useState(0.2);
   const [vecWeight, setVecWeight] = useState(0.3);
   const [rerankId, setRerankId] = useState('');
+
+  const [diagnosing, setDiagnosing] = useState(false);
+  const [diagnosis, setDiagnosis] = useState<any>(null);
+  const [openPdfChunkId, setOpenPdfChunkId] = useState<number | null>(null);
+
+  useEffect(() => {
+    setDiagnosis(null);
+    setOpenPdfChunkId(null);
+  }, [selectedGroup?.testcase.id, selectedRrId]);
+
+  const handleDiagnose = async () => {
+    if (!selectedRrId || !selectedGroup || diagnosing) return;
+    setDiagnosing(true);
+    try {
+      const res = await api.diagnoseTestcase(selectedRrId, selectedGroup.testcase.id);
+      setDiagnosis(res);
+    } catch (e: any) {
+      toast.error(e.message || 'Không chạy được chẩn đoán');
+    } finally {
+      setDiagnosing(false);
+    }
+  };
 
   const loadRuns = async () => {
     if (!activeRun) return;
@@ -135,9 +156,11 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
     if (!activeRun || generating) return;
     setGenerating(true);
     try {
-      const res = await api.autoGenerateTestcases(activeRun.id, genPerDoc, false, useLlmGen);
-      const modeNote = res.llm_used_count ? ` (${res.llm_used_count} câu bằng LLM)` : ' (0-LLM)';
-      toast.success(`Đã sinh ${res.generated_count} câu hỏi Golden Dataset${modeNote}.`);
+      const res = await api.autoGenerateTestcases(activeRun.id, genTotalCount, true);
+      const cc = res.class_counts || {};
+      toast.success(
+        `LLM đã sinh ${res.generated_count} câu Golden (Local: ${cc.Local || 0}, Global: ${cc.Global || 0}, Multi-hop: ${cc['Multi-hop'] || 0}).`
+      );
       await loadRuns();
       if (selectedRrId) await loadResults(selectedRrId);
     } catch (err: any) {
@@ -179,25 +202,21 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
           <div className="inline-flex items-center gap-1.5 text-xs text-[#71717a]">
             <input
               type="number"
-              min={1}
-              max={15}
-              className="ts-input py-1.5 w-12 font-mono text-center text-xs rounded-md bg-white"
-              value={genPerDoc}
-              onChange={(e) => setGenPerDoc(Number(e.target.value))}
-              title="Số câu hỏi sinh ra trên mỗi tài liệu"
+              min={5}
+              max={100}
+              className="ts-input py-1.5 w-14 font-mono text-center text-xs rounded-md bg-white"
+              value={genTotalCount}
+              onChange={(e) => setGenTotalCount(Number(e.target.value))}
+              title="Tổng số câu hỏi Golden Dataset (mặc định 40: 50% Local, 35% Global, 15% Multi-hop)"
             />
-            <label className="inline-flex items-center gap-1 text-[11px] text-[#52525b] cursor-pointer select-none" title="Bật để dùng LLM trong Cài đặt API (tắt = 0 LLM miễn phí)">
-              <input type="checkbox" checked={useLlmGen} onChange={(e) => setUseLlmGen(e.target.checked)} />
-              LLM
-            </label>
             <button
               onClick={handleAutoGenerate}
               disabled={generating || busy}
               className="ts-btn-secondary py-1.5 px-2.5 text-xs rounded-md disabled:opacity-45"
-              title="Tự động sinh Golden Dataset từ các tài liệu trong phiên hiện tại"
+              title="Bắt buộc dùng LLM đọc tài liệu và sinh Golden Dataset chuẩn tỷ lệ 50/35/15"
             >
               {generating ? <Loader2 className="size-3.5 animate-spin" /> : <Wand2 className="size-3.5" />}
-              {generating ? 'Đang sinh...' : 'Tự sinh Golden'}
+              {generating ? 'LLM đang sinh...' : 'Sinh Golden (LLM)'}
             </button>
           </div>
 
@@ -225,8 +244,26 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
       <div className="flex-1 grid grid-cols-12 min-h-0">
         {/* Left: Testcases */}
         <div className="col-span-4 border-r border-[#e8e8e6] overflow-y-auto bg-[#fafaf9]">
-          <div className="px-4 py-2.5 border-b border-[#ededeb] ts-eyebrow sticky top-0 bg-[#fafaf9] z-10">
-            BỘ CÂU HỎI GOLDEN ({groups.length})
+          <div className="px-4 py-2.5 border-b border-[#ededeb] flex items-center justify-between gap-2 sticky top-0 bg-[#fafaf9] z-10">
+            <span className="ts-eyebrow">BỘ CÂU HỎI GOLDEN ({groups.length})</span>
+            <button
+              type="button"
+              onClick={async () => {
+                if (!window.confirm('Xóa toàn bộ câu hỏi Golden Dataset hiện tại?')) return;
+                try {
+                  const res = await api.clearTestcases();
+                  toast.success(`Đã xóa ${res.deleted} câu hỏi Golden.`);
+                  setGroups([]);
+                  setSelectedGroup(null);
+                  await loadRuns();
+                } catch (e: any) {
+                  toast.error(e.message || 'Không xóa được Golden Dataset');
+                }
+              }}
+              className="text-[11px] text-[#b91c1c] hover:underline font-medium"
+            >
+              Xóa hết
+            </button>
           </div>
           {groups.map((g) => (
             <button
@@ -328,8 +365,145 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
                       <option value="CHUNKING">Tầng 2 · Lỗi cắt đoạn (Chunking)</option>
                     </select>
                   </label>
+
+                  <button
+                    type="button"
+                    onClick={handleDiagnose}
+                    disabled={diagnosing}
+                    className="ml-auto inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-[4px] bg-[#18181b] text-white hover:bg-[#27272a] disabled:opacity-50 transition-colors"
+                  >
+                    {diagnosing ? <Loader2 className="size-3.5 animate-spin" /> : <Search className="size-3.5" />}
+                    {diagnosing ? 'Đang soi kho chunk...' : 'Soi nguyên nhân gốc'}
+                  </button>
                 </div>
               </div>
+
+              {diagnosis && (
+                <div className="border border-[#d4d4d8] bg-[#fafaf9] rounded-[4px] p-4 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <span className="ts-eyebrow">CHẨN ĐOÁN NGUYÊN NHÂN GỐC (WHITE-BOX)</span>
+                      <span
+                        className={`text-[11px] font-mono font-semibold px-2 py-0.5 rounded border ${
+                          diagnosis.suggested_layer === 'PARSING'
+                            ? 'bg-[#fef2f2] text-[#b91c1c] border-[#fecaca]'
+                            : diagnosis.suggested_layer === 'CHUNKING'
+                            ? 'bg-[#fffbeb] text-[#b45309] border-[#fde68a]'
+                            : diagnosis.suggested_layer === 'RETRIEVAL'
+                            ? 'bg-[#eff6ff] text-[#1d4ed8] border-[#bfdbfe]'
+                            : 'bg-[#f0fdf4] text-[#15803d] border-[#bbf7d0]'
+                        }`}
+                      >
+                        {diagnosis.suggested_layer}
+                      </span>
+                      <span className="text-[11px] text-[#71717a] font-mono">
+                        Khớp cao nhất: {diagnosis.best_match_score}% / {diagnosis.total_chunks_searched} chunks
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {diagnosis.suggested_layer !== 'OK' && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const mapped =
+                              diagnosis.suggested_layer === 'RETRIEVAL' ? 'VECTOR' : diagnosis.suggested_layer;
+                            handleMetaUpdate({ root_cause_layer: mapped });
+                            toast.success(`Đã gắn nhãn nguyên nhân gốc: ${mapped}`);
+                          }}
+                          className="text-xs px-2.5 py-1 rounded bg-white border border-[#d4d4d8] hover:bg-[#f4f4f2] text-[#18181b] font-medium"
+                        >
+                          Áp dụng nhãn {diagnosis.suggested_layer}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => setDiagnosis(null)}
+                        className="text-[#71717a] hover:text-[#18181b] p-1"
+                        title="Đóng chẩn đoán"
+                      >
+                        <X className="size-3.5" />
+                      </button>
+                    </div>
+                  </div>
+
+                  <p className="text-xs text-[#27272a] leading-relaxed">{diagnosis.diagnosis_summary}</p>
+
+                  {diagnosis.config_hints?.length > 0 && (
+                    <div className="bg-white border border-[#e6e6e3] rounded-[4px] p-3 space-y-1">
+                      <div className="text-[11px] font-semibold text-[#52525b]">Gợi ý chỉnh cấu hình RAGFlow:</div>
+                      <ul className="list-disc pl-4 space-y-0.5 text-xs text-[#3f3f46]">
+                        {diagnosis.config_hints.map((h: string, i: number) => (
+                          <li key={i}>{h}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {diagnosis.matching_chunks?.length > 0 && (
+                    <div className="space-y-2">
+                      <div className="text-[11px] font-semibold text-[#52525b]">
+                        Top {diagnosis.matching_chunks.length} chunk gần đáp án nhất trong toàn bộ kho:
+                      </div>
+                      {diagnosis.matching_chunks.map((mc: any) => (
+                        <div key={mc.id} className="bg-white border border-[#e6e6e3] rounded-[4px] p-3 space-y-2">
+                          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="font-mono font-semibold text-[#18181b]">
+                                {mc.doc_code} #{mc.chunk_index}
+                              </span>
+                              <span className="text-[#71717a]">p.{mc.page_num}</span>
+                              <span className="font-mono text-[11px] text-[#52525b]">{mc.token_est} tok</span>
+                              {mc.in_retrieved_rank ? (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-[#f0fdf4] text-[#15803d] border border-[#bbf7d0] font-mono">
+                                  Lọt Top #{mc.in_retrieved_rank}
+                                </span>
+                              ) : (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-[#fef2f2] text-[#b91c1c] border border-[#fecaca]">
+                                  Không lọt Top-K
+                                </span>
+                              )}
+                              {mc.rule_flags?.map((f: string) => (
+                                <span
+                                  key={f}
+                                  className="inline-flex items-center gap-0.5 text-[10px] font-mono px-1.5 py-0.5 rounded bg-[#fef3c7] text-[#92400e] border border-[#fde68a]"
+                                >
+                                  <AlertTriangle className="size-2.5" />
+                                  {f}
+                                </span>
+                              ))}
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <span className="font-mono text-[11px] font-semibold text-[#18181b]">
+                                Khớp {mc.match_score}%
+                              </span>
+                              {mc.has_local_file && mc.filename.toLowerCase().endsWith('.pdf') && (
+                                <button
+                                  type="button"
+                                  onClick={() => setOpenPdfChunkId(openPdfChunkId === mc.id ? null : mc.id)}
+                                  className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded border border-[#e4e4e2] bg-[#fafaf9] hover:bg-[#f4f4f2] text-[#3f3f46]"
+                                >
+                                  <FileImage className="size-3" />
+                                  {openPdfChunkId === mc.id ? 'Ẩn PDF' : 'Xem trang PDF'}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                          <div className="text-xs text-[#27272a] whitespace-pre-wrap leading-relaxed bg-[#fafaf9] p-2.5 rounded border border-[#ededeb] max-h-40 overflow-y-auto">
+                            {mc.content}
+                          </div>
+                          {openPdfChunkId === mc.id && (
+                            <img
+                              src={`/api/parsing/documents/${mc.document_id}/page/${mc.page_num}`}
+                              alt={`Trang ${mc.page_num}`}
+                              className="w-full border border-[#e4e4e2] rounded"
+                            />
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
 
               <div className="space-y-3">
                 <div className="ts-eyebrow">TOP {selectedGroup.hits.length} ĐOẠN RAGFLOW TÌM ĐƯỢC</div>
@@ -430,10 +604,9 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
                 <label className="block text-xs text-[#52525b] mb-1">Model Rerank (để trống nếu tắt)</label>
                 <input className="ts-input w-full font-mono text-xs" placeholder="BAAI/bge-reranker-v2-m3" value={rerankId} onChange={(e) => setRerankId(e.target.value)} />
               </div>
-              <label className="flex items-center gap-2 text-xs text-[#3f3f46] cursor-pointer pt-1">
-                <input type="checkbox" checked={useLlmJudge} onChange={(e) => setUseLlmJudge(e.target.checked)} />
-                <span>Chấm nháp độ liên quan bằng LLM-as-a-Judge (tắt = RapidFuzz 0 đồng)</span>
-              </label>
+              <div className="text-[11px] text-[#027a42] bg-[#f2fbf6] border border-[#03aa5c]/30 px-2.5 py-1.5 rounded">
+                Mặc định dùng <strong>LLM-as-a-Judge</strong> chấm độ liên quan Top-10 chunk.
+              </div>
             </div>
             <div className="flex justify-end gap-2 pt-2 border-t border-[#ededeb]">
               <button type="button" onClick={() => setShowRunModal(false)} className="ts-btn-secondary">Hủy</button>
