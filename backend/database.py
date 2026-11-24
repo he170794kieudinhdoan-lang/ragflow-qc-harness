@@ -234,17 +234,8 @@ def init_db():
         )
 
         # Default settings if empty
-        defaults = {
-            "ragflow_base_url": "http://13.236.9.207",
-            "ragflow_api_key": "",
-            "llm_base_url": "https://api.openai.com/v1",
-            "llm_api_key": "",
-            "llm_model": "gpt-4o-mini",
-            "min_chunk_chars": "50",
-            "max_chunk_chars": "2600",
-        }
         now = utc_now()
-        for k, v in defaults.items():
+        for k, v in DEFAULT_SETTINGS.items():
             conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
                 (k, v, now),
@@ -259,6 +250,43 @@ def init_db():
             conn.execute("ALTER TABLE runs ADD COLUMN account_key TEXT DEFAULT ''")
 
 
+DEFAULT_SETTINGS: dict[str, str] = {
+    # Connection
+    "ragflow_base_url": "http://13.236.9.207",
+    "ragflow_api_key": "",
+    "llm_base_url": "https://api.openai.com/v1",
+    "llm_api_key": "",
+    "llm_model": "gpt-4o-mini",
+    # Step 1: Workspace / Sync
+    "slow_parse_threshold_sec": "180",
+    # Step 2: Parsing
+    "parsing_table_cell_match_threshold": "88",
+    "target_text_completeness": "0.80",
+    "target_table_accuracy": "0.75",
+    "target_reading_order": "0.80",
+    # Step 3: Chunking
+    "chunk_sample_per_doc": "5",
+    "min_chunk_chars": "50",
+    "max_chunk_chars": "2600",
+    "exempt_intact_table_from_max_chars": "true",
+    "chunk_dup_threshold": "0.85",
+    "chunk_adj_overlap_threshold": "88",
+    "chunk_repeated_line_min": "3",
+    "target_chunk_integrity": "0.80",
+    "max_chunk_noise_rate": "0.15",
+    "target_valid_size_rate": "0.85",
+    # Step 4: Retrieval
+    "default_top_k": "10",
+    "default_similarity_threshold": "0.2",
+    "default_vector_similarity_weight": "0.3",
+    "default_rerank_id": "",
+    "default_keyword_enabled": "true",
+    "golden_gen_per_doc": "3",
+    "target_contextual_precision": "0.65",
+    "target_context_coverage": "0.70",
+}
+
+
 def get_current_account_key() -> str:
     base_url = get_setting("ragflow_base_url", "").strip().rstrip("/").lower()
     api_key = get_setting("ragflow_api_key", "").strip()
@@ -267,16 +295,47 @@ def get_current_account_key() -> str:
     return hashlib.sha256(f"{base_url}|{api_key}".encode("utf-8")).hexdigest()[:16]
 
 
-def get_setting(key: str, default: str = "") -> str:
+def get_setting(key: str, default: str | None = None) -> str:
+    fallback = DEFAULT_SETTINGS.get(key, "") if default is None else default
     with get_db() as conn:
         row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-        return row["value"] if row else default
+        return row["value"] if row else fallback
+
+
+def get_int_setting(key: str, default: int | None = None) -> int:
+    raw = get_setting(key)
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return default if default is not None else int(float(DEFAULT_SETTINGS.get(key, "0")))
+
+
+def get_float_setting(key: str, default: float | None = None) -> float:
+    raw = get_setting(key)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default if default is not None else float(DEFAULT_SETTINGS.get(key, "0"))
+
+
+def get_bool_setting(key: str, default: bool | None = None) -> bool:
+    raw = get_setting(key).strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if default is not None:
+        return default
+    return DEFAULT_SETTINGS.get(key, "false").lower() == "true"
 
 
 def get_all_settings() -> dict:
+    merged = dict(DEFAULT_SETTINGS)
     with get_db() as conn:
         rows = conn.execute("SELECT key, value FROM settings").fetchall()
-        return {r["key"]: r["value"] for r in rows}
+        for r in rows:
+            merged[r["key"]] = r["value"]
+    return merged
 
 
 def set_setting(key: str, value: str):

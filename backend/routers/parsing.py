@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from database import UPLOAD_DIR, get_db, get_setting, repair_chunk_document_links, utc_now
 from ragflow_client import RAGFlowClient, RAGFlowError
 from llm_client import LLMError, llm_ocr_image
-from metrics import align_unit_to_chunks, extract_best_aligned_span_with_stitching, nfc
+from metrics import align_unit_to_chunks, compute_parsing_metrics, extract_best_aligned_span_with_stitching, nfc
 from extractor import extract_document_units
 from unit_sync import realign_units, units_need_realign
 
@@ -296,6 +296,48 @@ def bulk_approve_pass(run_id: int, payload: BulkApprovePayload):
         return {"ok": True, "updated": cur.rowcount}
 
 
+class BulkFailItem(BaseModel):
+    unit_id: int
+    error_codes: List[str] = []
+    char_error: bool = False
+    severity: str = ""
+    notes: str = ""
+
+
+class BulkFailPayload(BaseModel):
+    items: List[BulkFailItem]
+
+
+@router.post("/runs/{run_id}/bulk-approve-fail")
+def bulk_approve_fail(run_id: int, payload: BulkFailPayload):
+    if not payload.items:
+        return {"ok": True, "updated": 0}
+    now = utc_now()
+    updated = 0
+    with get_db() as conn:
+        for item in payload.items:
+            has_char_code = any(c in ("P4", "P5", "P6") for c in item.error_codes)
+            char_err_flag = 1 if (item.char_error or has_char_code) else 0
+            cur = conn.execute(
+                """
+                UPDATE parsing_units
+                SET verdict = 'FAIL', error_codes = ?, char_error = ?, severity = ?, notes = ?, updated_at = ?
+                WHERE run_id = ? AND id = ?
+                """,
+                (
+                    json.dumps(item.error_codes, ensure_ascii=False),
+                    char_err_flag,
+                    item.severity,
+                    item.notes,
+                    now,
+                    run_id,
+                    item.unit_id,
+                ),
+            )
+            updated += cur.rowcount
+    return {"ok": True, "updated": updated}
+
+
 @router.put("/units/{unit_id}/score")
 def score_parsing_unit(unit_id: int, payload: ParsingScoreUpdate):
     # Sync Character Error automatically if any Phụ lục B char-error code (P4, P5, P6) is tagged
@@ -408,32 +450,7 @@ def get_parsing_metrics(run_id: int):
         ).fetchall()
 
     rated = [r for r in rows if r["verdict"] != "UNRATED"]
-    table_units = [r for r in rated if r["unit_type"] == "table"]
-
-    # 1-to-1 OmniDocBench metrics (backward-compatible with legacy P1..P10 codes)
-    text_ok = 0
-    table_ok = 0
-    order_ok = 0
-    layout_ok = 0
-    char_err = 0
-
-    for r in rated:
-        codes = set(json.loads(r["error_codes"] or "[]"))
-        has_text_err = bool(codes & {"TEXT", "P1", "P4", "P5", "P6", "P7", "P8"}) or r["char_error"] == 1
-        has_table_err = bool(codes & {"TABLE", "P9", "P10"})
-        has_order_err = bool(codes & {"ORDER", "P3"})
-        has_layout_err = bool(codes & {"LAYOUT", "P2"})
-
-        if not has_text_err:
-            text_ok += 1
-        else:
-            char_err += 1
-        if r["unit_type"] == "table" and not has_table_err:
-            table_ok += 1
-        if not has_order_err:
-            order_ok += 1
-        if not has_layout_err:
-            layout_ok += 1
+    summary = compute_parsing_metrics(rows)
 
     by_group = {}
     for r in rated:
@@ -446,17 +463,10 @@ def get_parsing_metrics(run_id: int):
             b["table_total"] += 1
             if r["verdict"] == "PASS":
                 b["table_pass"] += 1
-        if r["char_error"] == 1:
+        raw_codes = r["error_codes"]
+        codes = set(json.loads(raw_codes) if isinstance(raw_codes, str) else (raw_codes or []))
+        if r["char_error"] == 1 or bool(codes & {"P4", "P5", "P6"}):
             b["char_err"] += 1
 
-    return {
-        "total_units": len(rows),
-        "rated_units": len(rated),
-        "text_completeness": round(text_ok / len(rated), 4) if rated else 0.0,
-        "table_accuracy": round(table_ok / len(table_units), 4) if table_units else 0.0,
-        "character_error_rate": round(char_err / len(rated), 4) if rated else 0.0,
-        "layout_accuracy": round(layout_ok / len(rated), 4) if rated else 0.0,
-        "layout_total": len(rated),
-        "reading_order_accuracy": round(order_ok / len(rated), 4) if rated else 0.0,
-        "by_format_group": by_group,
-    }
+    summary["by_format_group"] = by_group
+    return summary

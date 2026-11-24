@@ -77,6 +77,14 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ unit_ids: unitIds }),
     }),
+  bulkApproveFailParsingUnits: (
+    runId: number,
+    items: { unit_id: number; error_codes: string[]; char_error: boolean; severity: string; notes: string }[]
+  ) =>
+    req<any>(`/api/parsing/runs/${runId}/bulk-approve-fail`, {
+      method: 'POST',
+      body: JSON.stringify({ items }),
+    }),
   visionOcrUnit: (unitId: number) =>
     req<any>(`/api/parsing/units/${unitId}/vision-ocr`, { method: 'POST' }),
   getParsingMetrics: (runId: number) => req<any>(`/api/parsing/runs/${runId}/metrics`),

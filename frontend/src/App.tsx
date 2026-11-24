@@ -18,6 +18,7 @@ import { ParsingPage } from './pages/ParsingPage';
 import { ChunkingPage } from './pages/ChunkingPage';
 import { RetrievalPage } from './pages/RetrievalPage';
 import { CompareLabPage } from './pages/CompareLabPage';
+import SettingsModal from './components/SettingsModal';
 
 type StepId = 'workspace' | 'parsing' | 'chunking' | 'retrieval' | 'compare';
 
@@ -132,7 +133,7 @@ export default function App() {
 
   // Settings Modal & Session Switcher
   const [showSettings, setShowSettings] = useState(false);
-  const [settingsTab, setSettingsTab] = useState<'ragflow' | 'llm' | 'thresholds'>('ragflow');
+  const [settingDefaults, setSettingDefaults] = useState<Record<string, string>>({});
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
   const sessionMenuRef = useRef<HTMLDivElement | null>(null);
 
@@ -184,6 +185,7 @@ export default function App() {
       if (typeof v === 'string') cleanSettings[k] = v;
     }
     setSettings((prev) => ({ ...prev, ...cleanSettings }));
+    if (sRes.defaults) setSettingDefaults(sRes.defaults);
     setHasKey(Boolean(sRes.settings?.has_ragflow_key));
     const targetId = preferredRunId ?? activeRunIdRef.current ?? Number(localStorage.getItem(ACTIVE_RUN_STORAGE_KEY) || '');
     if (rList.length > 0) {
@@ -292,11 +294,22 @@ export default function App() {
             className="flex items-center gap-2 text-[#161616] hover:opacity-75 transition-opacity shrink-0"
             title="Về Trang chủ"
           >
-            <svg viewBox="0 0 24 24" className="size-5 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.75">
-              <polygon points="12 2 21 7 21 17 12 22 3 17 3 7 12 2" />
-              <line x1="12" y1="22" x2="12" y2="12" />
-              <line x1="21" y1="7" x2="12" y2="12" />
-              <line x1="3" y1="7" x2="12" y2="12" />
+            <svg viewBox="0 0 32 32" className="size-6 shrink-0" fill="none" aria-hidden="true">
+              <rect width="32" height="32" rx="7" fill="#161616" />
+              <polygon
+                points="16 4.5 26 10.25 26 21.75 16 27.5 6 21.75 6 10.25 16 4.5"
+                stroke="#fefefe"
+                strokeWidth="1.6"
+                strokeLinejoin="round"
+                opacity="0.92"
+              />
+              <g strokeLinecap="round">
+                <line x1="10.2" y1="15.2" x2="15.2" y2="10.2" stroke="#B2DDFF" strokeWidth="2.5" />
+                <line x1="10.8" y1="20.4" x2="20.4" y2="10.8" stroke="#1570EF" strokeWidth="2.7" />
+                <line x1="16.2" y1="21.0" x2="21.5" y2="15.7" stroke="#53B1FD" strokeWidth="2.5" />
+              </g>
+              <circle cx="24.5" cy="23.5" r="4.2" fill="#03aa5c" stroke="#161616" strokeWidth="1.5" />
+              <path d="M22.7 23.5l1.2 1.2 2.4-2.4" stroke="#fefefe" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
             <span className="font-mono text-[12px] font-semibold tracking-wider whitespace-nowrap">RAGFLOW QC</span>
           </button>
@@ -507,241 +520,19 @@ export default function App() {
         )}
       </main>
 
-      {/* Clean 3-Tab Settings Modal */}
+      {/* Pipeline & System Settings Modal */}
       {showSettings && (
-        <div className="fixed inset-0 z-50 bg-black/25 flex items-center justify-center p-4">
-          <div className="bg-[#fefefe] border border-[#dedede] rounded-[4px] w-full max-w-lg overflow-hidden shadow-lg">
-            {/* Modal Header */}
-            <div className="px-6 pt-5 pb-3 border-b border-[#dedede] flex items-start justify-between">
-              <div>
-                <div className="ts-eyebrow">SYSTEM SETTINGS</div>
-                <h2 className="text-base font-semibold text-[#161616] mt-0.5">Cài đặt hệ thống</h2>
-              </div>
-              <button
-                onClick={() => setShowSettings(false)}
-                aria-label="Đóng"
-                className="p-1 text-[#71717a] hover:text-[#161616] rounded-[3px] hover:bg-[#f4f4f2]"
-              >
-                <X className="size-4" />
-              </button>
-            </div>
-
-            {/* 3 Organized Tabs */}
-            <div className="px-6 border-b border-[#dedede] bg-[#f7f7f6] flex items-center gap-1">
-              {(
-                [
-                  { id: 'ragflow', label: 'Kết nối RAGFlow' },
-                  { id: 'llm', label: 'LLM Chấm tự động' },
-                  { id: 'thresholds', label: 'Ngưỡng kiểm thử' },
-                ] as const
-              ).map((t) => (
-                <button
-                  key={t.id}
-                  type="button"
-                  onClick={() => {
-                    setSettingsTab(t.id);
-                    setConnMsg({});
-                  }}
-                  className={`px-3 py-2 text-xs font-medium border-b-2 transition-colors ${
-                    settingsTab === t.id
-                      ? 'border-[#03aa5c] text-[#161616]'
-                      : 'border-transparent text-[#71717a] hover:text-[#161616]'
-                  }`}
-                >
-                  {t.label}
-                </button>
-              ))}
-            </div>
-
-            {/* Tab Content */}
-            <div className="p-6 space-y-4">
-              {settingsTab === 'ragflow' && (
-                <div className="space-y-3.5">
-                  <div>
-                    <label className="block text-xs font-medium text-[#3d3d3d] mb-1">
-                      Địa chỉ RAGFlow (Base URL)
-                    </label>
-                    <input
-                      className="ts-input w-full font-mono text-xs"
-                      value={settings.ragflow_base_url || ''}
-                      onChange={(e) => setSettings({ ...settings, ragflow_base_url: e.target.value })}
-                      placeholder="http://13.236.9.207"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-medium text-[#3d3d3d] mb-1">
-                      RAGFlow API Key
-                    </label>
-                    <input
-                      type="password"
-                      className="ts-input w-full font-mono text-xs"
-                      value={settings.ragflow_api_key || ''}
-                      onChange={(e) => setSettings({ ...settings, ragflow_api_key: e.target.value })}
-                      placeholder="ragflow-xxxxxxxxxxxxxxxx"
-                    />
-                  </div>
-                  <div className="pt-1">
-                    <button
-                      type="button"
-                      onClick={() => handleSaveAndTest(true)}
-                      disabled={testing}
-                      className="ts-btn-secondary text-xs"
-                    >
-                      <FlaskConical className="size-3.5 text-[#03aa5c]" />
-                      {testing ? 'Đang kiểm tra...' : 'Kiểm tra kết nối RAGFlow'}
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {settingsTab === 'llm' && (
-                <div className="space-y-3.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-xs text-[#71717a]">Chọn nhanh nhà cung cấp:</span>
-                    <div className="flex items-center gap-1 text-[11px]">
-                      {[
-                        { label: 'DeepSeek', url: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
-                        { label: 'Gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-3.8-flash' },
-                        { label: 'OpenAI', url: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
-                        { label: 'Ollama', url: 'http://localhost:11434/v1', model: 'qwen2.5:7b' },
-                      ].map((p) => (
-                        <button
-                          key={p.label}
-                          type="button"
-                          onClick={() => setSettings({ ...settings, llm_base_url: p.url, llm_model: p.model })}
-                          className="px-2 py-0.5 bg-[#f7f7f6] hover:bg-[#03aa5c]/15 hover:text-[#027a42] border border-[#dedede] text-[#3d3d3d] rounded-[2px] transition-colors"
-                        >
-                          {p.label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-xs font-medium text-[#3d3d3d] mb-1">LLM Base URL</label>
-                      <input
-                        className="ts-input w-full font-mono text-xs"
-                        value={settings.llm_base_url || ''}
-                        onChange={(e) => setSettings({ ...settings, llm_base_url: e.target.value })}
-                        placeholder="https://api.deepseek.com/v1"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium text-[#3d3d3d] mb-1">Model</label>
-                      <input
-                        className="ts-input w-full font-mono text-xs"
-                        value={settings.llm_model || ''}
-                        onChange={(e) => setSettings({ ...settings, llm_model: e.target.value })}
-                        placeholder="deepseek-chat"
-                      />
-                    </div>
-                  </div>
-                  <div>
-                    <label className="block text-xs font-medium text-[#3d3d3d] mb-1">LLM API Key</label>
-                    <input
-                      type="password"
-                      className="ts-input w-full font-mono text-xs"
-                      value={settings.llm_api_key || ''}
-                      onChange={(e) => setSettings({ ...settings, llm_api_key: e.target.value })}
-                      placeholder="sk-... hoặc AIza..."
-                    />
-                  </div>
-                  <div className="pt-1">
-                    <button
-                      type="button"
-                      disabled={testing}
-                      onClick={async () => {
-                        setTesting(true);
-                        try {
-                          await api.saveSettings(settings);
-                          const res = await api.testLlm();
-                          toast.success(`Kết nối LLM thành công (${res.model}).`);
-                          setConnMsg({ ok: true, text: `Kết nối LLM thành công (${res.model}).` });
-                        } catch (e: any) {
-                          toast.error(e.message);
-                          setConnMsg({ ok: false, text: e.message });
-                        } finally {
-                          setTesting(false);
-                        }
-                      }}
-                      className="ts-btn-secondary text-xs"
-                    >
-                      <FlaskConical className="size-3.5 text-[#03aa5c]" />
-                      {testing ? 'Đang kiểm tra...' : 'Kiểm tra kết nối LLM'}
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {settingsTab === 'thresholds' && (
-                <div className="space-y-3.5">
-                  <p className="text-xs text-[#71717a] leading-relaxed">
-                    Các ngưỡng ký tự dùng để tự động gắn cờ cảnh báo chunk vụn hoặc chunk quá dài khi đồng bộ và chấm ở Bước 3 (Chunking).
-                  </p>
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-xs font-medium text-[#3d3d3d] mb-1">
-                        Ngưỡng chunk vụn (ký tự)
-                      </label>
-                      <input
-                        type="number"
-                        className="ts-input w-full font-mono text-xs"
-                        value={settings.min_chunk_chars || '50'}
-                        onChange={(e) => setSettings({ ...settings, min_chunk_chars: e.target.value })}
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium text-[#3d3d3d] mb-1">
-                        Ngưỡng quá dài (ký tự)
-                      </label>
-                      <input
-                        type="number"
-                        className="ts-input w-full font-mono text-xs"
-                        value={settings.max_chunk_chars || '2600'}
-                        onChange={(e) => setSettings({ ...settings, max_chunk_chars: e.target.value })}
-                      />
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {connMsg.text && (
-                <div
-                  className={`text-xs px-3 py-2 rounded-[3px] border flex items-center gap-2 ${
-                    connMsg.ok
-                      ? 'bg-[#f2fbf6] border-[#03aa5c]/40 text-[#027a42]'
-                      : 'bg-rose-50 border-rose-200 text-rose-800'
-                  }`}
-                >
-                  {connMsg.ok && <CheckCircle2 className="size-3.5 shrink-0" />}
-                  <span>{connMsg.text}</span>
-                </div>
-              )}
-            </div>
-
-            {/* Modal Footer */}
-            <div className="px-6 py-3.5 bg-[#f7f7f6] border-t border-[#dedede] flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setShowSettings(false)}
-                className="ts-btn-secondary text-xs"
-              >
-                Hủy
-              </button>
-              <button
-                type="button"
-                onClick={async () => {
-                  await handleSaveAndTest(false);
-                  setShowSettings(false);
-                }}
-                disabled={testing}
-                className="ts-btn-primary text-xs"
-              >
-                Lưu cài đặt
-              </button>
-            </div>
-          </div>
-        </div>
+        <SettingsModal
+          settings={settings}
+          defaults={settingDefaults}
+          setSettings={setSettings}
+          onClose={() => setShowSettings(false)}
+          onSave={() => handleSaveAndTest(false)}
+          onTestRagflow={() => handleSaveAndTest(true)}
+          testing={testing}
+          connMsg={connMsg}
+          setConnMsg={setConnMsg}
+        />
       )}
     </div>
   );

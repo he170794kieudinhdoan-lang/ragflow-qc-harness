@@ -3,7 +3,7 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from database import get_db, get_setting, utc_now
+from database import get_bool_setting, get_db, get_float_setting, get_int_setting, get_setting, utc_now
 from metrics import analyze_chunk_rules, compute_answer_containment, detect_duplicates_classified, nfc
 
 router = APIRouter(prefix="/api/chunking", tags=["chunking"])
@@ -21,13 +21,19 @@ class ChunkScoreUpdate(BaseModel):
 
 
 @router.post("/runs/{run_id}/sample")
-def auto_sample_chunks(run_id: int, per_doc: int = 5):
+def auto_sample_chunks(run_id: int, per_doc: Optional[int] = None):
     """
     Deterministic stratified sampling: picks `per_doc` chunks per document covering
     start -> middle -> end, then runs the 0-LLM Chunking QC rule engine (C1..C8).
     """
-    min_chars = int(get_setting("min_chunk_chars", "50") or "50")
-    max_chars = int(get_setting("max_chunk_chars", "2600") or "2600")
+    if per_doc is None:
+        per_doc = get_int_setting("chunk_sample_per_doc", 5)
+    min_chars = get_int_setting("min_chunk_chars", 50)
+    max_chars = get_int_setting("max_chunk_chars", 2600)
+    exempt_intact_table = get_bool_setting("exempt_intact_table_from_max_chars", True)
+    dup_threshold = get_float_setting("chunk_dup_threshold", 0.85)
+    adj_overlap_threshold = get_float_setting("chunk_adj_overlap_threshold", 88.0)
+    repeated_line_min = max(2, get_int_setting("chunk_repeated_line_min", 3))
 
     with get_db() as conn:
         all_chunks = [
@@ -42,7 +48,11 @@ def auto_sample_chunks(run_id: int, per_doc: int = 5):
 
         conn.execute("UPDATE chunk_evaluations SET is_sampled = 0 WHERE run_id = ?", (run_id,))
 
-        adj_dups, far_dups = detect_duplicates_classified(all_chunks)
+        adj_dups, far_dups = detect_duplicates_classified(
+            all_chunks,
+            threshold=dup_threshold,
+            adj_overlap_threshold=adj_overlap_threshold,
+        )
 
         by_doc: dict = {}
         chunk_by_pos: dict = {}
@@ -60,7 +70,7 @@ def auto_sample_chunks(run_id: int, per_doc: int = 5):
                     if 6 <= len(s) <= 100 and s not in seen_in_chunk:
                         seen_in_chunk.add(s)
                         line_counts[s] = line_counts.get(s, 0) + 1
-            repeated_by_doc[doc_id] = {ln for ln, cnt in line_counts.items() if cnt >= 3}
+            repeated_by_doc[doc_id] = {ln for ln, cnt in line_counts.items() if cnt >= repeated_line_min}
 
         sampled_count = 0
         now = utc_now()
@@ -87,6 +97,7 @@ def auto_sample_chunks(run_id: int, per_doc: int = 5):
                     is_far_dup=ch["id"] in far_dups,
                     min_chars=min_chars,
                     max_chars=max_chars,
+                    exempt_intact_table=exempt_intact_table,
                 )
 
                 conn.execute(

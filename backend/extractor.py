@@ -161,18 +161,33 @@ def _extract_pdf(fp: str) -> List[ExtractedUnit]:
     except Exception:
         table_boxes_by_page = {}
 
-    # 2. Extract text & heading blocks outside tables via PyMuPDF and merge into full paragraphs
+    # 2. Extract text, heading, and significant image blocks outside tables via PyMuPDF
     pdf = fitz.open(fp)
     try:
         for p_idx, page in enumerate(pdf, start=1):
             t_boxes = table_boxes_by_page.get(p_idx, [])
-            blocks = page.get_text("blocks")
-            # Sort top-to-bottom, left-to-right
-            blocks.sort(key=lambda b: (round(b[1] / 12), b[0]))
+            page_w = float(page.rect.width) if page.rect else 600.0
+            mid_x = page_w * 0.5
+
+            # Use PyMuPDF's native reading-order sort instead of naive y/12 interleaving
+            raw_blocks = page.get_text("blocks", sort=True)
+
+            # Detect 2-column layout: if >= 3 text blocks sit strictly left of mid_x and >= 3 strictly right
+            text_blocks = [b for b in raw_blocks if len(b) >= 5 and (len(b) < 7 or b[6] == 0) and nfc(b[4]).strip()]
+            left_col = [b for b in text_blocks if b[2] <= mid_x + 12]
+            right_col = [b for b in text_blocks if b[0] >= mid_x - 12]
+            if len(left_col) >= 3 and len(right_col) >= 3:
+                full_width = [b for b in text_blocks if b[2] > mid_x + 12 and b[0] < mid_x - 12]
+                ordered_text_blocks = (
+                    sorted(full_width, key=lambda b: b[1])
+                    + sorted(left_col, key=lambda b: b[1])
+                    + sorted(right_col, key=lambda b: b[1])
+                )
+            else:
+                ordered_text_blocks = text_blocks
+
             page_texts: List[str] = []
-            for b in blocks:
-                if len(b) < 5:
-                    continue
+            for b in ordered_text_blocks:
                 bbox = (b[0], b[1], b[2], b[3])
                 txt = nfc(b[4]).strip()
                 if not txt:
@@ -185,6 +200,21 @@ def _extract_pdf(fp: str) -> List[ExtractedUnit]:
                 page_texts.append(joined_block)
 
             units.extend(_merge_blocks_into_paragraphs(page_texts, p_idx))
+
+            # Extract significant embedded images/diagrams (ignore tiny decorative icons < 12,000 px²)
+            img_idx = 0
+            for b in raw_blocks:
+                if len(b) >= 7 and b[6] == 1:
+                    w = float(b[2]) - float(b[0])
+                    h = float(b[3]) - float(b[1])
+                    if w * h >= 12000 and w >= 80 and h >= 60:
+                        img_idx += 1
+                        units.append((
+                            "image",
+                            p_idx,
+                            f"Trang {p_idx} · Hình/Sơ đồ #{img_idx}",
+                            f"[Hình ảnh / Sơ đồ trang {p_idx} ({int(w)}×{int(h)}px) — Cần kiểm tra RAGFlow có trích xuất được nội dung/nhãn trong hình hay không.]",
+                        ))
     finally:
         total_pages = len(pdf)
         pdf.close()

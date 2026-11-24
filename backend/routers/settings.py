@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Any, Dict
-from database import get_all_settings, set_setting, get_setting, get_db
+from database import DEFAULT_SETTINGS, get_all_settings, set_setting, get_setting, get_db
 from ragflow_client import RAGFlowClient, RAGFlowError
 from llm_client import LLMError, test_llm_connection
 from metrics import PARSING_ERROR_CATALOG, CHUNKING_ERROR_CATALOG, RETRIEVAL_ERROR_CATALOG
@@ -22,6 +22,7 @@ def read_settings():
     masked["has_llm_key"] = bool(data.get("llm_api_key", "").strip())
     return {
         "settings": masked,
+        "defaults": DEFAULT_SETTINGS,
         "catalogs": {
             "parsing_errors": PARSING_ERROR_CATALOG,
             "chunking_errors": CHUNKING_ERROR_CATALOG,

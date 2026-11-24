@@ -3,6 +3,7 @@ import { diffChars, diffWordsWithSpace } from 'diff';
 import { AlertCircle, ArrowRight, BarChart3, CheckCheck, ChevronLeft, ChevronRight, FileText, GripHorizontal, Image as ImageIcon, Layers, LayoutGrid, List, ListOrdered, Loader2, Lock, Maximize2, Minimize2, Plus, Sparkles, Table2, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { api } from '../api/client';
+import { ParsingTableView } from '../components/ParsingTableView';
 import { DocumentItem, ErrorCodeDef, ParsingUnit, RunItem } from '../types';
 
 interface Props {
@@ -22,6 +23,7 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
   const [hoveredUnit, setHoveredUnit] = useState<ParsingUnit | null>(null);
   const [colorFilter, setColorFilter] = useState<ColorFilter>('ALL');
   const [sidebarViewMode, setSidebarViewMode] = useState<'grid' | 'list'>('grid');
+  const [pageViewMode, setPageViewMode] = useState<'overview' | 'table'>('overview');
   const [metrics, setMetrics] = useState<any>(null);
   const [showAdd, setShowAdd] = useState(false);
 
@@ -276,6 +278,60 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
     .filter((u) => u.verdict === 'UNRATED' && getUnitEffectiveState(u) === 'PASS')
     .map((u) => u.id);
 
+  const unratedRedUnits = units.filter(
+    (u) => u.verdict === 'UNRATED' && getUnitEffectiveState(u) === 'FAIL'
+  );
+
+  const handleBulkApproveRed = async () => {
+    if (!activeRun || bulkApproving || unratedRedUnits.length === 0) return;
+    setBulkApproving(true);
+    const prevUnits = units;
+    const payloadItems = unratedRedUnits.map((u) => {
+      const suggested =
+        u.matched_chunks && u.matched_chunks.length > 0
+          ? u.matched_chunks[0]?.alignment?.suggested_error_codes || []
+          : [u.unit_type === 'image' || u.unit_type === 'diagram' ? 'P2' : 'P1'];
+      const codes = suggested.length > 0 ? suggested : ['P1'];
+      const hasChar = codes.some((c) => c === 'P4' || c === 'P5' || c === 'P6');
+      const sev = codes.some((c) => ['P1', 'P2', 'P3', 'P9', 'P10'].includes(c))
+        ? 'Nghiêm trọng'
+        : 'Trung bình';
+      return {
+        unit_id: u.id,
+        error_codes: codes,
+        char_error: hasChar,
+        severity: sev,
+        notes: u.notes || '',
+      };
+    });
+    const mapById = new Map(payloadItems.map((it) => [it.unit_id, it]));
+    const updatedUnits = units.map((u) => {
+      const it = mapById.get(u.id);
+      return it
+        ? {
+            ...u,
+            verdict: 'FAIL' as const,
+            error_codes: it.error_codes,
+            char_error: it.char_error ? 1 : 0,
+            severity: it.severity,
+          }
+        : u;
+    });
+    setUnits(updatedUnits);
+    onProgressChange?.(updatedUnits.filter((u) => u.verdict !== 'UNRATED').length, updatedUnits.length);
+    try {
+      await api.bulkApproveFailParsingUnits(activeRun.id, payloadItems);
+      api.getParsingMetrics(activeRun.id).then(setMetrics).catch(() => {});
+      toast.success(`Đã chốt nhanh ${payloadItems.length} ô đỏ kèm mã lỗi gợi ý.`);
+    } catch (e: any) {
+      setUnits(prevUnits);
+      onProgressChange?.(prevUnits.filter((u) => u.verdict !== 'UNRATED').length, prevUnits.length);
+      toast.error(e.message);
+    } finally {
+      setBulkApproving(false);
+    }
+  };
+
   const handleBulkApproveGreen = async () => {
     if (!activeRun || bulkApproving || unratedGreenIds.length === 0) return;
     setBulkApproving(true);
@@ -525,20 +581,41 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
         ? u.error_codes || []
         : u.matched_chunks?.[0]?.alignment?.suggested_error_codes || [];
     const charErrCnt = units.filter((u) =>
-      getCodes(u).some((c) => c === 'P4' || c === 'P5' || c === 'P6' || c === 'TEXT')
+      u.char_error === 1 || getCodes(u).some((c) => c === 'P4' || c === 'P5' || c === 'P6')
     ).length;
     const orderOkCnt = units.filter((u) => !getCodes(u).some((c) => c === 'P3' || c === 'ORDER')).length;
-    const layoutOkCnt = units.filter((u) => !getCodes(u).some((c) => c === 'P2' || c === 'LAYOUT')).length;
+    const fidelityOkCnt = units.filter((u) => !getCodes(u).some((c) => c === 'P3' || c === 'P10' || c === 'FIDELITY')).length;
+
+    const textCompleteness = textU.length ? (textU.filter((u) => getUnitEffectiveState(u) === 'PASS').length / textU.length) * 100 : null;
+    const tableAccuracy = tableU.length ? (tableU.filter((u) => getUnitEffectiveState(u) === 'PASS').length / tableU.length) * 100 : null;
+    const charErrorRate = units.length ? (charErrCnt / units.length) * 100 : 0;
+    // Never fake 100% Layout Accuracy when no image/diagram units exist
+    const layoutAccuracy = layoutU.length
+      ? (layoutU.filter((u) => getUnitEffectiveState(u) === 'PASS').length / layoutU.length) * 100
+      : null;
+    const readingOrder = units.length ? (orderOkCnt / units.length) * 100 : null;
+    const contentFidelity = units.length ? (fidelityOkCnt / units.length) * 100 : null;
+
+    const weightedTerms: [number, number | null][] = [
+      [0.25, textCompleteness],
+      [0.20, contentFidelity],
+      [0.20, tableAccuracy],
+      [0.15, units.length ? 100 - charErrorRate : null],
+      [0.10, layoutAccuracy],
+      [0.10, readingOrder],
+    ];
+    const availTerms = weightedTerms.filter(([, v]) => v !== null) as [number, number][];
+    const wSum = availTerms.reduce((acc, [w]) => acc + w, 0);
+    const parsingScore = wSum > 0 ? availTerms.reduce((acc, [w, v]) => acc + w * v, 0) / wSum : 0;
+
     return {
-      textCompleteness: textU.length ? (textU.filter((u) => getUnitEffectiveState(u) === 'PASS').length / textU.length) * 100 : null,
-      tableAccuracy: tableU.length ? (tableU.filter((u) => getUnitEffectiveState(u) === 'PASS').length / tableU.length) * 100 : null,
-      charErrorRate: units.length ? (charErrCnt / units.length) * 100 : 0,
-      layoutAccuracy: layoutU.length
-        ? (layoutU.filter((u) => getUnitEffectiveState(u) === 'PASS').length / layoutU.length) * 100
-        : units.length
-        ? (layoutOkCnt / units.length) * 100
-        : null,
-      readingOrder: units.length ? (orderOkCnt / units.length) * 100 : null,
+      textCompleteness,
+      tableAccuracy,
+      charErrorRate,
+      contentFidelity,
+      layoutAccuracy,
+      readingOrder,
+      parsingScore,
     };
   })();
 
@@ -635,6 +712,35 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
         </div>
 
         <div className="flex flex-wrap items-center gap-1.5 text-xs text-[#52525b]">
+          <div className="inline-flex items-center p-0.5 rounded-md bg-[#f4f4f2] border border-[#e4e4e2] mr-1">
+            <button
+              type="button"
+              onClick={() => setPageViewMode('overview')}
+              className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] rounded transition-colors ${
+                pageViewMode === 'overview'
+                  ? 'bg-white text-[#18181b] font-medium shadow-xs'
+                  : 'text-[#71717a] hover:text-[#18181b]'
+              }`}
+              title="Xem ma trận ô màu & biểu đồ Radar"
+            >
+              <LayoutGrid className="size-3" />
+              Tổng quan
+            </button>
+            <button
+              type="button"
+              onClick={() => setPageViewMode('table')}
+              className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] rounded transition-colors ${
+                pageViewMode === 'table'
+                  ? 'bg-white text-[#18181b] font-medium shadow-xs'
+                  : 'text-[#71717a] hover:text-[#18181b]'
+              }`}
+              title="Xem bảng tổng hợp điểm & chi tiết từng đoạn (Excel View)"
+            >
+              <Table2 className="size-3" />
+              Bảng chi tiết
+            </button>
+          </div>
+
           <button
             type="button"
             disabled={loading || filteredUnits.length === 0}
@@ -674,7 +780,18 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
         </div>
       </div>
 
-      {/* 2-Column Overview: Left = Matrix (DOC01..DOC20), Right = Thống kê lỗi */}
+      {pageViewMode === 'table' ? (
+        <ParsingTableView
+          units={units}
+          docs={docs}
+          getUnitEffectiveState={getUnitEffectiveState}
+          onSelectUnit={(u) => {
+            selectUnit(u);
+            setIsFullscreen(true);
+          }}
+        />
+      ) : (
+      /* 2-Column Overview: Left = Matrix (DOC01..DOC20), Right = Thống kê lỗi */
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 min-h-0 overflow-hidden bg-white">
         {/* Left: Matrix Overview */}
         <div className="lg:col-span-7 overflow-y-auto px-6 py-4 border-b lg:border-b-0 lg:border-r border-[#e8e8e6] bg-white">
@@ -713,6 +830,18 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
               >
                 <CheckCheck className="size-3.5" />
                 {bulkApproving ? 'Đang duyệt...' : `Duyệt nhanh ô xanh (${unratedGreenIds.length})`}
+              </button>
+            )}
+            {unratedRedUnits.length > 0 && (
+              <button
+                type="button"
+                onClick={handleBulkApproveRed}
+                disabled={bulkApproving}
+                className="ml-1 inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium bg-[#fef2f2] text-[#b91c1c] border border-[#f5d0d3] hover:bg-[#b91c1c] hover:text-white transition-colors disabled:opacity-45"
+                title="Chốt nhanh toàn bộ các ô đỏ thành Không đạt kèm mã lỗi P1..P10 gợi ý"
+              >
+                <AlertCircle className="size-3.5" />
+                {bulkApproving ? 'Đang duyệt...' : `Duyệt nhanh ô đỏ (${unratedRedUnits.length})`}
               </button>
             )}
           </div>
@@ -840,35 +969,41 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
             <div className="text-xs text-[#71717a] py-8 text-center">Chưa có dữ liệu thống kê.</div>
           ) : (
             <>
-              {/* 1. 4-Axis SVG Radar Chart Card */}
+              {/* 1. 5-Axis SVG Radar Chart Card + CER & Parsing Score */}
               {(() => {
                 const total = Math.max(units.length, 1);
                 const passPct = Math.round((counts.PASS / total) * 100);
                 const vText = Math.max(0, Math.min(100, effectiveMetrics.textCompleteness ?? 0));
+                const vFidelity = Math.max(0, Math.min(100, effectiveMetrics.contentFidelity ?? 0));
                 const vTable = Math.max(0, Math.min(100, effectiveMetrics.tableAccuracy ?? 0));
                 const vOrder = Math.max(0, Math.min(100, effectiveMetrics.readingOrder ?? 0));
                 const vLayout = Math.max(0, Math.min(100, effectiveMetrics.layoutAccuracy ?? 0));
+                const vCer = Math.max(0, Math.min(100, effectiveMetrics.charErrorRate ?? 0));
+                const vScore = Math.max(0, Math.min(100, effectiveMetrics.parsingScore ?? 0));
 
                 const cx = 160;
-                const cy = 98;
-                const maxR = 60;
+                const cy = 104;
+                const maxR = 58;
+                const angles = [-90, -18, 54, 126, 198];
                 const pt = (angleDeg: number, pct: number) => {
                   const rad = (angleDeg * Math.PI) / 180;
                   const r = (pct / 100) * maxR;
                   return [cx + r * Math.cos(rad), cy + r * Math.sin(rad)];
                 };
-                // Top (-90), Right (0), Bottom (90), Left (180)
-                const pTop = pt(-90, vText);
-                const pRight = pt(0, vTable);
-                const pBottom = pt(90, vOrder);
-                const pLeft = pt(180, vLayout);
-                const polyPoints = [pTop, pRight, pBottom, pLeft].map((p) => `${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' ');
+                const pts = [
+                  pt(angles[0], vText),
+                  pt(angles[1], vFidelity),
+                  pt(angles[2], vTable),
+                  pt(angles[3], vOrder),
+                  pt(angles[4], vLayout),
+                ];
+                const polyPoints = pts.map((p) => `${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' ');
 
                 return (
                   <div className="bg-white border border-[#e6e4de] rounded-xl shadow-xs p-4 space-y-3">
                     <div className="flex items-center justify-between">
                       <div>
-                        <div className="text-xs font-semibold text-[#18181b]">Biểu đồ Radar 4 trục</div>
+                        <div className="text-xs font-semibold text-[#18181b]">6 Metric Parsing · Radar 5 trục</div>
                         <div className="text-[11px] text-[#78716c]">
                           Đạt <span className="font-mono font-semibold text-[#027a42]">{passPct}%</span> ({counts.PASS}/{units.length} đoạn)
                         </div>
@@ -884,10 +1019,11 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
                     </div>
 
                     <div className="flex justify-center">
-                      <svg viewBox="0 0 320 198" className="w-full max-w-[330px] h-auto select-none">
-                        {/* Concentric diamond grid rings */}
+                      <svg viewBox="0 0 320 210" className="w-full max-w-[330px] h-auto select-none">
+                        {/* Concentric pentagon grid rings */}
                         {[25, 50, 75, 100].map((lvl) => {
-                          const ring = [pt(-90, lvl), pt(0, lvl), pt(90, lvl), pt(180, lvl)]
+                          const ring = angles
+                            .map((a) => pt(a, lvl))
                             .map((p) => `${p[0].toFixed(1)},${p[1].toFixed(1)}`)
                             .join(' ');
                           return (
@@ -902,8 +1038,20 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
                           );
                         })}
                         {/* Axis lines */}
-                        <line x1={cx} y1={cy - maxR} x2={cx} y2={cy + maxR} stroke="#e6e4de" strokeWidth="1" />
-                        <line x1={cx - maxR} y1={cy} x2={cx + maxR} y2={cy} stroke="#e6e4de" strokeWidth="1" />
+                        {angles.map((a, idx) => {
+                          const end = pt(a, 100);
+                          return (
+                            <line
+                              key={idx}
+                              x1={cx}
+                              y1={cy}
+                              x2={end[0].toFixed(1)}
+                              y2={end[1].toFixed(1)}
+                              stroke="#e6e4de"
+                              strokeWidth="1"
+                            />
+                          );
+                        })}
 
                         {/* Data polygon */}
                         <polygon
@@ -916,7 +1064,7 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
                         />
 
                         {/* Vertex dots */}
-                        {[pTop, pRight, pBottom, pLeft].map((p, idx) => (
+                        {pts.map((p, idx) => (
                           <circle
                             key={idx}
                             cx={p[0]}
@@ -929,35 +1077,68 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
                           />
                         ))}
 
-                        {/* Axis Labels (Accurate 0-100% Higher-is-Better Document Parsing Metrics) */}
-                        <text x={cx} y={14} textAnchor="middle" className="fill-[#52525b] text-[10px] font-medium">
-                          Text Accuracy
+                        {/* Axis Labels (5 Higher-is-Better Parsing Metrics) */}
+                        <text x={cx} y={16} textAnchor="middle" className="fill-[#52525b] text-[10px] font-medium">
+                          Text Completeness
                         </text>
-                        <text x={cx} y={26} textAnchor="middle" className="fill-[#18181b] text-[10px] font-mono font-semibold">
+                        <text x={cx} y={28} textAnchor="middle" className="fill-[#18181b] text-[10px] font-mono font-semibold">
                           {effectiveMetrics.textCompleteness !== null ? `${vText.toFixed(0)}%` : '—'}
                         </text>
 
-                        <text x={cx + maxR + 10} y={cy - 3} textAnchor="start" className="fill-[#52525b] text-[10px] font-medium">
+                        <text x={226} y={79} textAnchor="start" className="fill-[#52525b] text-[10px] font-medium">
+                          Content Fidelity
+                        </text>
+                        <text x={226} y={91} textAnchor="start" className="fill-[#18181b] text-[10px] font-mono font-semibold">
+                          {effectiveMetrics.contentFidelity !== null ? `${vFidelity.toFixed(0)}%` : '—'}
+                        </text>
+
+                        <text x={208} y={170} textAnchor="start" className="fill-[#52525b] text-[10px] font-medium">
                           Table Accuracy
                         </text>
-                        <text x={cx + maxR + 10} y={cy + 10} textAnchor="start" className="fill-[#18181b] text-[10px] font-mono font-semibold">
+                        <text x={208} y={182} textAnchor="start" className="fill-[#18181b] text-[10px] font-mono font-semibold">
                           {effectiveMetrics.tableAccuracy !== null ? `${vTable.toFixed(0)}%` : '—'}
                         </text>
 
-                        <text x={cx} y={cy + maxR + 14} textAnchor="middle" className="fill-[#52525b] text-[10px] font-medium">
+                        <text x={112} y={170} textAnchor="end" className="fill-[#52525b] text-[10px] font-medium">
                           Reading Order
                         </text>
-                        <text x={cx} y={cy + maxR + 26} textAnchor="middle" className="fill-[#18181b] text-[10px] font-mono font-semibold">
+                        <text x={112} y={182} textAnchor="end" className="fill-[#18181b] text-[10px] font-mono font-semibold">
                           {effectiveMetrics.readingOrder !== null ? `${vOrder.toFixed(0)}%` : '—'}
                         </text>
 
-                        <text x={cx - maxR - 10} y={cy - 3} textAnchor="end" className="fill-[#52525b] text-[10px] font-medium">
-                          Layout Accuracy
+                        <text x={94} y={79} textAnchor="end" className="fill-[#52525b] text-[10px] font-medium">
+                          Layout &amp; Struct
                         </text>
-                        <text x={cx - maxR - 10} y={cy + 10} textAnchor="end" className="fill-[#18181b] text-[10px] font-mono font-semibold">
+                        <text x={94} y={91} textAnchor="end" className="fill-[#18181b] text-[10px] font-mono font-semibold">
                           {effectiveMetrics.layoutAccuracy !== null ? `${vLayout.toFixed(0)}%` : '—'}
                         </text>
                       </svg>
+                    </div>
+
+                    {/* 6th metric (Character Error Rate - lower is better) + Weighted Parsing Score */}
+                    <div className="grid grid-cols-2 gap-2 pt-2 border-t border-[#efede8]">
+                      <div className="px-2.5 py-2 rounded-lg bg-[#faf9f7] border border-[#eceae4] flex items-center justify-between">
+                        <div>
+                          <div className="text-[10px] font-medium text-[#78716c]">Character Error Rate</div>
+                          <div className="text-[9.5px] text-[#a1a1aa]">Phụ lục A · càng thấp càng tốt</div>
+                        </div>
+                        <span
+                          className={`font-mono text-xs font-semibold ${
+                            vCer <= 5 ? 'text-[#027a42]' : vCer <= 15 ? 'text-[#b45309]' : 'text-[#b91c1c]'
+                          }`}
+                        >
+                          {vCer.toFixed(1)}%
+                        </span>
+                      </div>
+                      <div className="px-2.5 py-2 rounded-lg bg-[#f2f7f4] border border-[#d6eadf] flex items-center justify-between">
+                        <div>
+                          <div className="text-[10px] font-medium text-[#027a42]">Parsing Score</div>
+                          <div className="text-[9.5px] text-[#52796f]">Tổng hợp 6 metric</div>
+                        </div>
+                        <span className="font-mono text-xs font-bold text-[#027a42]">
+                          {vScore.toFixed(1)}%
+                        </span>
+                      </div>
                     </div>
 
                     {/* Compact Error Group Pills */}
@@ -1052,6 +1233,7 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
           )}
         </div>
       </div>
+      )}
 
       {/* Fullscreen Scoring Mode — opened via "Chế độ chấm" button or clicking a square */}
       {selectedUnit && (

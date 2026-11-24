@@ -1,0 +1,645 @@
+import React, { useState } from 'react';
+import {
+  FlaskConical,
+  Plug,
+  FolderSync,
+  FileSearch,
+  Scissors,
+  SearchCheck,
+  RotateCcw,
+  X,
+} from 'lucide-react';
+import { api } from '../api/client';
+
+type SectionId = 'connection' | 'step1' | 'step2' | 'step3' | 'step4';
+
+interface SettingsModalProps {
+  settings: Record<string, string>;
+  defaults: Record<string, string>;
+  setSettings: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+  onClose: () => void;
+  onSave: () => Promise<void>;
+  onTestRagflow: () => Promise<void>;
+  testing: boolean;
+  connMsg: { ok?: boolean; text?: string };
+  setConnMsg: React.Dispatch<React.SetStateAction<{ ok?: boolean; text?: string }>>;
+}
+
+const SECTION_KEYS: Record<SectionId, string[]> = {
+  connection: ['ragflow_base_url', 'llm_base_url', 'llm_model'],
+  step1: ['slow_parse_threshold_sec'],
+  step2: [
+    'parsing_table_cell_match_threshold',
+    'target_text_completeness',
+    'target_table_accuracy',
+    'target_reading_order',
+  ],
+  step3: [
+    'chunk_sample_per_doc',
+    'min_chunk_chars',
+    'max_chunk_chars',
+    'exempt_intact_table_from_max_chars',
+    'chunk_dup_threshold',
+    'chunk_adj_overlap_threshold',
+    'chunk_repeated_line_min',
+    'target_chunk_integrity',
+    'max_chunk_noise_rate',
+    'target_valid_size_rate',
+  ],
+  step4: [
+    'default_top_k',
+    'default_similarity_threshold',
+    'default_vector_similarity_weight',
+    'default_rerank_id',
+    'default_keyword_enabled',
+    'golden_gen_per_doc',
+    'target_contextual_precision',
+    'target_context_coverage',
+  ],
+};
+
+const NAV_ITEMS: { id: SectionId; label: string; sub: string; icon: React.ComponentType<any> }[] = [
+  { id: 'connection', label: 'Kết nối & LLM', sub: 'RAGFlow API, LLM Judge', icon: Plug },
+  { id: 'step1', label: 'Bước 1: Đồng bộ', sub: 'Cảnh báo parse', icon: FolderSync },
+  { id: 'step2', label: 'Bước 2: Parsing', sub: 'Ngưỡng đọc & KPI', icon: FileSearch },
+  { id: 'step3', label: 'Bước 3: Chunking', sub: 'Mẫu, size, trùng, nhiễu', icon: Scissors },
+  { id: 'step4', label: 'Bước 4: Retrieval', sub: 'Search mặc định & KPI', icon: SearchCheck },
+];
+
+function FieldRow({
+  label,
+  hint,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div>
+      <label className="block text-xs font-medium text-[#27272a] mb-1">{label}</label>
+      {children}
+      {hint && <p className="text-[11px] text-[#71717a] mt-1 leading-relaxed">{hint}</p>}
+    </div>
+  );
+}
+
+export default function SettingsModal({
+  settings,
+  defaults,
+  setSettings,
+  onClose,
+  onSave,
+  onTestRagflow,
+  testing,
+  connMsg,
+  setConnMsg,
+}: SettingsModalProps) {
+  const [section, setSection] = useState<SectionId>('connection');
+  const [testingLlm, setTestingLlm] = useState(false);
+
+  const val = (key: string, fallback = '') => settings[key] ?? defaults[key] ?? fallback;
+  const setKey = (key: string, value: string) => setSettings((prev) => ({ ...prev, [key]: value }));
+
+  const resetSection = () => {
+    const keys = SECTION_KEYS[section];
+    setSettings((prev) => {
+      const next = { ...prev };
+      for (const k of keys) {
+        if (defaults[k] !== undefined) next[k] = defaults[k];
+      }
+      return next;
+    });
+    setConnMsg({ ok: true, text: 'Đã khôi phục giá trị mặc định cho mục này (bấm Lưu để áp dụng).' });
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/30 flex items-center justify-center p-4">
+      <div className="bg-[#fefefe] border border-[#dedede] rounded-[6px] w-full max-w-3xl max-h-[88vh] flex flex-col overflow-hidden shadow-xl">
+        {/* Header */}
+        <div className="px-6 py-4 border-b border-[#dedede] flex items-center justify-between shrink-0">
+          <div>
+            <div className="ts-eyebrow">SYSTEM &amp; PIPELINE SETTINGS</div>
+            <h2 className="text-base font-semibold text-[#161616] mt-0.5">Cài đặt hệ thống &amp; từng bước kiểm thử</h2>
+          </div>
+          <button
+            onClick={onClose}
+            aria-label="Đóng"
+            className="p-1.5 text-[#71717a] hover:text-[#161616] rounded-[4px] hover:bg-[#f4f4f2]"
+          >
+            <X className="size-4" />
+          </button>
+        </div>
+
+        {/* Body: Left sidebar + Right content */}
+        <div className="flex flex-1 min-h-0">
+          {/* Sidebar */}
+          <aside className="w-52 shrink-0 border-r border-[#dedede] bg-[#fafaf9] p-2.5 space-y-1 overflow-y-auto">
+            {NAV_ITEMS.map((item) => {
+              const Icon = item.icon;
+              const active = section === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => {
+                    setSection(item.id);
+                    setConnMsg({});
+                  }}
+                  className={`w-full text-left px-2.5 py-2 rounded-[4px] flex items-start gap-2.5 transition-colors ${
+                    active
+                      ? 'bg-white border border-[#dedede] text-[#161616] shadow-2xs'
+                      : 'border border-transparent text-[#52525b] hover:bg-[#f1f1ef] hover:text-[#161616]'
+                  }`}
+                >
+                  <Icon className={`size-4 mt-0.5 shrink-0 ${active ? 'text-[#03aa5c]' : 'text-[#71717a]'}`} />
+                  <div className="min-w-0">
+                    <div className="text-xs font-medium truncate">{item.label}</div>
+                    <div className="text-[10px] text-[#71717a] truncate">{item.sub}</div>
+                  </div>
+                </button>
+              );
+            })}
+          </aside>
+
+          {/* Right Panel */}
+          <div className="flex-1 overflow-y-auto p-6 space-y-5">
+            <div className="flex items-center justify-between border-b border-[#ededeb] pb-3">
+              <div>
+                <h3 className="text-sm font-semibold text-[#161616]">
+                  {NAV_ITEMS.find((i) => i.id === section)?.label}
+                </h3>
+                <p className="text-[11px] text-[#71717a]">
+                  {NAV_ITEMS.find((i) => i.id === section)?.sub}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={resetSection}
+                className="inline-flex items-center gap-1.5 text-[11px] text-[#52525b] hover:text-[#161616] px-2.5 py-1 rounded-[4px] border border-[#e4e4e2] hover:bg-[#f4f4f2]"
+              >
+                <RotateCcw className="size-3" />
+                Khôi phục mặc định
+              </button>
+            </div>
+
+            {section === 'connection' && (
+              <div className="space-y-5">
+                <div className="space-y-3">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
+                    RAGFlow Server
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <FieldRow label="Địa chỉ RAGFlow (Base URL)">
+                      <input
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('ragflow_base_url')}
+                        onChange={(e) => setKey('ragflow_base_url', e.target.value)}
+                        placeholder="http://13.236.9.207"
+                      />
+                    </FieldRow>
+                    <FieldRow label="RAGFlow API Key">
+                      <input
+                        type="password"
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('ragflow_api_key')}
+                        onChange={(e) => setKey('ragflow_api_key', e.target.value)}
+                        placeholder="ragflow-xxxxxxxxxxxxxxxx"
+                      />
+                    </FieldRow>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={onTestRagflow}
+                    disabled={testing}
+                    className="ts-btn-secondary text-xs"
+                  >
+                    <FlaskConical className="size-3.5 text-[#03aa5c]" />
+                    {testing ? 'Đang kiểm tra...' : 'Kiểm tra kết nối RAGFlow'}
+                  </button>
+                </div>
+
+                <div className="border-t border-[#ededeb] pt-4 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
+                      LLM Judge (Chấm tự động &amp; Sinh Golden Dataset)
+                    </span>
+                    <div className="flex items-center gap-1 text-[11px]">
+                      {[
+                        { label: 'DeepSeek', url: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
+                        { label: 'Gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-flash' },
+                        { label: 'OpenAI', url: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+                        { label: 'Ollama', url: 'http://localhost:11434/v1', model: 'qwen2.5:7b' },
+                      ].map((p) => (
+                        <button
+                          key={p.label}
+                          type="button"
+                          onClick={() =>
+                            setSettings((prev) => ({ ...prev, llm_base_url: p.url, llm_model: p.model }))
+                          }
+                          className="px-2 py-0.5 bg-[#f7f7f6] hover:bg-[#03aa5c]/15 hover:text-[#027a42] border border-[#dedede] text-[#3d3d3d] rounded-[2px]"
+                        >
+                          {p.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <FieldRow label="LLM Base URL">
+                      <input
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('llm_base_url')}
+                        onChange={(e) => setKey('llm_base_url', e.target.value)}
+                      />
+                    </FieldRow>
+                    <FieldRow label="Tên Model">
+                      <input
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('llm_model')}
+                        onChange={(e) => setKey('llm_model', e.target.value)}
+                      />
+                    </FieldRow>
+                  </div>
+                  <FieldRow label="LLM API Key">
+                    <input
+                      type="password"
+                      className="ts-input w-full font-mono text-xs"
+                      value={val('llm_api_key')}
+                      onChange={(e) => setKey('llm_api_key', e.target.value)}
+                      placeholder="sk-..."
+                    />
+                  </FieldRow>
+                  <button
+                    type="button"
+                    disabled={testingLlm}
+                    onClick={async () => {
+                      setTestingLlm(true);
+                      setConnMsg({});
+                      try {
+                        await api.saveSettings(settings);
+                        const r = await api.testLlm();
+                        setConnMsg({ ok: true, text: `Kết nối LLM thành công (${r.model})` });
+                      } catch (e: any) {
+                        setConnMsg({ ok: false, text: e.message });
+                      } finally {
+                        setTestingLlm(false);
+                      }
+                    }}
+                    className="ts-btn-secondary text-xs"
+                  >
+                    <FlaskConical className="size-3.5 text-[#03aa5c]" />
+                    {testingLlm ? 'Đang kiểm tra...' : 'Kiểm tra kết nối LLM'}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {section === 'step1' && (
+              <div className="space-y-4">
+                <FieldRow
+                  label="Ngưỡng cảnh báo parse chậm — SLOW_PARSE (giây)"
+                  hint="Tài liệu có thời gian parse vượt ngưỡng này sẽ bị gắn cờ SLOW_PARSE khi đồng bộ từ RAGFlow. Đặt 0 để tắt cảnh báo này. Mặc định: 180s (PDF scan/dày nên đặt 600–900s)."
+                >
+                  <input
+                    type="number"
+                    min={0}
+                    className="ts-input w-48 font-mono text-xs"
+                    value={val('slow_parse_threshold_sec', '180')}
+                    onChange={(e) => setKey('slow_parse_threshold_sec', e.target.value)}
+                  />
+                </FieldRow>
+              </div>
+            )}
+
+            {section === 'step2' && (
+              <div className="space-y-5">
+                <div className="space-y-3">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
+                    Matching tự động
+                  </div>
+                  <FieldRow
+                    label="Ngưỡng khớp ô bảng — Table Cell Match (%)"
+                    hint="Độ tương đồng RapidFuzz tối thiểu để tính 1 ô bảng đọc chính xác (mặc định: 88%)."
+                  >
+                    <input
+                      type="number"
+                      min={50}
+                      max={100}
+                      className="ts-input w-40 font-mono text-xs"
+                      value={val('parsing_table_cell_match_threshold', '88')}
+                      onChange={(e) => setKey('parsing_table_cell_match_threshold', e.target.value)}
+                    />
+                  </FieldRow>
+                </div>
+
+                <div className="border-t border-[#ededeb] pt-4 space-y-3">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
+                    Ngưỡng KPI đạt chuẩn (Overview &amp; Khuyến nghị)
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <FieldRow label="Text Completeness (0–1)" hint="Mặc định: 0.80">
+                      <input
+                        type="number"
+                        step="0.05"
+                        min={0}
+                        max={1}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('target_text_completeness', '0.80')}
+                        onChange={(e) => setKey('target_text_completeness', e.target.value)}
+                      />
+                    </FieldRow>
+                    <FieldRow label="Table Accuracy (0–1)" hint="Mặc định: 0.75">
+                      <input
+                        type="number"
+                        step="0.05"
+                        min={0}
+                        max={1}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('target_table_accuracy', '0.75')}
+                        onChange={(e) => setKey('target_table_accuracy', e.target.value)}
+                      />
+                    </FieldRow>
+                    <FieldRow label="Reading Order (0–1)" hint="Mặc định: 0.80">
+                      <input
+                        type="number"
+                        step="0.05"
+                        min={0}
+                        max={1}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('target_reading_order', '0.80')}
+                        onChange={(e) => setKey('target_reading_order', e.target.value)}
+                      />
+                    </FieldRow>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {section === 'step3' && (
+              <div className="space-y-5">
+                <div className="space-y-3">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
+                    Lấy mẫu &amp; Kích thước chunk (C8)
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <FieldRow label="Số chunk mẫu / tài liệu" hint="0 = lấy tất cả. Mặc định: 5">
+                      <input
+                        type="number"
+                        min={0}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('chunk_sample_per_doc', '5')}
+                        onChange={(e) => setKey('chunk_sample_per_doc', e.target.value)}
+                      />
+                    </FieldRow>
+                    <FieldRow label="Độ dài tối thiểu (ký tự)" hint="Dưới ngưỡng → TOO_SHORT">
+                      <input
+                        type="number"
+                        min={0}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('min_chunk_chars', '50')}
+                        onChange={(e) => setKey('min_chunk_chars', e.target.value)}
+                      />
+                    </FieldRow>
+                    <FieldRow label="Độ dài tối đa (ký tự)" hint="Vượt ngưỡng → TOO_LONG">
+                      <input
+                        type="number"
+                        min={100}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('max_chunk_chars', '2600')}
+                        onChange={(e) => setKey('max_chunk_chars', e.target.value)}
+                      />
+                    </FieldRow>
+                  </div>
+                  <label className="flex items-center gap-2 text-xs text-[#27272a] cursor-pointer pt-1">
+                    <input
+                      type="checkbox"
+                      checked={val('exempt_intact_table_from_max_chars', 'true') === 'true'}
+                      onChange={(e) =>
+                        setKey('exempt_intact_table_from_max_chars', e.target.checked ? 'true' : 'false')
+                      }
+                      className="rounded border-[#d4d4d8]"
+                    />
+                    Miễn lỗi <span className="font-mono text-[11px]">TOO_LONG</span> cho bảng HTML nguyên vẹn (&lt;table&gt;...&lt;/table&gt;)
+                  </label>
+                </div>
+
+                <div className="border-t border-[#ededeb] pt-4 space-y-3">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
+                    Rule phát hiện trùng lặp (C6/C7) &amp; nhiễu (C4)
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <FieldRow label="Ngưỡng trùng nội dung (0–1)" hint="Mặc định: 0.85">
+                      <input
+                        type="number"
+                        step="0.05"
+                        min={0.5}
+                        max={1}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('chunk_dup_threshold', '0.85')}
+                        onChange={(e) => setKey('chunk_dup_threshold', e.target.value)}
+                      />
+                    </FieldRow>
+                    <FieldRow label="Trùng biên liền kề (%)" hint="C6 overlap. Mặc định: 88">
+                      <input
+                        type="number"
+                        min={50}
+                        max={100}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('chunk_adj_overlap_threshold', '88')}
+                        onChange={(e) => setKey('chunk_adj_overlap_threshold', e.target.value)}
+                      />
+                    </FieldRow>
+                    <FieldRow label="Số lần lặp dòng → Nhiễu C4" hint="Header/footer. Mặc định: 3">
+                      <input
+                        type="number"
+                        min={2}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('chunk_repeated_line_min', '3')}
+                        onChange={(e) => setKey('chunk_repeated_line_min', e.target.value)}
+                      />
+                    </FieldRow>
+                  </div>
+                </div>
+
+                <div className="border-t border-[#ededeb] pt-4 space-y-3">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
+                    Ngưỡng KPI đạt chuẩn
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <FieldRow label="Chunk Integrity (0–1)" hint="Mặc định: 0.80">
+                      <input
+                        type="number"
+                        step="0.05"
+                        min={0}
+                        max={1}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('target_chunk_integrity', '0.80')}
+                        onChange={(e) => setKey('target_chunk_integrity', e.target.value)}
+                      />
+                    </FieldRow>
+                    <FieldRow label="Noise Rate tối đa (0–1)" hint="Càng thấp càng tốt. Mặc định: 0.15">
+                      <input
+                        type="number"
+                        step="0.05"
+                        min={0}
+                        max={1}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('max_chunk_noise_rate', '0.15')}
+                        onChange={(e) => setKey('max_chunk_noise_rate', e.target.value)}
+                      />
+                    </FieldRow>
+                    <FieldRow label="Size Compliance (0–1)" hint="Mặc định: 0.85">
+                      <input
+                        type="number"
+                        step="0.05"
+                        min={0}
+                        max={1}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('target_valid_size_rate', '0.85')}
+                        onChange={(e) => setKey('target_valid_size_rate', e.target.value)}
+                      />
+                    </FieldRow>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {section === 'step4' && (
+              <div className="space-y-5">
+                <div className="space-y-3">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
+                    Tham số mặc định khi chạy Retrieval
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <FieldRow label="Top-K mặc định" hint="Mặc định: 10">
+                      <input
+                        type="number"
+                        min={1}
+                        max={50}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('default_top_k', '10')}
+                        onChange={(e) => setKey('default_top_k', e.target.value)}
+                      />
+                    </FieldRow>
+                    <FieldRow label="Similarity Threshold (0–1)" hint="Mặc định: 0.2">
+                      <input
+                        type="number"
+                        step="0.05"
+                        min={0}
+                        max={1}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('default_similarity_threshold', '0.2')}
+                        onChange={(e) => setKey('default_similarity_threshold', e.target.value)}
+                      />
+                    </FieldRow>
+                    <FieldRow label="Vector Weight (0–1)" hint="Mặc định: 0.3">
+                      <input
+                        type="number"
+                        step="0.05"
+                        min={0}
+                        max={1}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('default_vector_similarity_weight', '0.3')}
+                        onChange={(e) => setKey('default_vector_similarity_weight', e.target.value)}
+                      />
+                    </FieldRow>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <FieldRow label="Rerank Model ID mặc định" hint="Để trống nếu không dùng Rerank">
+                      <input
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('default_rerank_id', '')}
+                        onChange={(e) => setKey('default_rerank_id', e.target.value)}
+                        placeholder="VD: BAAI/bge-reranker-v2-m3"
+                      />
+                    </FieldRow>
+                    <FieldRow label="Số câu Golden sinh tự động / file" hint="Mặc định: 3">
+                      <input
+                        type="number"
+                        min={1}
+                        max={15}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('golden_gen_per_doc', '3')}
+                        onChange={(e) => setKey('golden_gen_per_doc', e.target.value)}
+                      />
+                    </FieldRow>
+                  </div>
+                  <label className="flex items-center gap-2 text-xs text-[#27272a] cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={val('default_keyword_enabled', 'true') === 'true'}
+                      onChange={(e) =>
+                        setKey('default_keyword_enabled', e.target.checked ? 'true' : 'false')
+                      }
+                      className="rounded border-[#d4d4d8]"
+                    />
+                    Bật Keyword Search (Hybrid) mặc định
+                  </label>
+                </div>
+
+                <div className="border-t border-[#ededeb] pt-4 space-y-3">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
+                    Ngưỡng KPI đạt chuẩn
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <FieldRow label="Contextual Precision (0–1)" hint="Mặc định: 0.65">
+                      <input
+                        type="number"
+                        step="0.05"
+                        min={0}
+                        max={1}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('target_contextual_precision', '0.65')}
+                        onChange={(e) => setKey('target_contextual_precision', e.target.value)}
+                      />
+                    </FieldRow>
+                    <FieldRow label="Context Coverage (0–1)" hint="Mặc định: 0.70">
+                      <input
+                        type="number"
+                        step="0.05"
+                        min={0}
+                        max={1}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('target_context_coverage', '0.70')}
+                        onChange={(e) => setKey('target_context_coverage', e.target.value)}
+                      />
+                    </FieldRow>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {connMsg.text && (
+              <div
+                className={`px-3 py-2 text-xs rounded-[4px] border ${
+                  connMsg.ok
+                    ? 'bg-[#03aa5c]/10 border-[#03aa5c]/30 text-[#027a42]'
+                    : 'bg-red-50 border-red-200 text-red-700'
+                }`}
+              >
+                {connMsg.text}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="px-6 py-3.5 border-t border-[#dedede] bg-[#f7f7f6] flex items-center justify-end gap-2 shrink-0">
+          <button type="button" onClick={onClose} className="ts-btn-secondary text-xs">
+            Đóng
+          </button>
+          <button
+            type="button"
+            onClick={async () => {
+              await onSave();
+              onClose();
+            }}
+            className="ts-btn-primary text-xs"
+          >
+            Lưu cài đặt
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -2,7 +2,7 @@ import json
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 
-from database import get_db, utc_now
+from database import get_db, get_float_setting, utc_now
 from exporter import export_run_workbook
 from metrics import compute_contextual_precision, detect_chunk_rule_flags
 
@@ -112,21 +112,21 @@ def get_run_diagnostics(run_id: int):
 
     # Layer 1: Parsing diagnostics
     if p["rated_units"] > 0:
-        if p["table_accuracy"] < 0.75:
+        if p["table_accuracy"] < get_float_setting("target_table_accuracy", 0.75):
             recommendations.append({
                 "layer": "PARSING",
                 "severity": "high",
                 "title": f"Độ chính xác bảng biểu thấp ({round(p['table_accuracy'] * 100)}%)",
                 "action": "Trong Cấu hình Parse → Parser & OCR: bật DeepDOC, tăng Table Context Size (256–512) hoặc đổi Chunk Method sang 'table' cho tài liệu nhiều bảng.",
             })
-        if p["text_completeness"] < 0.8:
+        if p["text_completeness"] < get_float_setting("target_text_completeness", 0.80):
             recommendations.append({
                 "layer": "PARSING",
                 "severity": "high",
                 "title": f"Chất lượng đọc chữ / OCR chưa đạt ({round(p['text_completeness'] * 100)}%)",
                 "action": "Bật 'Enable Vision Enhancement' trong Cấu hình Parse hoặc chuyển PDF Parser sang MinerU đối với tài liệu scan / mờ.",
             })
-        if p["reading_order_accuracy"] < 0.8:
+        if p["reading_order_accuracy"] < get_float_setting("target_reading_order", 0.80):
             recommendations.append({
                 "layer": "PARSING",
                 "severity": "medium",
@@ -136,21 +136,21 @@ def get_run_diagnostics(run_id: int):
 
     # Layer 2: Chunking diagnostics
     if c["sampled_total"] > 0:
-        if c["chunk_integrity"] < 0.8:
+        if c["chunk_integrity"] < get_float_setting("target_chunk_integrity", 0.80):
             recommendations.append({
                 "layer": "CHUNKING",
                 "severity": "high",
                 "title": f"Tính toàn vẹn chunk thấp ({round(c['chunk_integrity'] * 100)}%)",
                 "action": "Tăng Chunk Token Size (VD: 512 → 768/1024) hoặc tăng Overlapped Percent lên 10–15% để tránh cắt đứt câu/bảng.",
             })
-        if c["noise_rate"] > 0.15:
+        if c["noise_rate"] > get_float_setting("max_chunk_noise_rate", 0.15):
             recommendations.append({
                 "layer": "CHUNKING",
                 "severity": "medium",
                 "title": f"Tỷ lệ chunk dính nhiễu cao ({round(c['noise_rate'] * 100)}%)",
                 "action": "Kiểm tra header/footer lặp lại trong PDF và điều chỉnh Delimiters trong Cấu hình Parse → Chunker.",
             })
-        if c["valid_size_rate"] < 0.85:
+        if c["valid_size_rate"] < get_float_setting("target_valid_size_rate", 0.85):
             recommendations.append({
                 "layer": "CHUNKING",
                 "severity": "medium",
@@ -160,14 +160,14 @@ def get_run_diagnostics(run_id: int):
 
     # Layer 3: Retrieval diagnostics
     if ret_summary and ret_summary["total_testcases"] > 0:
-        if ret_summary["avg_contextual_precision"] < 0.65:
+        if ret_summary["avg_contextual_precision"] < get_float_setting("target_contextual_precision", 0.65):
             recommendations.append({
                 "layer": "RETRIEVAL",
                 "severity": "high",
                 "title": f"Contextual Precision thấp ({round(ret_summary['avg_contextual_precision'] * 100)}%)",
                 "action": "Bật Rerank model, tăng trọng số Hybrid Search (vector_similarity_weight ~ 0.3–0.5) hoặc giảm similarity_threshold xuống 0.15.",
             })
-        if ret_summary["avg_context_coverage"] < 0.7:
+        if ret_summary["avg_context_coverage"] < get_float_setting("target_context_coverage", 0.70):
             recommendations.append({
                 "layer": "RETRIEVAL",
                 "severity": "medium",

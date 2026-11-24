@@ -6,7 +6,7 @@ from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Uploa
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from database import UPLOAD_DIR, get_current_account_key, get_db, get_setting, repair_chunk_document_links, utc_now
+from database import UPLOAD_DIR, get_current_account_key, get_db, get_float_setting, get_setting, repair_chunk_document_links, utc_now
 from ragflow_client import RAGFlowClient, RAGFlowError
 from metrics import detect_chunk_rule_flags
 from unit_sync import ensure_units_for_document_async
@@ -618,12 +618,13 @@ async def get_run_parse_status(run_id: int):
             else:
                 local_doc_id = local_doc["id"]
 
+            slow_threshold = get_float_setting("slow_parse_threshold_sec", 180.0)
             anomalies = []
             if r_status == "FAIL":
                 anomalies.append("PARSE_FAILED")
             if r_status == "DONE" and meta["chunk_count"] == 0:
                 anomalies.append("ZERO_CHUNKS")
-            if meta["duration"] > 180:
+            if slow_threshold > 0 and meta["duration"] > slow_threshold:
                 anomalies.append("SLOW_PARSE")
 
             conn.execute(
@@ -843,12 +844,13 @@ async def sync_run_from_ragflow(
                 local_doc_id = cur.lastrowid
                 local_doc["id"] = local_doc_id
 
+            slow_threshold = get_float_setting("slow_parse_threshold_sec", 180.0)
             anomalies = []
             if meta["status"] == "FAIL":
                 anomalies.append("PARSE_FAILED")
             if meta["status"] == "DONE" and meta["chunk_count"] == 0:
                 anomalies.append("ZERO_CHUNKS")
-            if meta["duration"] > 180:
+            if slow_threshold > 0 and meta["duration"] > slow_threshold:
                 anomalies.append("SLOW_PARSE")
 
             conn.execute(

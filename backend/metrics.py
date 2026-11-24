@@ -6,10 +6,16 @@ from rapidfuzz import fuzz
 
 
 PARSING_ERROR_CATALOG = [
-    {"code": "TEXT", "group": "Text Extraction", "name": "Thiếu chữ / Lỗi dấu & OCR", "severity": "Nghiêm trọng", "metric": "Text Extraction"},
-    {"code": "TABLE", "group": "Tabular Data", "name": "Vỡ cấu trúc bảng / Sai số liệu", "severity": "Nghiêm trọng", "metric": "Table Accuracy"},
-    {"code": "ORDER", "group": "Reading Order", "name": "Sai thứ tự đọc / Đảo cột", "severity": "Trung bình", "metric": "Reading Order"},
-    {"code": "LAYOUT", "group": "Layout & Media", "name": "Mất nội dung ảnh / Sơ đồ / Scan", "severity": "Nghiêm trọng", "metric": "Layout Accuracy"},
+    {"code": "P1", "group": "Mất nội dung", "name": "Mất đoạn văn bản", "severity": "Nghiêm trọng", "metric": "Text Completeness"},
+    {"code": "P2", "group": "Mất nội dung", "name": "Mất nội dung ảnh / sơ đồ / scan", "severity": "Nghiêm trọng", "metric": "Layout Accuracy"},
+    {"code": "P3", "group": "Sai thứ tự", "name": "Trộn dòng / sai thứ tự đọc / đảo nghĩa", "severity": "Nghiêm trọng", "metric": "Reading Order"},
+    {"code": "P4", "group": "Lỗi ký tự", "name": "Mất dấu tiếng Việt / lỗi ký tự", "severity": "Trung bình", "metric": "Character Error"},
+    {"code": "P5", "group": "Lỗi ký tự", "name": "Ký tự rác / hỏng font", "severity": "Trung bình", "metric": "Character Error"},
+    {"code": "P6", "group": "Lỗi ký tự", "name": "Lỗi OCR (tài liệu scan/ảnh)", "severity": "Trung bình", "metric": "Character Error"},
+    {"code": "P7", "group": "Mất cấu trúc", "name": "Mất cấu trúc heading", "severity": "Trung bình", "metric": "Layout Accuracy"},
+    {"code": "P8", "group": "Mất cấu trúc", "name": "Mất cấu trúc danh sách (bullet/numbering)", "severity": "Trung bình", "metric": "Layout Accuracy"},
+    {"code": "P9", "group": "Vỡ bảng", "name": "Vỡ cấu trúc bảng (mất hàng/cột/ô gộp)", "severity": "Nghiêm trọng", "metric": "Table Accuracy"},
+    {"code": "P10", "group": "Mất nội dung", "name": "Thiếu / sai số liệu trong bảng", "severity": "Nghiêm trọng", "metric": "Content Fidelity"},
 ]
 
 CHUNKING_ERROR_CATALOG = [
@@ -55,6 +61,38 @@ def _html_table_to_pipe(text: str) -> str:
     t = re.sub(r"<[^>]+>", " ", t)
     lines = [re.sub(r"[ \t]+", " ", ln).strip(" |") for ln in t.splitlines()]
     return "\n".join(ln for ln in lines if ln)
+
+
+def _extract_table_cells(text: str) -> List[str]:
+    """Extract normalized non-empty table cells from either pipe-delimited or HTML table text."""
+    pipe_txt = _html_table_to_pipe(text)
+    cells: List[str] = []
+    for ln in nfc(pipe_txt).splitlines():
+        for raw_cell in ln.split("|"):
+            c = normalize_text(raw_cell)
+            if c:
+                cells.append(c)
+    return cells
+
+
+def _compute_table_cell_recall(source_text: str, candidate_text: str) -> float:
+    """
+    Format-agnostic table evaluation: measures what % of source table cells are faithfully
+    preserved in the parsed output (tolerant to colspan/rowspan/HTML-to-pipe formatting differences).
+    """
+    src_cells = _extract_table_cells(source_text)
+    if not src_cells:
+        return 0.0
+    cand_norm = normalize_text(_html_table_to_pipe(candidate_text))
+    if not cand_norm:
+        return 0.0
+    matched = 0
+    for cell in src_cells:
+        if cell in cand_norm:
+            matched += 1
+        elif len(cell) >= 4 and float(fuzz.partial_ratio(cell, cand_norm)) >= 88.0:
+            matched += 1
+    return round((matched / len(src_cells)) * 100.0, 2)
 
 
 def strip_diacritics(text: str) -> str:
@@ -128,16 +166,16 @@ def analyze_parsing_risks(
     exc_c = collapse_whitespace(excerpt)
 
     if not exc_c:
-        code = "LAYOUT" if unit_type in ("image", "diagram") or "scan" in (format_group or "").lower() else "TEXT"
+        code = "P2" if unit_type in ("image", "diagram") or "scan" in (format_group or "").lower() else "P1"
         flags.append({"code": "MISSING_CONTENT", "label": f"Không tìm thấy nội dung khớp ({code})", "severity": "Nghiêm trọng"})
         return flags, [code]
 
-    # Garbage / corrupted characters -> TEXT
+    # P5: Garbage / corrupted characters
     if re.search(r"[\ufffd\x00-\x08\x0b\x0c\x0e-\x1f]", exc_c):
-        flags.append({"code": "GARBAGE_CHAR", "label": "Phát hiện ký tự rác / lỗi mã hóa (TEXT)", "severity": "Trung bình"})
-        add_code("TEXT")
+        flags.append({"code": "GARBAGE_CHAR", "label": "Phát hiện ký tự rác / lỗi mã hóa (P5)", "severity": "Trung bình"})
+        add_code("P5")
 
-    # Vietnamese diacritic loss/corruption -> TEXT
+    # P4: Vietnamese diacritic loss/corruption
     has_diacritic_issue = False
     if src_c.lower() != exc_c.lower():
         acc_sim = float(fuzz.ratio(src_c.lower(), exc_c.lower()))
@@ -146,36 +184,36 @@ def analyze_parsing_risks(
             has_diacritic_issue = True
             flags.append({
                 "code": "DIACRITIC_LOSS",
-                "label": "Nghi mất dấu / sai dấu tiếng Việt (TEXT)",
+                "label": "Nghi mất dấu / sai dấu tiếng Việt (P4)",
                 "severity": "Trung bình",
             })
-            add_code("TEXT")
+            add_code("P4")
 
     # P6: OCR error for scan/image format group
     if ("scan" in (format_group or "").lower() or "ảnh" in (format_group or "").lower()) and (
         has_diacritic_issue or text_sim < 90.0
     ):
-        add_code("LAYOUT")
+        add_code("P6")
 
-    # ORDER: Scrambled reading order (high bag-of-words overlap, low sequential ratio)
+    # P3: Scrambled reading order (high bag-of-words overlap, low sequential ratio)
     if text_sim < 78.0:
         tok_set = float(fuzz.token_set_ratio(src_c.lower(), exc_c.lower()))
         if tok_set >= 85.0 and (tok_set - text_sim) >= 12.0:
             flags.append({
                 "code": "READING_ORDER_SCRAMBLED",
-                "label": "Nghi đảo thứ tự dòng / trộn cột (ORDER)",
+                "label": "Nghi đảo thứ tự dòng / trộn cột (P3)",
                 "severity": "Nghiêm trọng",
             })
-            add_code("ORDER")
+            add_code("P3")
 
-    # TABLE / TEXT: Critical numeric / operator mismatch
+    # P10 / P3: Critical numeric / operator mismatch
     src_nums = _extract_num_multiset(src_c)
     exc_nums = _extract_num_multiset(exc_c)
     if src_nums and src_nums != exc_nums:
         missing_nums = [k for k, v in src_nums.items() if exc_nums.get(k, 0) < v]
         if missing_nums:
             sample = ", ".join(missing_nums[:4])
-            err_code = "TABLE" if unit_type == "table" else "TEXT"
+            err_code = "P10" if unit_type == "table" else "P3"
             flags.append({
                 "code": "CRITICAL_NUM_DIFF",
                 "label": f"Lệch / mất số liệu: {sample} ({err_code})",
@@ -183,52 +221,47 @@ def analyze_parsing_risks(
             })
             add_code(err_code)
 
-    # TEXT: Critical negation / polarity flip
+    # P3: Critical negation / polarity flip
     src_low = src_c.lower()
     exc_low = exc_c.lower()
     diff_terms = [term for term in _NEGATION_TERMS if src_low.count(term) != exc_low.count(term)]
     if diff_terms:
         flags.append({
             "code": "CRITICAL_NEGATION_DIFF",
-            "label": f"Lệch từ phủ định/đối lập: {', '.join(diff_terms[:3])} (TEXT)",
+            "label": f"Lệch từ phủ định/đối lập: {', '.join(diff_terms[:3])} (P3)",
             "severity": "Nghiêm trọng",
         })
-        add_code("TEXT")
+        add_code("P3")
 
-    # TABLE: Table structure broken
+    # P9: Table structure broken (cell-level recall, tolerant to colspan/rowspan formatting)
     if unit_type == "table":
-        src_rows = [ln for ln in nfc(source_text).splitlines() if ln.strip()]
-        exc_rows = [ln for ln in nfc(excerpt).splitlines() if ln.strip()]
-        src_pipes = source_text.count("|")
-        exc_pipes = excerpt.count("|")
-        row_mismatch = len(src_rows) >= 2 and abs(len(src_rows) - len(exc_rows)) >= max(2, len(src_rows) // 3)
-        pipe_mismatch = src_pipes >= 3 and abs(src_pipes - exc_pipes) >= max(3, src_pipes // 3)
-        if text_sim < 85.0 or row_mismatch or pipe_mismatch:
+        cell_recall = _compute_table_cell_recall(source_text, excerpt)
+        if cell_recall < 80.0 and text_sim < 85.0:
             flags.append({
                 "code": "TABLE_BROKEN",
-                "label": "Bảng nghi bị vỡ hàng/cột (TABLE)",
-                "severity": "Trung bình",
+                "label": f"Bảng nghi bị vỡ/thiếu ô (Cell recall {cell_recall:.0f}%) (P9)",
+                "severity": "Nghiêm trọng",
             })
-            add_code("TABLE")
+            add_code("P9")
     else:
         src_lines = [ln.strip() for ln in nfc(source_text).splitlines() if ln.strip()]
         exc_lines = [ln.strip() for ln in nfc(excerpt).splitlines() if ln.strip()]
-        # Heading merged into body paragraph -> ORDER
+        # P7: Heading merged into body paragraph
         if len(src_lines) >= 2 and _HEADING_LINE_RE.match(src_lines[0]) and len(src_lines[0]) <= 110:
             if len(exc_lines) == 1 and len(exc_lines[0]) > len(src_lines[0]) + 25:
-                add_code("ORDER")
-        # List merged -> ORDER
+                add_code("P7")
+        # P8: List merged
         src_list_cnt = sum(1 for ln in src_lines if _LIST_LINE_RE.match(ln))
         exc_list_cnt = sum(1 for ln in exc_lines if _LIST_LINE_RE.match(ln))
         if src_list_cnt >= 2 and exc_list_cnt < src_list_cnt:
-            add_code("ORDER")
+            add_code("P8")
 
-    # Severe missing content -> LAYOUT / TEXT
+    # Severe missing content -> P2 / P1
     if text_sim < 72.0:
         if unit_type in ("image", "diagram") or "scan" in (format_group or "").lower():
-            add_code("LAYOUT")
+            add_code("P2")
         elif unit_type != "table":
-            add_code("TEXT")
+            add_code("P1")
 
     return flags, suggested_codes
 
@@ -269,7 +302,7 @@ def detect_chunk_rule_flags(
 
 
 def detect_duplicates_classified(
-    chunks: List[Dict[str, Any]], threshold: float = 0.85
+    chunks: List[Dict[str, Any]], threshold: float = 0.85, adj_overlap_threshold: float = 88.0
 ) -> Tuple[set, set]:
     """
     Returns (adjacent_dup_ids [C6], far_dup_ids [C7]) using RapidFuzz C++:
@@ -297,7 +330,7 @@ def detect_duplicates_classified(
             if is_adj:
                 tail_i = txt_i[-220:]
                 head_j = txt_j[:260]
-                if len(tail_i) >= 60 and fuzz.partial_ratio(tail_i, head_j, score_cutoff=88.0) >= 88.0:
+                if len(tail_i) >= 60 and fuzz.partial_ratio(tail_i, head_j, score_cutoff=adj_overlap_threshold) >= adj_overlap_threshold:
                     adjacent_dups.add(id_i)
                     adjacent_dups.add(id_j)
                     continue
@@ -329,6 +362,7 @@ def analyze_chunk_rules(
     is_far_dup: bool = False,
     min_chars: int = 50,
     max_chars: int = 2600,
+    exempt_intact_table: bool = True,
 ) -> Dict[str, Any]:
     """
     0-LLM Chunking QC rule engine aligned with Phụ lục A (6 metrics) & Phụ lục B (C1..C8).
@@ -361,7 +395,7 @@ def analyze_chunk_rules(
 
     if 0 < n < min_chars:
         add("C8", "TOO_SHORT")
-    elif n > max_chars and not is_intact_table:
+    elif n > max_chars and not (exempt_intact_table and is_intact_table):
         add("C8", "TOO_LONG")
     noise_patterns = [
         r"\btrang\s+\d+\s*/\s*\d+\b",
@@ -475,6 +509,11 @@ def extract_best_aligned_span(
     src_collapsed = collapse_whitespace(src_raw)
     exc_collapsed = collapse_whitespace(excerpt)
     text_sim = round(float(fuzz.ratio(src_collapsed, exc_collapsed)), 2)
+
+    # For tables, use cell-level recall so HTML colspan/rowspan formatting doesn't cause false FAILs
+    if unit_type == "table":
+        cell_recall = _compute_table_cell_recall(src_raw, excerpt)
+        text_sim = max(text_sim, cell_recall)
 
     has_text_diff = src_collapsed != exc_collapsed
     has_format_diff = (not has_text_diff) and (src_raw != excerpt)
@@ -670,3 +709,86 @@ def compute_context_coverage(reference_context: str, retrieved_chunks: List[Dict
         txt = ch.get("content") or ch.get("content_with_weight") or ""
         union_tokens |= {t for t in re.findall(r"\w+", normalize_text(txt)) if len(t) >= 2}
     return round(len(ref_tokens & union_tokens) / len(ref_tokens), 4)
+
+
+def compute_parsing_metrics(rows: List[Any]) -> Dict[str, Any]:
+    """
+    Single Source of Truth for Parsing metrics across parsing.py and analytics.py.
+    - text_completeness: text units passing without text/char/structure errors
+    - table_accuracy: table units passing without P9/P10/TABLE (None if no table units)
+    - character_error_rate: ONLY P4/P5/P6 or char_error == 1 (never P1/P7/P8!)
+    - layout_accuracy: ONLY image/diagram units (None if no image/diagram units — never fake 100%)
+    - reading_order_accuracy: all rated units without P3/ORDER
+    - content_fidelity: all rated units without P3/P10/FIDELITY
+    - parsing_score: weighted composite over available metrics (auto re-normalized)
+    """
+    import json
+
+    rated = [r for r in rows if r["verdict"] != "UNRATED"]
+    text_units = [r for r in rated if r["unit_type"] not in ("table", "image", "diagram")]
+    table_units = [r for r in rated if r["unit_type"] == "table"]
+    layout_units = [r for r in rated if r["unit_type"] in ("image", "diagram")]
+
+    text_ok = 0
+    table_ok = 0
+    layout_ok = 0
+    order_ok = 0
+    fidelity_ok = 0
+    char_err = 0
+
+    for r in rated:
+        raw_codes = r["error_codes"]
+        codes = set(json.loads(raw_codes) if isinstance(raw_codes, str) else (raw_codes or []))
+        is_char_err = bool(codes & {"P4", "P5", "P6"}) or r["char_error"] == 1
+        has_text_err = bool(codes & {"TEXT", "P1", "P4", "P5", "P6", "P7", "P8"}) or r["char_error"] == 1
+        has_table_err = bool(codes & {"TABLE", "P9", "P10"})
+        has_order_err = bool(codes & {"ORDER", "P3"})
+        has_layout_err = bool(codes & {"LAYOUT", "P2"})
+        has_fidelity_err = bool(codes & {"FIDELITY", "P3", "P10"})
+
+        if is_char_err:
+            char_err += 1
+        if r["unit_type"] not in ("table", "image", "diagram") and not has_text_err and r["verdict"] == "PASS":
+            text_ok += 1
+        if r["unit_type"] == "table" and not has_table_err and r["verdict"] == "PASS":
+            table_ok += 1
+        if r["unit_type"] in ("image", "diagram") and not has_layout_err and r["verdict"] == "PASS":
+            layout_ok += 1
+        if not has_order_err:
+            order_ok += 1
+        if not has_fidelity_err:
+            fidelity_ok += 1
+
+    text_completeness = round(text_ok / len(text_units), 4) if text_units else None
+    table_accuracy = round(table_ok / len(table_units), 4) if table_units else None
+    character_error_rate = round(char_err / len(rated), 4) if rated else 0.0
+    layout_accuracy = round(layout_ok / len(layout_units), 4) if layout_units else None
+    reading_order_accuracy = round(order_ok / len(rated), 4) if rated else None
+    content_fidelity = round(fidelity_ok / len(rated), 4) if rated else None
+
+    # Dynamically re-normalize weights over available metrics so N/A categories don't distort score
+    weighted_terms = [
+        (0.25, text_completeness),
+        (0.20, content_fidelity),
+        (0.20, table_accuracy),
+        (0.15, (1.0 - character_error_rate) if rated else None),
+        (0.10, layout_accuracy),
+        (0.10, reading_order_accuracy),
+    ]
+    avail = [(w, v) for w, v in weighted_terms if v is not None]
+    w_sum = sum(w for w, _ in avail)
+    parsing_score = round(sum(w * v for w, v in avail) / w_sum, 4) if w_sum > 0 else 0.0
+
+    return {
+        "total_units": len(rows),
+        "rated_units": len(rated),
+        "text_completeness": text_completeness if text_completeness is not None else 0.0,
+        "table_accuracy": table_accuracy if table_accuracy is not None else 0.0,
+        "table_total": len(table_units),
+        "character_error_rate": character_error_rate,
+        "content_fidelity": content_fidelity if content_fidelity is not None else 0.0,
+        "layout_accuracy": layout_accuracy,
+        "layout_total": len(layout_units),
+        "reading_order_accuracy": reading_order_accuracy if reading_order_accuracy is not None else 0.0,
+        "parsing_score": parsing_score,
+    }
