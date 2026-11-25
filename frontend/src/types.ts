@@ -145,6 +145,10 @@ export interface RetrievalRun {
   vector_similarity_weight: number;
   rerank_id: string;
   keyword_enabled: number;
+  judge_engine?: string;
+  judge_duration_ms?: number;
+  judge_call_count?: number;
+  judge_error_count?: number;
   created_at: string;
 }
 
@@ -159,7 +163,7 @@ export interface RetrievalHit {
   vector_similarity: number;
   term_similarity: number;
   relevant: number | null;
-  relevancy_source: 'MANUAL' | 'CACHED' | 'LLM_DRAFT' | 'UNRATED';
+  relevancy_source: 'MANUAL' | 'CACHED' | 'LLM_DRAFT' | 'JEV_DRAFT' | 'RULE' | 'UNRATED';
   reason: string;
 }
 

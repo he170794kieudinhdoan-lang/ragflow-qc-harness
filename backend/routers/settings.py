@@ -3,7 +3,13 @@ from pydantic import BaseModel
 from typing import Any, Dict
 from database import DEFAULT_SETTINGS, get_all_settings, set_setting, get_setting, get_db
 from ragflow_client import RAGFlowClient, RAGFlowError
-from llm_client import LLMError, test_llm_connection
+from llm_client import (
+    LLMError,
+    resolve_systemone_credentials,
+    systemone_requires_key,
+    test_llm_connection,
+    test_system_one_connection,
+)
 from metrics import PARSING_ERROR_CATALOG, CHUNKING_ERROR_CATALOG, RETRIEVAL_ERROR_CATALOG
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -21,6 +27,9 @@ def read_settings():
     masked["has_ragflow_key"] = bool(data.get("ragflow_api_key", "").strip())
     masked["has_llm_key"] = bool(data.get("llm_api_key", "").strip())
     masked["has_vision_key"] = bool(data.get("vision_api_key", "").strip())
+    _, resolved_sys1_key, _, _ = resolve_systemone_credentials(get_setting)
+    sys1_url = data.get("systemone_base_url", "").strip()
+    masked["has_systemone_key"] = bool(resolved_sys1_key) or (bool(sys1_url) and not systemone_requires_key(sys1_url))
     return {
         "settings": masked,
         "defaults": DEFAULT_SETTINGS,
@@ -38,7 +47,7 @@ def update_settings(payload: SettingsPayload):
     old_base_url = get_setting("ragflow_base_url", "").strip().rstrip("/")
 
     for k, v in payload.settings.items():
-        if k in ("has_ragflow_key", "has_llm_key", "has_vision_key"):
+        if k in ("has_ragflow_key", "has_llm_key", "has_vision_key", "has_systemone_key"):
             continue
         value = str(v)
         if k == "ragflow_base_url":
@@ -102,3 +111,19 @@ async def test_vision_endpoint():
         raise HTTPException(status_code=400, detail=f"Lỗi kết nối Vision LLM: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Không gọi được tới Vision LLM: {e}")
+
+
+@router.post("/test-systemone")
+async def test_systemone_endpoint():
+    base_url, api_key, model, _ = resolve_systemone_credentials(get_setting)
+    if not base_url or not model or (systemone_requires_key(base_url) and not api_key):
+        raise HTTPException(
+            status_code=400,
+            detail="Vui lòng cấu hình System One Base URL, Model (và API Key nếu dùng Vercel/TypeSafe Cloud).",
+        )
+    try:
+        return await test_system_one_connection(base_url, api_key, model)
+    except LLMError as e:
+        raise HTTPException(status_code=400, detail=f"Lỗi kết nối Jev System One: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Không gọi được tới Jev System One: {e}")

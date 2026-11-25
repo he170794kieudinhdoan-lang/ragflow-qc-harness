@@ -381,6 +381,84 @@ export const CompareLabPage: React.FC<Props> = ({ activeRun }) => {
               </div>
             </div>
 
+            {diff.performance && (
+              <div className="border border-[#e4e4e2] rounded-lg bg-white overflow-hidden shadow-2xs">
+                <div className="px-5 py-3 border-b border-[#e4e4e2] bg-[#fafaf9] flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <div className="ts-eyebrow">SO SÁNH HIỆU SUẤT JUDGE (A vs B)</div>
+                    <div className="text-xs text-[#71717a] mt-0.5">
+                      Đo tốc độ chấm, số lỗi fallback và tỷ lệ đồng thuận trên từng chunk cùng testcase
+                    </div>
+                  </div>
+                  {diff.performance.hit_agreement_rate !== null && diff.performance.hit_agreement_rate !== undefined && (
+                    <span className="font-mono text-xs px-2.5 py-1 rounded-full bg-[#f2fbf6] text-[#027a42] border border-[#03aa5c]/35 font-semibold">
+                      Đồng thuận: {(diff.performance.hit_agreement_rate * 100).toFixed(1)}% ({diff.performance.agreed_hits}/{diff.performance.compared_hits} hits)
+                    </span>
+                  )}
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-[#ededeb] text-xs">
+                  {[
+                    { tag: '[A] Bản chuẩn', meta: diff.baseline?.meta, perf: diff.performance.baseline },
+                    { tag: '[B] Bản mới', meta: diff.candidate?.meta, perf: diff.performance.candidate },
+                  ].map((item, idx) => (
+                    <div key={idx} className="p-4 space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-semibold text-[#18181b] truncate">
+                          {item.tag}: {item.meta?.name}
+                        </span>
+                        <span className="font-mono text-[10px] uppercase px-2 py-0.5 rounded bg-[#f4f4f2] border border-[#dedede] text-[#18181b]">
+                          {item.perf?.judge_engine || 'llm'}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2 font-mono text-[11px] pt-1">
+                        <div className="p-2 rounded bg-[#fafaf9] border border-[#ededeb]">
+                          <div className="text-[10px] text-[#71717a] font-sans">Thời gian</div>
+                          <div className="font-semibold text-[#18181b] mt-0.5">
+                            {item.perf?.judge_duration_ms ? `${item.perf.judge_duration_ms} ms` : '—'}
+                          </div>
+                        </div>
+                        <div className="p-2 rounded bg-[#fafaf9] border border-[#ededeb]">
+                          <div className="text-[10px] text-[#71717a] font-sans">TB / Hit</div>
+                          <div className="font-semibold text-[#18181b] mt-0.5">
+                            {item.perf?.ms_per_hit !== null && item.perf?.ms_per_hit !== undefined ? `${item.perf.ms_per_hit} ms` : '—'}
+                          </div>
+                        </div>
+                        <div className="p-2 rounded bg-[#fafaf9] border border-[#ededeb]">
+                          <div className="text-[10px] text-[#71717a] font-sans">Calls / Lỗi</div>
+                          <div className="font-semibold text-[#18181b] mt-0.5">
+                            {item.perf?.judge_call_count ?? 0} /{' '}
+                            <span className={item.perf?.judge_error_count ? 'text-rose-600' : 'text-emerald-700'}>
+                              {item.perf?.judge_error_count ?? 0}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                {diff.performance.disagreed_samples?.length > 0 && (
+                  <div className="border-t border-[#ededeb] px-5 py-3 bg-[#fafaf9]/60 space-y-2">
+                    <div className="text-[11px] font-semibold text-[#52525b]">
+                      Mẫu chunk lệch nhãn giữa [A] và [B] ({diff.performance.disagreed_samples.length}):
+                    </div>
+                    <div className="space-y-1.5">
+                      {diff.performance.disagreed_samples.map((ds: any, i: number) => (
+                        <div key={i} className="text-[11px] bg-white border border-[#ededeb] rounded px-3 py-2 flex flex-wrap items-center justify-between gap-2">
+                          <div className="min-w-0 flex-1">
+                            <span className="font-mono font-semibold text-[#18181b] mr-2">{ds.tc_code}</span>
+                            <span className="text-[#52525b] mr-2">{ds.doc_name}</span>
+                            <span className="font-mono text-[#71717a]">
+                              [A:{ds.baseline_relevant}] {ds.baseline_reason || '—'} | [B:{ds.candidate_relevant}] {ds.candidate_reason || '—'}
+                            </span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Diff Lists */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
               <div className="border border-[#e4e4e2] rounded-lg bg-white overflow-hidden shadow-2xs">

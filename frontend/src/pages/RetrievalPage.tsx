@@ -23,9 +23,11 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
   const [showAddTc, setShowAddTc] = useState(false);
   const [showRunModal, setShowRunModal] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [rejudging, setRejudging] = useState<'' | 'jev' | 'llm'>('');
   const [generating, setGenerating] = useState(false);
   const [genTotalCount, setGenTotalCount] = useState(40);
-  const [useLlmJudge, setUseLlmJudge] = useState(true);
+  const [judgeEngine, setJudgeEngine] = useState<'jev' | 'llm' | 'rule'>('jev');
+  const [bypassCache, setBypassCache] = useState(false);
 
   const [tcCode, setTcCode] = useState('TC04');
   const [tcClass, setTcClass] = useState('Local');
@@ -89,6 +91,18 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
   }, [activeRun?.id]);
 
   useEffect(() => {
+    api
+      .getSettings()
+      .then((res) => {
+        const pref = res?.settings?.retrieval_judge_provider;
+        if (pref === 'jev' || pref === 'llm' || pref === 'rule') {
+          setJudgeEngine(pref);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
     if (selectedRrId) loadResults(selectedRrId);
   }, [selectedRrId]);
 
@@ -123,18 +137,46 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
         vector_similarity_weight: vecWeight,
         rerank_id: rerankId,
         keyword_enabled: true,
-        use_llm: useLlmJudge,
+        use_llm: judgeEngine !== 'rule',
+        judge_engine: judgeEngine,
+        bypass_cache: bypassCache,
       });
       setShowRunModal(false);
       await loadRuns();
       setSelectedRrId(res.retrieval_run_id);
-      toast.success(
-        `Chạy xong ${res.testcases_executed} câu hỏi · Giữ lại ${res.smart_cache_hits} nhãn đã chấm.`
-      );
+      const msTxt = res.judge_duration_ms ? ` · ${res.judge_duration_ms}ms` : '';
+      const errCnt = Number(res.judge_error_count || 0);
+      const errTxt = errCnt ? ` (${errCnt} lượt fallback)` : '';
+      const msg = `Chạy xong ${res.testcases_executed} câu (${String(res.judge_engine || judgeEngine).toUpperCase()})${msTxt}${errTxt} · Cache: ${res.smart_cache_hits}.`;
+      if (errCnt > 0) toast.warning(msg);
+      else toast.success(msg);
     } catch (err: any) {
       toast.error(err.message);
     } finally {
       setBusy(false);
+    }
+  };
+
+  const handleRejudge = async (engine: 'jev' | 'llm') => {
+    if (!selectedRrId || rejudging || busy) return;
+    setRejudging(engine);
+    try {
+      const res = await api.rejudgeRetrievalRun(selectedRrId, { judge_engine: engine });
+      await loadRuns();
+      setSelectedRrId(res.retrieval_run_id);
+      const agrTxt =
+        res.agreement_rate !== null && res.agreement_rate !== undefined
+          ? ` · Đồng thuận ${(res.agreement_rate * 100).toFixed(0)}% (${res.agreed_hits}/${res.compared_hits})`
+          : '';
+      const errCnt = Number(res.judge_error_count || 0);
+      const errTxt = errCnt ? ` · ${errCnt} lỗi fallback` : '';
+      const msg = `Đã chấm lại ${res.total_hits} hits bằng ${engine.toUpperCase()} trong ${res.judge_duration_ms}ms (${res.avg_ms_per_hit}ms/hit)${agrTxt}${errTxt}`;
+      if (errCnt > 0) toast.warning(msg);
+      else toast.success(msg);
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setRejudging('');
     }
   };
 
@@ -220,9 +262,33 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
             </button>
           </div>
 
-          <button onClick={() => setShowRunModal(true)} disabled={busy || generating} className="ts-btn-primary py-1.5 px-3 text-xs rounded-md disabled:opacity-45">
+          <button onClick={() => setShowRunModal(true)} disabled={busy || generating || !!rejudging} className="ts-btn-primary py-1.5 px-3 text-xs rounded-md disabled:opacity-45">
             <Play className="size-3.5" /> Chạy test tìm kiếm
           </button>
+          {selectedRrId && (
+            <>
+              <button
+                type="button"
+                onClick={() => handleRejudge('jev')}
+                disabled={!!rejudging || busy || generating}
+                className="inline-flex items-center gap-1.5 py-1.5 px-2.5 text-xs font-medium rounded-md border border-[#03aa5c]/40 bg-[#f2fbf6] text-[#027a42] hover:bg-[#03aa5c] hover:text-white transition-colors disabled:opacity-45"
+                title="Chấm lại các Top-K hits hiện có bằng Jev System One để đo tốc độ & so A/B với LLM"
+              >
+                {rejudging === 'jev' ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5" />}
+                {rejudging === 'jev' ? 'Jev/Kev đang chấm...' : 'Chấm lại bằng Jev / Kev'}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleRejudge('llm')}
+                disabled={!!rejudging || busy || generating}
+                className="ts-btn-secondary py-1.5 px-2.5 text-xs rounded-md disabled:opacity-45"
+                title="Chấm lại các Top-K hits hiện có bằng Chat LLM (đo thời gian để làm mốc so sánh với Jev)"
+              >
+                {rejudging === 'llm' ? <Loader2 className="size-3.5 animate-spin" /> : <Wand2 className="size-3.5" />}
+                {rejudging === 'llm' ? 'LLM đang chấm...' : 'Chấm lại bằng LLM'}
+              </button>
+            </>
+          )}
           <button onClick={() => setShowAddTc(true)} className="ts-btn-secondary py-1.5 px-2.5 text-xs rounded-md">
             <Plus className="size-3.5" /> Thêm tay
           </button>
@@ -519,7 +585,7 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
                     }`}
                   >
                     <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
                         <span className="ts-tag-neutral font-semibold">#{hit.rank}</span>
                         <span className="font-medium text-[#18181b]">{hit.doc_name || 'Tài liệu'}</span>
                         {hit.relevancy_source === 'CACHED' && (
@@ -527,11 +593,43 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
                             <Sparkles className="size-3" /> Đã chấm từ lần trước
                           </span>
                         )}
+                        {hit.relevancy_source === 'JEV_DRAFT' && (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-[#f2fbf6] text-[#027a42] border border-[#03aa5c]/35">
+                            JEV
+                          </span>
+                        )}
+                        {hit.relevancy_source === 'LLM_DRAFT' && (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded bg-[#eff6ff] text-[#1d4ed8] border border-[#bfdbfe]">
+                            LLM
+                          </span>
+                        )}
+                        {hit.relevancy_source === 'RULE' && (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded bg-[#fffbeb] text-[#b45309] border border-[#fde68a]">
+                            RULE
+                          </span>
+                        )}
+                        {hit.relevancy_source === 'MANUAL' && (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded bg-[#f4f4f2] text-[#18181b] border border-[#d4d4d8]">
+                            MANUAL
+                          </span>
+                        )}
                       </div>
                       <span className="font-mono text-[#71717a] tabular-nums">
                         Khớp: <strong className="text-[#18181b]">{(hit.similarity * 100).toFixed(0)}%</strong>
                       </span>
                     </div>
+
+                    {hit.reason && (
+                      <div
+                        className={`text-[11px] font-mono px-2.5 py-1 rounded border ${
+                          hit.reason.includes('Cần duyệt') || hit.reason.includes('Fallback')
+                            ? 'bg-[#fffbeb] border-[#fde68a] text-[#92400e]'
+                            : 'bg-[#fafaf9] border-[#ededeb] text-[#52525b]'
+                        }`}
+                      >
+                        {hit.reason}
+                      </div>
+                    )}
 
                     <div className="text-[14px] text-[#18181b] leading-relaxed whitespace-pre-wrap text-pretty">
                       {hit.content}
@@ -604,9 +702,27 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
                 <label className="block text-xs text-[#52525b] mb-1">Model Rerank (để trống nếu tắt)</label>
                 <input className="ts-input w-full font-mono text-xs" placeholder="BAAI/bge-reranker-v2-m3" value={rerankId} onChange={(e) => setRerankId(e.target.value)} />
               </div>
-              <div className="text-[11px] text-[#027a42] bg-[#f2fbf6] border border-[#03aa5c]/30 px-2.5 py-1.5 rounded">
-                Mặc định dùng <strong>LLM-as-a-Judge</strong> chấm độ liên quan Top-10 chunk.
+              <div>
+                <label className="block text-xs text-[#52525b] mb-1">Bộ chấm Relevancy</label>
+                <select
+                  className="ts-input w-full text-xs"
+                  value={judgeEngine}
+                  onChange={(e) => setJudgeEngine(e.target.value as 'jev' | 'llm' | 'rule')}
+                >
+                  <option value="jev">Jev System One (typesafe-ai/jev · Nhanh + có xác suất p)</option>
+                  <option value="llm">Generative LLM (/chat/completions)</option>
+                  <option value="rule">RapidFuzz Rule (0-AI · Miễn phí)</option>
+                </select>
               </div>
+              <label className="flex items-center gap-2 text-xs text-[#3f3f46] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={bypassCache}
+                  onChange={(e) => setBypassCache(e.target.checked)}
+                  className="rounded border-[#d4d4d8]"
+                />
+                Bỏ qua Smart Cache (chấm mới toàn bộ thay vì kế thừa nhãn cũ)
+              </label>
             </div>
             <div className="flex justify-end gap-2 pt-2 border-t border-[#ededeb]">
               <button type="button" onClick={() => setShowRunModal(false)} className="ts-btn-secondary">Hủy</button>

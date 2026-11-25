@@ -35,6 +35,7 @@ export const api = {
   testRagflow: () => req<any>('/api/settings/test-ragflow', { method: 'POST' }),
   testLlm: () => req<any>('/api/settings/test-llm', { method: 'POST' }),
   testVision: () => req<any>('/api/settings/test-vision', { method: 'POST' }),
+  testSystemOne: () => req<any>('/api/settings/test-systemone', { method: 'POST' }),
 
   // Workspace
   listDocuments: (runId?: number) =>
@@ -155,6 +156,8 @@ export const api = {
     req<any[]>(`/api/retrieval/runs${runId ? `?run_id=${runId}` : ''}`),
   executeRetrieval: (payload: any) =>
     req<any>('/api/retrieval/runs/execute', { method: 'POST', body: JSON.stringify(payload) }),
+  rejudgeRetrievalRun: (rrId: number, payload: { judge_engine: 'jev' | 'llm' | 'rule'; name?: string }) =>
+    req<any>(`/api/retrieval/runs/${rrId}/rejudge`, { method: 'POST', body: JSON.stringify(payload) }),
   getRetrievalResults: (rrId: number) => req<any[]>(`/api/retrieval/runs/${rrId}/results`),
   scoreRetrievalResult: (resultId: number, relevant: number, reason: string) =>
     req<any>(`/api/retrieval/results/${resultId}/score`, {

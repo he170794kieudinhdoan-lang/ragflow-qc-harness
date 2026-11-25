@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import re
@@ -54,10 +55,18 @@ async def call_llm_json(
     }
 
     client = get_shared_http_client()
-    r = await client.post(url, headers=headers, json=body, timeout=timeout)
-    if r.status_code >= 400:
-        raise LLMError(f"HTTP {r.status_code}: {r.text[:260]}")
-    payload = r.json()
+    last_resp = None
+    for attempt in range(4):
+        r = await client.post(url, headers=headers, json=body, timeout=timeout)
+        last_resp = r
+        if r.status_code == 429 and attempt < 3:
+            await asyncio.sleep(1.5 * (2 ** attempt))
+            continue
+        break
+    assert last_resp is not None
+    if last_resp.status_code >= 400:
+        raise LLMError(f"HTTP {last_resp.status_code}: {last_resp.text[:360]}")
+    payload = last_resp.json()
     choices = payload.get("choices") or []
     if not choices:
         raise LLMError("LLM trả về phản hồi rỗng.")
@@ -154,6 +163,163 @@ async def llm_judge_relevance(
     rel = 1 if int(data.get("relevant", 0)) == 1 else 0
     reason = str(data.get("reason", "")).strip()[:160]
     return rel, reason or ("LLM: Liên quan" if rel == 1 else "LLM: Không liên quan")
+
+
+def _systemone_endpoint(base_url: str) -> str:
+    b = (base_url or "").strip().rstrip("/")
+    if b.endswith("/systemone"):
+        return b
+    if b.endswith("/v1"):
+        return f"{b}/systemone"
+    return f"{b}/v1/systemone"
+
+
+def systemone_requires_key(base_url: str) -> bool:
+    """Cloud hosted endpoints (TypeSafe / Vercel AI Gateway) require an API key; Colab/local Kev may omit it."""
+    b = (base_url or "").strip().lower()
+    return "api.typesafe.ai" in b or "ai-gateway.vercel.sh" in b
+
+
+def resolve_systemone_credentials(get_setting_fn) -> Tuple[str, str, str, float]:
+    """Resolve (base_url, api_key, model, threshold), sharing Vercel AI Gateway key when appropriate."""
+    base_url = (get_setting_fn("systemone_base_url", "https://ai-gateway.vercel.sh/typesafe") or "").strip()
+    api_key = (get_setting_fn("systemone_api_key", "") or "").strip()
+    if not api_key and "ai-gateway.vercel.sh" in base_url.lower():
+        llm_base = (get_setting_fn("llm_base_url", "") or "").strip().lower()
+        if "ai-gateway.vercel.sh" in llm_base:
+            api_key = (get_setting_fn("llm_api_key", "") or "").strip()
+    model = (get_setting_fn("systemone_model", "typesafe-ai/jev") or "typesafe-ai/jev").strip()
+    try:
+        threshold = float(get_setting_fn("systemone_threshold", "0.50") or "0.50")
+    except (TypeError, ValueError):
+        threshold = 0.50
+    threshold = max(0.05, min(0.95, threshold))
+    return base_url, api_key, model, threshold
+
+
+async def call_system_one(
+    base_url: str,
+    api_key: str,
+    model: str,
+    state: Any,
+    questions: Dict[str, Any],
+    timeout: float = 60.0,
+) -> Dict[str, Any]:
+    """Call TypeSafe System One / Kev decision endpoint (/v1/systemone)."""
+    url = _systemone_endpoint(base_url)
+    headers = {"Content-Type": "application/json"}
+    if api_key.strip():
+        headers["Authorization"] = f"Bearer {api_key.strip()}"
+
+    body: Dict[str, Any] = {
+        "model": model.strip() or "typesafe-ai/jev",
+        "state": state,
+        "questions": questions,
+    }
+    client = get_shared_http_client()
+    r = None
+    for attempt in range(3):
+        r = await client.post(url, headers=headers, json=body, timeout=timeout)
+        if r.status_code in (429, 503) and attempt < 2:
+            await asyncio.sleep(1.5 * (attempt + 1))
+            continue
+        break
+    assert r is not None
+    if r.status_code >= 400:
+        raise LLMError(f"System One HTTP {r.status_code}: {r.text[:400]}")
+    payload = r.json()
+    answers = payload.get("answers")
+    if not isinstance(answers, dict):
+        raise LLMError(f"System One không trả về trường answers hợp lệ: {str(payload)[:180]}")
+    return answers
+
+
+async def test_system_one_connection(base_url: str, api_key: str, model: str) -> Dict[str, Any]:
+    answers = await call_system_one(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        state="Câu hỏi: Liều dùng PrEP hàng ngày là gì?\nĐoạn tìm được: Uống 1 viên mỗi ngày vào giờ cố định.",
+        questions={
+            "relevant": {
+                "type": "noul",
+                "instructions": "Đoạn tìm được có chứa thông tin trả lời cho câu hỏi không?",
+            }
+        },
+        timeout=25.0,
+    )
+    ans = answers.get("relevant") or {}
+    prob = ans.get("noul")
+    return {"ok": True, "model": model, "sample_noul": prob, "answers": answers}
+
+
+async def jev_judge_relevance(
+    base_url: str,
+    api_key: str,
+    model: str,
+    question: str,
+    reference_context: str,
+    chunk_content: str,
+    threshold: float = 0.50,
+) -> Tuple[int, str]:
+    """
+    System One (Jev / Kev) Strict Retrieval Relevancy Judge: returns (1|0, calibrated_reason).
+    Uses structured English binary (noul) questions — empirically calibrated for Kev/Jev —
+    to verify concrete answer-bearing facts and filter pure metadata/header chunks.
+    """
+    ref_text = (reference_context or "").strip()[:800]
+    chunk_text = (chunk_content or "").strip()[:1400]
+    state = (
+        f"User Question: {question.strip()}\n\n"
+        + (f"Gold Reference Context: {ref_text}\n\n" if ref_text else "")
+        + f"Candidate Chunk:\n{chunk_text}"
+    )
+    rel_instruction = (
+        "Does the Candidate Chunk itself state key facts found in the Gold Reference Context to answer the User Question? "
+        "Answer NO if Candidate Chunk is only metadata, headers, URLs, or unrelated."
+        if ref_text
+        else "Does the Candidate Chunk itself contain specific factual details to answer the User Question? "
+        "Answer NO if Candidate Chunk is only metadata, headers, URLs, or unrelated."
+    )
+    answers = await call_system_one(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        state=state,
+        questions={
+            "relevant": {
+                "type": "noul",
+                "instructions": rel_instruction,
+            },
+            "metadata_only": {
+                "type": "noul",
+                "instructions": (
+                    "Does the Candidate Chunk consist mostly of metadata fields "
+                    "(source, source_url, topic, domain, disease) or headings without body facts?"
+                ),
+            },
+        },
+        timeout=35.0,
+    )
+    raw_ans = answers.get("relevant") or {}
+    p = raw_ans.get("noul")
+    if p is None:
+        raise LLMError(f"Jev không trả về giá trị noul: {raw_ans}")
+    prob = float(p)
+
+    raw_meta = answers.get("metadata_only") or {}
+    p_meta = raw_meta.get("noul")
+    prob_meta = float(p_meta) if p_meta is not None else 0.0
+
+    # Reject chunks dominated by metadata/headings unless answer-bearing evidence strongly outweighs meta signal
+    if prob_meta >= 0.44 and (prob - prob_meta) < 0.20:
+        return 0, f"Jev: Không liên quan (tiêu đề/metadata · p={prob:.2f}, meta={prob_meta:.2f})"
+
+    rel = 1 if prob >= threshold else 0
+    borderline = " · Cần duyệt" if abs(prob - threshold) <= 0.08 else ""
+    label = "Liên quan" if rel == 1 else "Không liên quan"
+    meta_note = f", meta={prob_meta:.2f}" if prob_meta >= 0.38 else ""
+    return rel, f"Jev: {label} (p={prob:.2f}{meta_note}{borderline})"
 
 
 async def llm_judge_chunk(
@@ -400,10 +566,18 @@ async def llm_ocr_image(
     }
 
     client = get_shared_http_client()
-    r = await client.post(url, headers=headers, json=body, timeout=timeout)
-    if r.status_code >= 400:
-        raise LLMError(f"HTTP {r.status_code}: {r.text[:260]}")
-    payload = r.json()
+    last_resp = None
+    for attempt in range(4):
+        r = await client.post(url, headers=headers, json=body, timeout=timeout)
+        last_resp = r
+        if r.status_code == 429 and attempt < 3:
+            await asyncio.sleep(1.5 * (2 ** attempt))
+            continue
+        break
+    assert last_resp is not None
+    if last_resp.status_code >= 400:
+        raise LLMError(f"HTTP {last_resp.status_code}: {last_resp.text[:360]}")
+    payload = last_resp.json()
     choices = payload.get("choices") or []
     if not choices:
         raise LLMError("Vision LLM trả về phản hồi rỗng.")
@@ -473,10 +647,18 @@ async def llm_ocr_images_batch(
     }
 
     client = get_shared_http_client()
-    r = await client.post(url, headers=headers, json=body, timeout=timeout)
-    if r.status_code >= 400:
-        raise LLMError(f"HTTP {r.status_code}: {r.text[:260]}")
-    payload = r.json()
+    last_resp = None
+    for attempt in range(4):
+        r = await client.post(url, headers=headers, json=body, timeout=timeout)
+        last_resp = r
+        if r.status_code == 429 and attempt < 3:
+            await asyncio.sleep(1.5 * (2 ** attempt))
+            continue
+        break
+    assert last_resp is not None
+    if last_resp.status_code >= 400:
+        raise LLMError(f"HTTP {last_resp.status_code}: {last_resp.text[:360]}")
+    payload = last_resp.json()
     choices = payload.get("choices") or []
     if not choices:
         raise LLMError("Vision LLM trả về phản hồi rỗng.")

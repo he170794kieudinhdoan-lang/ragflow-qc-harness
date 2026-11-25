@@ -26,7 +26,7 @@ interface SettingsModalProps {
 }
 
 const SECTION_KEYS: Record<SectionId, string[]> = {
-  connection: ['ragflow_base_url', 'llm_base_url', 'llm_model'],
+  connection: ['ragflow_base_url', 'llm_base_url', 'llm_model', 'systemone_base_url', 'systemone_model'],
   step1: ['slow_parse_threshold_sec'],
   step2: [
     'parsing_table_cell_match_threshold',
@@ -47,6 +47,8 @@ const SECTION_KEYS: Record<SectionId, string[]> = {
     'target_valid_size_rate',
   ],
   step4: [
+    'retrieval_judge_provider',
+    'systemone_threshold',
     'default_top_k',
     'default_similarity_threshold',
     'default_vector_similarity_weight',
@@ -97,6 +99,7 @@ export default function SettingsModal({
 }: SettingsModalProps) {
   const [section, setSection] = useState<SectionId>('connection');
   const [testingLlm, setTestingLlm] = useState(false);
+  const [testingSys1, setTestingSys1] = useState(false);
 
   const val = (key: string, fallback = '') => settings[key] ?? defaults[key] ?? fallback;
   const setKey = (key: string, value: string) => setSettings((prev) => ({ ...prev, [key]: value }));
@@ -226,6 +229,7 @@ export default function SettingsModal({
                     </span>
                     <div className="flex items-center gap-1 text-[11px]">
                       {[
+                        { label: 'Vercel', url: 'https://ai-gateway.vercel.sh/v1', model: 'openai/gpt-4o-mini' },
                         { label: 'DeepSeek', url: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
                         { label: 'Gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-3.8-flash' },
                         { label: 'OpenAI', url: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
@@ -368,6 +372,93 @@ export default function SettingsModal({
                   >
                     <FlaskConical className="size-3.5 text-[#03aa5c]" />
                     {testingLlm ? 'Đang kiểm tra...' : 'Kiểm tra kết nối Vision LLM'}
+                  </button>
+                </div>
+
+                <div className="border-t border-[#ededeb] pt-4 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <span className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
+                        Jev / Kev System One (Chấm Relevancy Bước 4)
+                      </span>
+                      <p className="text-[10px] text-[#71717a] mt-0.5">
+                        Hỗ trợ Jev (Vercel / TypeSafe) hoặc Kev open-source (Google Colab URL trycloudflare.com / localhost:8009).
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-1 text-[11px] shrink-0">
+                      {[
+                        { label: 'Kev (Colab/Local)', url: 'http://localhost:8009', model: 'jaredpalmer/kev-4b' },
+                        { label: 'Vercel · Jev', url: 'https://ai-gateway.vercel.sh/typesafe', model: 'typesafe-ai/jev' },
+                        { label: 'TypeSafe Direct', url: 'https://api.typesafe.ai', model: 'jev-latest' },
+                      ].map((p) => (
+                        <button
+                          key={p.label}
+                          type="button"
+                          onClick={() =>
+                            setSettings((prev) => ({
+                              ...prev,
+                              systemone_base_url: p.url,
+                              systemone_model: p.model,
+                            }))
+                          }
+                          className="px-2 py-0.5 bg-[#f7f7f6] hover:bg-[#03aa5c]/15 hover:text-[#027a42] border border-[#dedede] text-[#3d3d3d] rounded-[2px]"
+                        >
+                          {p.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <FieldRow label="System One Base URL">
+                      <input
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('systemone_base_url', 'https://ai-gateway.vercel.sh/typesafe')}
+                        onChange={(e) => setKey('systemone_base_url', e.target.value)}
+                        placeholder="https://ai-gateway.vercel.sh/typesafe"
+                      />
+                    </FieldRow>
+                    <FieldRow label="Model Jev">
+                      <input
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('systemone_model', 'typesafe-ai/jev')}
+                        onChange={(e) => setKey('systemone_model', e.target.value)}
+                        placeholder="typesafe-ai/jev"
+                      />
+                    </FieldRow>
+                  </div>
+                  <FieldRow label="System One / Vercel AI Gateway Key (tùy chọn nếu dùng chung key LLM)">
+                    <input
+                      type="password"
+                      className="ts-input w-full font-mono text-xs"
+                      value={val('systemone_api_key')}
+                      onChange={(e) => setKey('systemone_api_key', e.target.value)}
+                      placeholder="vck_... (để trống nếu dùng chung key Vercel ở mục LLM)"
+                    />
+                  </FieldRow>
+                  <button
+                    type="button"
+                    disabled={testingSys1}
+                    onClick={async () => {
+                      setTestingSys1(true);
+                      setConnMsg({});
+                      try {
+                        await api.saveSettings(settings);
+                        const r = await api.testSystemOne();
+                        const pTxt =
+                          r.sample_noul !== undefined && r.sample_noul !== null
+                            ? ` · sample noul=${Number(r.sample_noul).toFixed(2)}`
+                            : '';
+                        setConnMsg({ ok: true, text: `Kết nối Jev thành công (${r.model}${pTxt})` });
+                      } catch (e: any) {
+                        setConnMsg({ ok: false, text: e.message });
+                      } finally {
+                        setTestingSys1(false);
+                      }
+                    }}
+                    className="ts-btn-secondary text-xs"
+                  >
+                    <FlaskConical className="size-3.5 text-[#03aa5c]" />
+                    {testingSys1 ? 'Đang kiểm tra...' : 'Kiểm tra kết nối Jev'}
                   </button>
                 </div>
               </div>
@@ -654,6 +745,36 @@ export default function SettingsModal({
                     />
                     Bật Keyword Search (Hybrid) mặc định
                   </label>
+                </div>
+
+                <div className="border-t border-[#ededeb] pt-4 space-y-3">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
+                    Engine chấm Relevancy mặc định (Bước 4)
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <FieldRow label="Bộ chấm mặc định" hint="Khuyên dùng Jev System One để có tốc độ cao và xác suất p.">
+                      <select
+                        className="ts-input w-full text-xs"
+                        value={val('retrieval_judge_provider', 'jev')}
+                        onChange={(e) => setKey('retrieval_judge_provider', e.target.value)}
+                      >
+                        <option value="jev">Jev System One (typesafe-ai/jev)</option>
+                        <option value="llm">Generative LLM (/chat/completions)</option>
+                        <option value="rule">RapidFuzz Rule (0-AI)</option>
+                      </select>
+                    </FieldRow>
+                    <FieldRow label="Ngưỡng xác suất Jev/Kev noul (0.05–0.95)" hint="Mặc định: 0.50 (đã hiệu chuẩn strict + lọc metadata; vùng ±0.08 Cần duyệt)">
+                      <input
+                        type="number"
+                        step="0.05"
+                        min={0.05}
+                        max={0.95}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('systemone_threshold', '0.50')}
+                        onChange={(e) => setKey('systemone_threshold', e.target.value)}
+                      />
+                    </FieldRow>
+                  </div>
                 </div>
 
                 <div className="border-t border-[#ededeb] pt-4 space-y-3">

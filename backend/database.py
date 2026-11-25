@@ -257,6 +257,17 @@ def init_db():
         if "fidelity_error" not in pu_cols:
             conn.execute("ALTER TABLE parsing_units ADD COLUMN fidelity_error INTEGER DEFAULT 0")
 
+        # Ensure retrieval_runs judge performance tracking columns exist
+        rr_cols = {r["name"] for r in conn.execute("PRAGMA table_info(retrieval_runs)").fetchall()}
+        if "judge_engine" not in rr_cols:
+            conn.execute("ALTER TABLE retrieval_runs ADD COLUMN judge_engine TEXT DEFAULT ''")
+        if "judge_duration_ms" not in rr_cols:
+            conn.execute("ALTER TABLE retrieval_runs ADD COLUMN judge_duration_ms INTEGER DEFAULT 0")
+        if "judge_call_count" not in rr_cols:
+            conn.execute("ALTER TABLE retrieval_runs ADD COLUMN judge_call_count INTEGER DEFAULT 0")
+        if "judge_error_count" not in rr_cols:
+            conn.execute("ALTER TABLE retrieval_runs ADD COLUMN judge_error_count INTEGER DEFAULT 0")
+
 
 DEFAULT_SETTINGS: dict[str, str] = {
     # Connection
@@ -268,6 +279,12 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "vision_base_url": "",
     "vision_api_key": "",
     "vision_model": "",
+    # System One / Jev (Retrieval Judge via Vercel AI Gateway or TypeSafe)
+    "retrieval_judge_provider": "jev",
+    "systemone_base_url": "https://ai-gateway.vercel.sh/typesafe",
+    "systemone_api_key": "",
+    "systemone_model": "typesafe-ai/jev",
+    "systemone_threshold": "0.50",
     # Step 1: Workspace / Sync
     "slow_parse_threshold_sec": "180",
     # Step 2: Parsing

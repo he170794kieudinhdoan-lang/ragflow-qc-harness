@@ -283,11 +283,74 @@ def compare_retrieval_runs(baseline_rr_id: int, candidate_rr_id: int):
             elif not b_tc["passed"] and c_tc["passed"]:
                 improvements.append(entry)
 
+        b_hits = conn.execute(
+            "SELECT testcase_id, ragflow_chunk_id, doc_name, relevant, reason FROM retrieval_results WHERE retrieval_run_id = ?",
+            (baseline_rr_id,),
+        ).fetchall()
+        c_hits = conn.execute(
+            "SELECT testcase_id, ragflow_chunk_id, doc_name, relevant, reason FROM retrieval_results WHERE retrieval_run_id = ?",
+            (candidate_rr_id,),
+        ).fetchall()
+        tc_code_map = {
+            r["id"]: r["tc_code"]
+            for r in conn.execute("SELECT id, tc_code FROM golden_testcases").fetchall()
+        }
+
+        b_hit_map = {(r["testcase_id"], r["ragflow_chunk_id"]): dict(r) for r in b_hits}
+        agreed_hits = 0
+        compared_hits = 0
+        disagreed_samples = []
+        for ch in c_hits:
+            bh = b_hit_map.get((ch["testcase_id"], ch["ragflow_chunk_id"]))
+            if not bh or bh["relevant"] is None or ch["relevant"] is None:
+                continue
+            compared_hits += 1
+            if int(bh["relevant"]) == int(ch["relevant"]):
+                agreed_hits += 1
+            elif len(disagreed_samples) < 10:
+                disagreed_samples.append({
+                    "tc_code": tc_code_map.get(ch["testcase_id"], f"TC#{ch['testcase_id']}"),
+                    "doc_name": ch["doc_name"] or bh["doc_name"] or "",
+                    "ragflow_chunk_id": ch["ragflow_chunk_id"],
+                    "baseline_relevant": int(bh["relevant"]),
+                    "candidate_relevant": int(ch["relevant"]),
+                    "baseline_reason": bh["reason"] or "",
+                    "candidate_reason": ch["reason"] or "",
+                })
+
+        b_meta = dict(b_rr)
+        c_meta = dict(c_rr)
+        b_cnt = len(b_hits)
+        c_cnt = len(c_hits)
+        performance = {
+            "baseline": {
+                "judge_engine": b_meta.get("judge_engine") or "llm",
+                "judge_duration_ms": int(b_meta.get("judge_duration_ms") or 0),
+                "judge_call_count": int(b_meta.get("judge_call_count") or 0),
+                "judge_error_count": int(b_meta.get("judge_error_count") or 0),
+                "total_hits": b_cnt,
+                "ms_per_hit": round(int(b_meta.get("judge_duration_ms") or 0) / b_cnt, 1) if b_cnt and b_meta.get("judge_duration_ms") else None,
+            },
+            "candidate": {
+                "judge_engine": c_meta.get("judge_engine") or "llm",
+                "judge_duration_ms": int(c_meta.get("judge_duration_ms") or 0),
+                "judge_call_count": int(c_meta.get("judge_call_count") or 0),
+                "judge_error_count": int(c_meta.get("judge_error_count") or 0),
+                "total_hits": c_cnt,
+                "ms_per_hit": round(int(c_meta.get("judge_duration_ms") or 0) / c_cnt, 1) if c_cnt and c_meta.get("judge_duration_ms") else None,
+            },
+            "compared_hits": compared_hits,
+            "agreed_hits": agreed_hits,
+            "hit_agreement_rate": round(agreed_hits / compared_hits, 4) if compared_hits else None,
+            "disagreed_samples": disagreed_samples,
+        }
+
     return {
-        "baseline": {"meta": dict(b_rr), "summary": b_sum},
-        "candidate": {"meta": dict(c_rr), "summary": c_sum},
+        "baseline": {"meta": b_meta, "summary": b_sum},
+        "candidate": {"meta": c_meta, "summary": c_sum},
         "regressions_pass_to_fail": regressions,
         "improvements_fail_to_pass": improvements,
+        "performance": performance,
     }
 
 
