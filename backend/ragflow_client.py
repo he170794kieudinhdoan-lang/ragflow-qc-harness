@@ -69,6 +69,7 @@ class RAGFlowClient:
 
     # --- Datasets ---
     async def list_datasets(self, page: int = 1, page_size: int = 100) -> List[Dict[str, Any]]:
+        page_size = max(1, min(int(page_size), 100))
         client = get_shared_http_client()
         r = await client.get(
             f"{self.base_url}/api/v1/datasets",
@@ -185,6 +186,7 @@ class RAGFlowClient:
     async def list_documents(
         self, dataset_id: str, page: int = 1, page_size: int = 100
     ) -> List[Dict[str, Any]]:
+        page_size = max(1, min(int(page_size), 100))
         client = get_shared_http_client()
         all_docs: List[Dict[str, Any]] = []
         seen_ids = set()
@@ -299,6 +301,7 @@ class RAGFlowClient:
         page: int = 1,
         page_size: int = 100,
     ) -> Dict[str, Any]:
+        page_size = max(1, min(int(page_size), 100))
         client = get_shared_http_client()
         r = await client.get(
             f"{self.base_url}/api/v1/datasets/{dataset_id}/documents/{document_id}/chunks",

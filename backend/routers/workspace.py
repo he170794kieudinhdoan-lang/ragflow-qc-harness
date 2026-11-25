@@ -575,7 +575,7 @@ async def get_run_parse_status(run_id: int):
             raise HTTPException(status_code=400, detail="Run này chưa gắn RAGFlow Dataset ID")
 
     try:
-        remote_docs = await client.list_documents(dataset_id, page=1, page_size=200)
+        remote_docs = await client.list_documents(dataset_id, page=1, page_size=100)
     except RAGFlowError as e:
         raise HTTPException(status_code=400, detail=f"Lỗi kiểm tra tiến độ từ RAGFlow: {e}")
 
@@ -773,7 +773,7 @@ async def sync_run_from_ragflow(
         }
 
     try:
-        remote_docs = await client.list_documents(dataset_id, page=1, page_size=200)
+        remote_docs = await client.list_documents(dataset_id, page=1, page_size=100)
     except RAGFlowError as e:
         raise HTTPException(status_code=400, detail=f"Lỗi lấy danh sách tài liệu từ RAGFlow: {e}")
 
