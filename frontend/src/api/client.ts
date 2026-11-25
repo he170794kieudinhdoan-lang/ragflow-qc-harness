@@ -103,8 +103,11 @@ export const api = {
   // Chunking
   sampleChunks: (runId: number, perDoc = 5) =>
     req<any>(`/api/chunking/runs/${runId}/sample?per_doc=${perDoc}`, { method: 'POST' }),
-  llmJudgeChunks: (runId: number, overwriteManual = false) =>
-    req<any>(`/api/chunking/runs/${runId}/llm-judge?overwrite_manual=${overwriteManual}`, { method: 'POST' }),
+  llmJudgeChunks: (runId: number, overwriteManual = false, judgeEngine: 'auto' | 'jev' | 'llm' = 'auto') =>
+    req<any>(
+      `/api/chunking/runs/${runId}/llm-judge?overwrite_manual=${overwriteManual}&judge_engine=${judgeEngine}`,
+      { method: 'POST' },
+    ),
   listChunkEvals: (runId: number, sampledOnly = true) =>
     req<any[]>(`/api/chunking/runs/${runId}/evaluations?sampled_only=${sampledOnly}`),
   scoreChunk: (runId: number, chunkPk: number, payload: any) =>

@@ -293,6 +293,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "target_table_accuracy": "0.75",
     "target_reading_order": "0.80",
     # Step 3: Chunking
+    "chunking_judge_provider": "jev",
     "chunk_sample_per_doc": "5",
     "min_chunk_chars": "50",
     "max_chunk_chars": "2600",

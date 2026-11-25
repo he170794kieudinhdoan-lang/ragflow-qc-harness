@@ -443,7 +443,7 @@ export const ChunkingTableView: React.FC<Props> = ({
                   <th className={`${hdrBorder} px-1.5 py-1.5 text-center whitespace-nowrap`}>Ko trùng</th>
                   <th className={`${hdrBorder} px-1.5 py-1.5 text-center whitespace-nowrap`}>Độ dài</th>
                   <th className={`${hdrBorder} px-2 py-1.5 text-left whitespace-nowrap`}>Mã lỗi</th>
-                  <th className={`${hdrBorder} px-2.5 py-1.5 text-left min-w-[220px]`}>Đánh giá LLM / Ghi chú</th>
+                  <th className={`${hdrBorder} px-2.5 py-1.5 text-left min-w-[220px]`}>Đánh giá AI / Ghi chú</th>
                 </tr>
               </thead>
               <tbody>

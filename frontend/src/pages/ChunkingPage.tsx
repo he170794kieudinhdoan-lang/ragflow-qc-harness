@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { toast } from 'sonner';
-import { AlertCircle, ArrowRight, BarChart3, ChevronLeft, ChevronRight, LayoutGrid, List, Loader2, Maximize2, Search, Shuffle, Sparkles, Table2, X } from 'lucide-react';
+import { AlertCircle, ArrowRight, BarChart3, ChevronLeft, ChevronRight, LayoutGrid, List, Loader2, Maximize2, Search, Shuffle, Sparkles, Table2, Wand2, X } from 'lucide-react';
 import { api } from '../api/client';
 import { ChunkEvalItem, ErrorCodeDef, RunItem } from '../types';
 import { ChunkExplorer } from '../components/ChunkExplorer';
@@ -43,7 +43,7 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextS
   const [docFilter, setDocFilter] = useState('');
   const [colorFilter, setColorFilter] = useState<ChunkFilter>('ALL');
   const [sampling, setSampling] = useState(false);
-  const [judgingLlm, setJudgingLlm] = useState(false);
+  const [judgingEngine, setJudgingEngine] = useState<'' | 'jev' | 'llm'>('');
   const [saving, setSaving] = useState(false);
 
   const [integrity, setIntegrity] = useState<number>(1);
@@ -147,20 +147,26 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextS
     }
   };
 
-  const handleLlmJudge = async () => {
-    if (!activeRun || judgingLlm || sampling) return;
-    setJudgingLlm(true);
+  const handleAiJudge = async (engine: 'jev' | 'llm') => {
+    if (!activeRun || judgingEngine || sampling) return;
+    setJudgingEngine(engine);
     try {
-      const res = await api.llmJudgeChunks(activeRun.id, false);
+      const res = await api.llmJudgeChunks(activeRun.id, false, engine);
       setSelected(null);
       await load();
-      toast.success(
-        `LLM (${res.model || 'AI'}) đã chấm xong ${res.judged_count} chunk (giữ nguyên ${res.skipped_manual || 0} chunk đã duyệt tay).`
-      );
+      const engLabel = (res.judge_engine || engine) === 'jev' ? 'Kev/Jev' : 'LLM';
+      const msTxt = res.judge_duration_ms ? ` trong ${res.judge_duration_ms}ms` : '';
+      const errTxt = res.failed_count > 0 ? ` · ${res.failed_count} chunk lỗi` : '';
+      const msg = `${engLabel} (${res.model || 'AI'}) đã chấm ${res.judged_count} chunk${msTxt}${errTxt} (giữ nguyên ${res.skipped_manual || 0} chunk đã duyệt tay).`;
+      if (res.failed_count > 0) {
+        toast.warning(msg);
+      } else {
+        toast.success(msg);
+      }
     } catch (e: any) {
-      toast.error(e.message);
+      toast.error(e.message || 'Không chấm được Chunking');
     } finally {
-      setJudgingLlm(false);
+      setJudgingEngine('');
     }
   };
 
@@ -354,32 +360,44 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextS
                 const v = parseInt(e.target.value, 10);
                 setPerDoc(Number.isFinite(v) ? Math.max(1, Math.min(100, v)) : 5);
               }}
-              disabled={sampling || judgingLlm}
+              disabled={sampling || !!judgingEngine}
               title="Nhập số chunk mẫu mỗi tài liệu (1–100)"
             />
             <span className="pr-2 text-[11px] text-[#71717a] select-none">mẫu/file</span>
             <button
               type="button"
               onClick={handleAutoSample}
-              disabled={sampling || judgingLlm}
+              disabled={sampling || !!judgingEngine}
               className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium bg-[#f7f7f6] hover:bg-[#ededeb] text-[#18181b] border-l border-[#e4e4e2] disabled:opacity-45 transition-colors"
-              title="Lấy mẫu lại theo số lượng mới & tự động chấm bằng Rule + LLM"
+              title="Lấy mẫu lại theo số lượng mới & tự động chấm bằng Rule + AI mặc định"
             >
               {sampling ? <Loader2 className="size-3 animate-spin" /> : <Shuffle className="size-3" />}
               {sampling ? 'Đang lấy mẫu...' : 'Lấy mẫu lại'}
             </button>
           </div>
           {chunks.length > 0 && (
-            <button
-              type="button"
-              onClick={handleLlmJudge}
-              disabled={judgingLlm || sampling}
-              className="ts-btn-ghost py-1 px-2 text-xs rounded-md disabled:opacity-45"
-              title="Chấm lại toàn bộ chunk mẫu bằng LLM (giữ nguyên các chunk đã duyệt tay)"
-            >
-              {judgingLlm ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5" />}
-              {judgingLlm ? 'Đang chấm LLM...' : 'Chấm lại LLM'}
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={() => handleAiJudge('jev')}
+                disabled={!!judgingEngine || sampling}
+                className="ts-btn-ghost py-1 px-2 text-xs rounded-md border border-emerald-200 bg-emerald-50/70 text-emerald-800 hover:bg-emerald-100 disabled:opacity-45"
+                title="Chấm lại toàn bộ chunk mẫu bằng Kev / Jev System One (giữ nguyên các chunk đã duyệt tay)"
+              >
+                {judgingEngine === 'jev' ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5" />}
+                {judgingEngine === 'jev' ? 'Kev/Jev đang chấm...' : 'Chấm lại Kev / Jev'}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleAiJudge('llm')}
+                disabled={!!judgingEngine || sampling}
+                className="ts-btn-ghost py-1 px-2 text-xs rounded-md disabled:opacity-45"
+                title="Chấm lại toàn bộ chunk mẫu bằng Generative LLM (giữ nguyên các chunk đã duyệt tay)"
+              >
+                {judgingEngine === 'llm' ? <Loader2 className="size-3.5 animate-spin" /> : <Wand2 className="size-3.5" />}
+                {judgingEngine === 'llm' ? 'Đang chấm LLM...' : 'Chấm lại LLM'}
+              </button>
+            </>
           )}
         </div>
 
@@ -887,6 +905,8 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextS
                 const sourceLabel =
                   selected.judge_source === 'MANUAL'
                     ? 'Đã duyệt tay'
+                    : selected.judge_source === 'JEV'
+                    ? 'Đánh giá Kev / Jev'
                     : selected.judge_source === 'LLM'
                     ? 'Đánh giá LLM'
                     : 'Rule tự động';

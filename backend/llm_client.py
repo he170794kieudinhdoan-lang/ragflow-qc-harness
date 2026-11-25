@@ -376,6 +376,102 @@ async def llm_judge_chunk(
     }
 
 
+async def jev_judge_chunk(
+    base_url: str,
+    api_key: str,
+    model: str,
+    chunk_content: str,
+    prev_content: str,
+    next_content: str,
+    filename: str = "",
+    threshold: float = 0.50,
+) -> Dict[str, Any]:
+    """
+    System One (Jev / Kev) Chunking QC Judge: evaluates integrity, standalone context sufficiency,
+    and cleanliness (no_noise) in one /v1/systemone call using calibrated positive defect questions.
+    """
+    prev_tail = (prev_content or "").strip()[-400:] or "N/A"
+    next_head = (next_content or "").strip()[:400] or "N/A"
+    cur_text = (chunk_content or "").strip()[:2200]
+    state = (
+        f"TEXT TO CHECK:\n{cur_text}\n\n"
+        f"(Context before: {prev_tail} | Context after: {next_head})"
+    )
+    answers = await call_system_one(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        state=state,
+        questions={
+            "is_broken": {
+                "type": "noul",
+                "instructions": (
+                    "Does TEXT TO CHECK begin or end mid-sentence or split a bullet list/table across adjacent context?"
+                ),
+            },
+            "missing_subject": {
+                "type": "noul",
+                "instructions": (
+                    "Looking ONLY inside TEXT TO CHECK (ignoring Document Title), does it fail to name the specific medicine, "
+                    "disease, or subject it talks about (ambiguous standalone snippet)?"
+                ),
+            },
+            "has_noise": {
+                "type": "noul",
+                "instructions": (
+                    "Does TEXT TO CHECK contain website UI junk such as menus, breadcrumbs ('Trang chủ >'), "
+                    "booking buttons, hotlines, copyright notices, isolated page numbers, or garbled OCR characters?"
+                ),
+            },
+        },
+        timeout=35.0,
+    )
+
+    def _prob(key: str) -> float:
+        val = (answers.get(key) or {}).get("noul")
+        if val is None:
+            raise LLMError(f"Jev/Kev không trả về giá trị noul cho '{key}'")
+        return float(val)
+
+    p_broken = _prob("is_broken")
+    p_missing_subj = _prob("missing_subject")
+    p_noise = _prob("has_noise")
+
+    broken_cut = max(0.30, min(0.80, threshold - 0.06))
+    ctx_cut = max(0.25, min(0.75, threshold - 0.22))
+    integrity = 0 if p_broken >= broken_cut else 1
+    ctx_suff = 0 if p_missing_subj >= ctx_cut else 1
+    no_noise = 0 if p_noise >= threshold else 1
+
+    codes = []
+    if integrity == 0:
+        codes.append("INTEGRITY")
+    if ctx_suff == 0:
+        codes.append("CONTEXT")
+    if no_noise == 0:
+        codes.append("NOISE")
+
+    borderline = (
+        abs(p_broken - broken_cut) <= 0.06
+        or abs(p_missing_subj - ctx_cut) <= 0.06
+        or abs(p_noise - threshold) <= 0.08
+    )
+    b_tag = " · Cần duyệt" if borderline else ""
+    scores_str = f"broken={p_broken:.2f}, no_ctx={p_missing_subj:.2f}, noise={p_noise:.2f}"
+    if codes:
+        reason = f"Jev/Kev phát hiện {', '.join(codes)} ({scores_str}{b_tag})"
+    else:
+        reason = f"Jev/Kev: Đạt chuẩn ({scores_str}{b_tag})"
+
+    return {
+        "integrity": integrity,
+        "context_sufficiency": ctx_suff,
+        "no_noise": no_noise,
+        "error_codes": codes,
+        "reason": reason[:200],
+    }
+
+
 async def llm_judge_parsing_unit(
     base_url: str,
     api_key: str,

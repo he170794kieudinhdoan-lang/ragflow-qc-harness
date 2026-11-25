@@ -35,6 +35,7 @@ const SECTION_KEYS: Record<SectionId, string[]> = {
     'target_reading_order',
   ],
   step3: [
+    'chunking_judge_provider',
     'chunk_sample_per_doc',
     'min_chunk_chars',
     'max_chunk_chars',
@@ -149,11 +150,10 @@ export default function SettingsModal({
                     setSection(item.id);
                     setConnMsg({});
                   }}
-                  className={`w-full text-left px-2.5 py-2 rounded-[4px] flex items-start gap-2.5 transition-colors ${
-                    active
-                      ? 'bg-white border border-[#dedede] text-[#161616] shadow-2xs'
-                      : 'border border-transparent text-[#52525b] hover:bg-[#f1f1ef] hover:text-[#161616]'
-                  }`}
+                  className={`w-full text-left px-2.5 py-2 rounded-[4px] flex items-start gap-2.5 transition-colors ${active
+                    ? 'bg-white border border-[#dedede] text-[#161616] shadow-2xs'
+                    : 'border border-transparent text-[#52525b] hover:bg-[#f1f1ef] hover:text-[#161616]'
+                    }`}
                 >
                   <Icon className={`size-4 mt-0.5 shrink-0 ${active ? 'text-[#03aa5c]' : 'text-[#71717a]'}`} />
                   <div className="min-w-0">
@@ -633,6 +633,41 @@ export default function SettingsModal({
 
                 <div className="border-t border-[#ededeb] pt-4 space-y-3">
                   <div className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
+                    Engine chấm Chunking mặc định (Bước 3)
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <FieldRow
+                      label="Bộ chấm mặc định"
+                      hint="Khuyên dùng Jev / Kev để chấm nhanh 3 tiêu chí ngữ nghĩa và không dính 429."
+                    >
+                      <select
+                        className="ts-input w-full text-xs"
+                        value={val('chunking_judge_provider', 'jev')}
+                        onChange={(e) => setKey('chunking_judge_provider', e.target.value)}
+                      >
+                        <option value="jev">Jev / Kev System One (/v1/systemone)</option>
+                        <option value="llm">Generative LLM (/chat/completions)</option>
+                      </select>
+                    </FieldRow>
+                    <FieldRow
+                      label="Ngưỡng xác suất Jev/Kev noul"
+                      hint="Dùng chung ngưỡng cấu hình tại Bước 4 (mặc định 0.50)."
+                    >
+                      <input
+                        type="number"
+                        step="0.05"
+                        min={0.05}
+                        max={0.95}
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('systemone_threshold', '0.50')}
+                        onChange={(e) => setKey('systemone_threshold', e.target.value)}
+                      />
+                    </FieldRow>
+                  </div>
+                </div>
+
+                <div className="border-t border-[#ededeb] pt-4 space-y-3">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
                     Ngưỡng KPI đạt chuẩn
                   </div>
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -811,11 +846,10 @@ export default function SettingsModal({
 
             {connMsg.text && (
               <div
-                className={`px-3 py-2 text-xs rounded-[4px] border ${
-                  connMsg.ok
-                    ? 'bg-[#03aa5c]/10 border-[#03aa5c]/30 text-[#027a42]'
-                    : 'bg-red-50 border-red-200 text-red-700'
-                }`}
+                className={`px-3 py-2 text-xs rounded-[4px] border ${connMsg.ok
+                  ? 'bg-[#03aa5c]/10 border-[#03aa5c]/30 text-[#027a42]'
+                  : 'bg-red-50 border-red-200 text-red-700'
+                  }`}
               >
                 {connMsg.text}
               </div>

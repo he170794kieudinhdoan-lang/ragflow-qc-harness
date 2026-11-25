@@ -2,12 +2,18 @@ import asyncio
 import json
 import os
 import re
-from typing import List, Optional
+import time
+from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from database import get_bool_setting, get_db, get_float_setting, get_int_setting, get_setting, utc_now
-from llm_client import llm_judge_chunk
+from llm_client import (
+    jev_judge_chunk,
+    llm_judge_chunk,
+    resolve_systemone_credentials,
+    systemone_requires_key,
+)
 from metrics import analyze_chunk_rules, compute_answer_containment, detect_duplicates_classified, nfc
 
 router = APIRouter(prefix="/api/chunking", tags=["chunking"])
@@ -176,19 +182,30 @@ async def auto_sample_chunks(run_id: int, per_doc: Optional[int] = None):
 
     llm_judged = 0
     try:
-        llm_res = await llm_judge_sampled_chunks(run_id, overwrite_manual=False)
+        llm_res = await llm_judge_sampled_chunks(run_id, overwrite_manual=False, judge_engine="auto")
         llm_judged = int(llm_res.get("judged_count", 0))
     except HTTPException:
         pass
     return {"ok": True, "sampled_chunks": sampled_count, "llm_judged": llm_judged}
 
 
-@router.post("/runs/{run_id}/llm-judge")
-async def llm_judge_sampled_chunks(run_id: int, overwrite_manual: bool = False):
-    """
-    Runs LLM-as-a-Judge across all sampled chunks in `run_id` (concurrently with Semaphore(6)),
-    merging semantic LLM verdicts (C1-C4 + Vietnamese reason) with deterministic mechanical rules (C5-C8).
-    """
+def _resolve_chunking_judge(requested_engine: str = "auto") -> Dict[str, Any]:
+    raw = (requested_engine or "auto").strip().lower()
+    if raw in ("jev", "llm"):
+        engine = raw
+    else:
+        pref = (get_setting("chunking_judge_provider", "jev") or "jev").strip().lower()
+        engine = pref if pref in ("jev", "llm") else "jev"
+
+    if engine == "jev":
+        sys_base, sys_key, sys_model, threshold = resolve_systemone_credentials(get_setting)
+        if not sys_base or not sys_model or (systemone_requires_key(sys_base) and not sys_key):
+            raise HTTPException(
+                status_code=400,
+                detail="Chưa cấu hình Jev / Kev System One (URL, Model và API Key nếu dùng cloud) trong Cài đặt để chấm Chunking.",
+            )
+        return {"engine": "jev", "base_url": sys_base, "api_key": sys_key, "model": sys_model, "threshold": threshold}
+
     llm_base = get_setting("llm_base_url", "").strip()
     llm_key = get_setting("llm_api_key", "").strip()
     llm_model = get_setting("llm_model", "").strip()
@@ -197,6 +214,22 @@ async def llm_judge_sampled_chunks(run_id: int, overwrite_manual: bool = False):
             status_code=400,
             detail="Chưa cấu hình LLM (Base URL, Model, API Key) trong Cài đặt để chấm Chunking bằng LLM.",
         )
+    return {"engine": "llm", "base_url": llm_base, "api_key": llm_key, "model": llm_model}
+
+
+@router.post("/runs/{run_id}/llm-judge")
+async def llm_judge_sampled_chunks(
+    run_id: int,
+    overwrite_manual: bool = False,
+    judge_engine: str = "auto",
+):
+    """
+    Runs AI Chunking QC (Jev/Kev System One or Generative LLM) across sampled chunks in `run_id`,
+    merging semantic verdicts (C1-C4 + reason) with deterministic mechanical rules (C5-C8).
+    """
+    cfg = _resolve_chunking_judge(judge_engine)
+    engine = cfg["engine"]
+    source_tag = "JEV" if engine == "jev" else "LLM"
 
     with get_db() as conn:
         rows = conn.execute(
@@ -220,9 +253,17 @@ async def llm_judge_sampled_chunks(run_id: int, overwrite_manual: bool = False):
 
     targets = [dict(r) for r in rows if overwrite_manual or r["judge_source"] != "MANUAL"]
     if not targets:
-        return {"ok": True, "judged_count": 0, "skipped_manual": len(rows), "failed_count": 0}
+        return {
+            "ok": True,
+            "judge_engine": engine,
+            "judged_count": 0,
+            "skipped_manual": len(rows),
+            "failed_count": 0,
+            "judge_duration_ms": 0,
+            "model": cfg["model"],
+        }
 
-    sem = asyncio.Semaphore(6)
+    sem = asyncio.Semaphore(4 if engine == "jev" else 6)
     updates = []
     errors = []
 
@@ -231,15 +272,27 @@ async def llm_judge_sampled_chunks(run_id: int, overwrite_manual: bool = False):
         next_txt = pos_map.get((item["document_id"], item["chunk_index"] + 1), "")
         async with sem:
             try:
-                res = await llm_judge_chunk(
-                    llm_base,
-                    llm_key,
-                    llm_model,
-                    item["content"] or "",
-                    prev_txt,
-                    next_txt,
-                    item["filename"] or "",
-                )
+                if engine == "jev":
+                    res = await jev_judge_chunk(
+                        cfg["base_url"],
+                        cfg["api_key"],
+                        cfg["model"],
+                        item["content"] or "",
+                        prev_txt,
+                        next_txt,
+                        item["filename"] or "",
+                        threshold=cfg["threshold"],
+                    )
+                else:
+                    res = await llm_judge_chunk(
+                        cfg["base_url"],
+                        cfg["api_key"],
+                        cfg["model"],
+                        item["content"] or "",
+                        prev_txt,
+                        next_txt,
+                        item["filename"] or "",
+                    )
                 try:
                     existing_codes = set(json.loads(item["error_codes"] or "[]"))
                 except Exception:
@@ -261,6 +314,7 @@ async def llm_judge_sampled_chunks(run_id: int, overwrite_manual: bool = False):
                     valid_size,
                     json.dumps(merged_codes),
                     res["reason"],
+                    source_tag,
                     utc_now(),
                     run_id,
                     item["chunk_pk"],
@@ -268,7 +322,15 @@ async def llm_judge_sampled_chunks(run_id: int, overwrite_manual: bool = False):
             except Exception as e:
                 errors.append(str(e)[:160])
 
+    t0 = time.perf_counter()
     await asyncio.gather(*(_judge_one(t) for t in targets))
+    duration_ms = int((time.perf_counter() - t0) * 1000)
+
+    if len(targets) > 0 and len(errors) == len(targets):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Chấm Chunking bằng {engine.upper()} thất bại hoàn toàn ({len(errors)}/{len(targets)} chunk lỗi): {errors[0]}",
+        )
 
     with get_db() as conn:
         for u in updates:
@@ -276,7 +338,7 @@ async def llm_judge_sampled_chunks(run_id: int, overwrite_manual: bool = False):
                 """
                 UPDATE chunk_evaluations
                 SET integrity=?, context_sufficiency=?, no_noise=?, no_duplicate=?, valid_size=?,
-                    error_codes=?, notes=?, judge_source='LLM', updated_at=?
+                    error_codes=?, notes=?, judge_source=?, updated_at=?
                 WHERE run_id=? AND chunk_id=?
                 """,
                 u,
@@ -284,10 +346,12 @@ async def llm_judge_sampled_chunks(run_id: int, overwrite_manual: bool = False):
 
     return {
         "ok": True,
+        "judge_engine": engine,
         "judged_count": len(updates),
         "skipped_manual": len(rows) - len(targets),
         "failed_count": len(errors),
-        "model": llm_model,
+        "judge_duration_ms": duration_ms,
+        "model": cfg["model"],
     }
 
 
