@@ -205,9 +205,11 @@ def export_run_workbook(run_id: int) -> bytes:
             ])
 
         # 4. Chunking Summary (by Document + by Format Group + Overall) & Detail
+        from metrics import compute_weighted_chunking_rates
+
         cevals = conn.execute(
             """
-            SELECT ce.*, c.chunk_index, c.ragflow_chunk_id, c.char_count, c.rule_flags, c.content,
+            SELECT ce.*, c.document_id, c.chunk_index, c.ragflow_chunk_id, c.char_count, c.rule_flags, c.content,
                    d.doc_code, d.filename, d.format_group
             FROM chunk_evaluations ce
             JOIN chunks c ON c.id = ce.chunk_id
@@ -217,20 +219,23 @@ def export_run_workbook(run_id: int) -> bytes:
             """,
             (run_id,),
         ).fetchall()
+        c_doc_totals = {
+            r["document_id"]: r["cnt"]
+            for r in conn.execute(
+                "SELECT document_id, COUNT(*) AS cnt FROM chunks WHERE run_id = ? GROUP BY document_id",
+                (run_id,),
+            ).fetchall()
+        }
 
         def _chunk_rates(rows_in):
-            def _r(field, inv=False):
-                vals = [x[field] for x in rows_in if x[field] is not None]
-                if not vals:
-                    return 0.0
-                return sum(1 for v in vals if (v == 0 if inv else v == 1)) / len(vals)
+            cm = compute_weighted_chunking_rates(rows_in, c_doc_totals)
             return (
                 len(rows_in),
-                _pct(_r("integrity")),
-                _pct(_r("context_sufficiency")),
-                _pct(_r("no_noise", inv=True)),
-                _pct(_r("no_duplicate", inv=True)),
-                _pct(_r("valid_size")),
+                _pct(cm["chunk_integrity"]),
+                _pct(cm["context_sufficiency"]),
+                _pct(cm["noise_rate"]),
+                _pct(cm["duplicate_rate"]),
+                _pct(cm["valid_size_rate"]),
             )
 
         # 4a. Per-document Chunking Summary (matches ChunkingTableView 1-for-1)

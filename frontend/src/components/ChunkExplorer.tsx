@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { api } from '../api/client';
+import { ChunkContentView } from './ChunkContentView';
 
 interface ChunkExplorerItem {
   id: number;
@@ -523,9 +524,10 @@ export const ChunkExplorer: React.FC<Props> = ({ runId, flagLabels }) => {
               {/* Main Content */}
               <div className="space-y-1">
                 <div className="ts-eyebrow">NỘI DUNG CHUNK</div>
-                <div className="p-4 rounded bg-[#fafaf9] border border-[#e4e4e2] text-[13.5px] text-[#18181b] whitespace-pre-wrap leading-relaxed">
-                  {highlightText(selected.content, debouncedQuery)}
-                </div>
+                <ChunkContentView
+                  content={selected.content}
+                  renderText={(txt) => highlightText(txt, debouncedQuery)}
+                />
               </div>
 
               {/* Next Context */}

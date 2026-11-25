@@ -23,6 +23,7 @@ import { WorkspacePage } from './pages/WorkspacePage';
 import { ParsingPage } from './pages/ParsingPage';
 import { ChunkingPage } from './pages/ChunkingPage';
 import { RetrievalPage } from './pages/RetrievalPage';
+import { BrandWordmark } from './components/BrandWordmark';
 import { CompareLabPage } from './pages/CompareLabPage';
 import SettingsModal from './components/SettingsModal';
 import { PageLoader } from './components/PageLoader';
@@ -110,8 +111,11 @@ export default function App() {
     }
   };
 
+  const [visitedTabs, setVisitedTabs] = useState<string[]>(() => [tab]);
+
   const setTab = (next: string) => {
     setTabState(next);
+    setVisitedTabs((prev) => (prev.includes(next) ? prev : [...prev, next]));
     try {
       localStorage.setItem('ragflow_qc_active_tab', next);
     } catch {
@@ -207,6 +211,13 @@ export default function App() {
       /* ignore */
     }
   };
+
+  useEffect(() => {
+    setVisitedTabs([tab]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeRun?.id, refreshKey]);
+
+  const hasVisited = (id: string) => tab === id || visitedTabs.includes(id);
 
   const loadRuns = async (preferredRunId?: number) => {
     const [rList, sRes] = await Promise.all([api.listRuns(), api.getSettings()]);
@@ -328,9 +339,7 @@ export default function App() {
               <rect x="12.5" y="20.4" width="11.5" height="2.6" rx="0.6" fill="#141414" />
               <circle cx="9.3" cy="21.7" r="1.4" fill="#03aa5c" />
             </svg>
-            <span className="font-mono text-[12px] font-bold tracking-[0.12em] whitespace-nowrap text-[#141414]">
-              RAGFLOW<span className="text-[#027a42] ml-1 font-semibold">QC</span>
-            </span>
+            <BrandWordmark className="h-[19px] w-auto shrink-0" autoAnimate />
           </button>
 
           {activeWorkflowMeta && (
@@ -490,43 +499,49 @@ export default function App() {
         {tab === 'overview' && (
           <OverviewPage activeRun={activeRun} onStartWorkflow={startWorkflow} />
         )}
-        {tab === 'workspace' && (
-          <WorkspacePage
-            activeRun={activeRun}
-            runs={runs}
-            refreshKey={refreshKey}
-            onReloadRuns={loadRuns}
-            onSelectRun={persistActiveRun}
-            onOpenSettings={() => setShowSettings(true)}
-            onNextStep={() => setTab('parsing')}
-          />
+        {hasVisited('workspace') && (
+          <div className={tab === 'workspace' ? '' : 'hidden'}>
+            <WorkspacePage
+              activeRun={activeRun}
+              runs={runs}
+              refreshKey={refreshKey}
+              onReloadRuns={loadRuns}
+              onSelectRun={persistActiveRun}
+              onOpenSettings={() => setShowSettings(true)}
+              onNextStep={() => setTab('parsing')}
+            />
+          </div>
         )}
-        {tab === 'parsing' && (
-          <div className="h-full">
+        {hasVisited('parsing') && (
+          <div className={tab === 'parsing' ? 'h-full' : 'hidden'}>
             <ParsingPage
               activeRun={activeRun}
               errorCatalog={catalogs.parsing_errors}
+              isActive={tab === 'parsing'}
               onProgressChange={(rated, total) => setParsingProgress({ rated, total })}
               onNextStep={() => setTab('chunking')}
             />
           </div>
         )}
-        {tab === 'chunking' && (
-          <div className="h-full">
+        {hasVisited('chunking') && (
+          <div className={tab === 'chunking' ? 'h-full' : 'hidden'}>
             <ChunkingPage
               activeRun={activeRun}
               errorCatalog={catalogs.chunking_errors}
+              isActive={tab === 'chunking'}
               onNextStep={() => setTab('retrieval')}
             />
           </div>
         )}
-        {tab === 'retrieval' && (
-          <div className="h-full">
+        {hasVisited('retrieval') && (
+          <div className={tab === 'retrieval' ? 'h-full' : 'hidden'}>
             <RetrievalPage activeRun={activeRun} />
           </div>
         )}
-        {tab === 'compare' && (
-          <CompareLabPage activeRun={activeRun} />
+        {hasVisited('compare') && (
+          <div className={tab === 'compare' ? '' : 'hidden'}>
+            <CompareLabPage activeRun={activeRun} />
+          </div>
         )}
       </main>
 

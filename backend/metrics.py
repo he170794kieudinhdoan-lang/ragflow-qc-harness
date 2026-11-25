@@ -432,18 +432,88 @@ def detect_chunk_rule_flags(
     return [f for f in res["rule_flags"] if f not in ("BROKEN_TABLE", "BAD_BOUNDARY", "LOW_CONTEXT")]
 
 
+def compute_weighted_chunking_rates(
+    rows: List[Any],
+    doc_totals: Dict[Any, int],
+) -> Dict[str, Any]:
+    """
+    Single source of truth for Chunking metrics using Cochran (1977) Stratified Weighted Estimator:
+        P_hat = sum_h (N_h * p_h) / sum_h N_h
+    where N_h is the true total chunk count of document h and p_h is its sampled pass/error rate.
+    Used consistently across Step 3 (ChunkingPage), Step 5 (Analytics/Compare), and Excel export.
+    """
+    by_doc: Dict[Any, List[Any]] = {}
+    for r in rows:
+        did = r["document_id"]
+        by_doc.setdefault(did, []).append(r)
+
+    def _unweighted(field: str, invert: bool = False) -> float:
+        vals = [r[field] for r in rows if r[field] is not None]
+        if not vals:
+            return 0.0
+        ok = sum(1 for v in vals if (v == 0 if invert else v == 1))
+        return round(ok / len(vals), 4)
+
+    def _weighted(field: str, invert: bool = False) -> float:
+        num = 0.0
+        den = 0.0
+        for doc_id, doc_rows in by_doc.items():
+            vals = [r[field] for r in doc_rows if r[field] is not None]
+            if not vals:
+                continue
+            ok = sum(1 for v in vals if (v == 0 if invert else v == 1))
+            p_h = ok / len(vals)
+            w_h = float(doc_totals.get(doc_id, len(vals)))
+            num += w_h * p_h
+            den += w_h
+        if den <= 0:
+            return _unweighted(field, invert=invert)
+        return round(num / den, 4)
+
+    return {
+        "chunk_integrity": _weighted("integrity"),
+        "context_sufficiency": _weighted("context_sufficiency"),
+        "noise_rate": _weighted("no_noise", invert=True),
+        "duplicate_rate": _weighted("no_duplicate", invert=True),
+        "valid_size_rate": _weighted("valid_size"),
+        "unweighted": {
+            "chunk_integrity": _unweighted("integrity"),
+            "context_sufficiency": _unweighted("context_sufficiency"),
+            "noise_rate": _unweighted("no_noise", invert=True),
+            "duplicate_rate": _unweighted("no_duplicate", invert=True),
+            "valid_size_rate": _unweighted("valid_size"),
+        },
+    }
+
+
+def _dup_compare_text(raw: str) -> str:
+    """
+    For HTML table chunks, strip repeated <caption>/<th> headers and HTML tag boilerplate
+    (<table>, <tr>, <td>) so duplicate detection compares actual cell data values only.
+    """
+    txt = raw or ""
+    low = txt.lower()
+    if "<table" in low and "<td" in low:
+        stripped = re.sub(r"<caption\b[^>]*>.*?</caption>", " ", txt, flags=re.I | re.S)
+        stripped = re.sub(r"<th\b[^>]*>.*?</th>", " ", stripped, flags=re.I | re.S)
+        stripped = re.sub(r"<[^>]+>", " ", stripped)
+        return normalize_text(stripped)
+    return normalize_text(txt)
+
+
 def detect_duplicates_classified(
     chunks: List[Dict[str, Any]], threshold: float = 0.85, adj_overlap_threshold: float = 88.0
 ) -> Tuple[set, set]:
     """
-    Returns (adjacent_dup_ids [C6], far_dup_ids [C7]) using RapidFuzz C++:
-    - C6: high similarity or heavy boundary overlap between consecutive chunks of the same doc.
-    - C7: high similarity between non-adjacent chunks (redundant content).
+    Returns (adjacent_dup_ids, far_dup_ids) using RapidFuzz C++:
+    - adjacent_dup_ids: high similarity or heavy boundary overlap between consecutive chunks of the same doc.
+    - far_dup_ids: high similarity between non-adjacent chunks (redundant content).
+    For HTML tables, compares <td> data rows (excluding repeated <th>/<caption> headers).
     """
     adjacent_dups = set()
     far_dups = set()
     normed = [
-        (c["id"], c.get("document_id"), c.get("chunk_index", 0), normalize_text(c["content"]))
+        (c["id"], c.get("document_id"), c.get("chunk_index", 0), _dup_compare_text(c["content"]))
         for c in chunks
     ]
     cutoff = threshold * 100.0
@@ -452,7 +522,7 @@ def detect_duplicates_classified(
         id_i, doc_i, idx_i, txt_i = normed[i]
         if len(txt_i) < 40:
             continue
-        pref_i = txt_i[:500]
+        pref_i = txt_i[:1200]
         for j in range(i + 1, n):
             id_j, doc_j, idx_j, txt_j = normed[j]
             if len(txt_j) < 40:
@@ -465,9 +535,10 @@ def detect_duplicates_classified(
                     adjacent_dups.add(id_i)
                     adjacent_dups.add(id_j)
                     continue
-            if min(len(pref_i), len(txt_j[:500])) / max(len(pref_i), len(txt_j[:500])) < 0.7:
+            pref_j = txt_j[:1200]
+            if min(len(pref_i), len(pref_j)) / max(len(pref_i), len(pref_j)) < 0.7:
                 continue
-            sim = fuzz.ratio(pref_i, txt_j[:500], score_cutoff=cutoff)
+            sim = fuzz.ratio(pref_i, pref_j, score_cutoff=cutoff)
             if sim >= cutoff:
                 if is_adj:
                     adjacent_dups.add(id_i)
@@ -535,9 +606,6 @@ def analyze_chunk_rules(
     elif n > max_chars and not (exempt_intact_table and is_intact_table):
         add("SIZE", "TOO_LONG")
 
-    if re.search(r"[\ufffd\x00-\x08\x0b\x0c\x0e-\x1f]", raw):
-        add("NOISE", "CHAR_CORRUPTION")
-
     has_rep_line = bool(repeated_lines and any(ln in repeated_lines for ln in lines))
     has_isolated_page_num = len(lines) >= 3 and any(re.fullmatch(r"\d{1,3}", ln) for ln in lines)
     has_cta_footer = bool(
@@ -553,7 +621,7 @@ def analyze_chunk_rules(
         long_norm = [ln for ln in norm_lines if len(ln) >= 22]
         for i_ln in range(len(long_norm)):
             for j_ln in range(i_ln + 1, len(long_norm)):
-                if fuzz.ratio(long_norm[i_ln], long_norm[j_ln], score_cutoff=82) >= 82:
+                if fuzz.ratio(long_norm[i_ln], long_norm[j_ln], score_cutoff=95) >= 95:
                     has_internal_dup = True
                     break
             if has_internal_dup:
@@ -566,7 +634,7 @@ def analyze_chunk_rules(
                     half = len(toks) // 2
                     left_s = " ".join(toks[:half])
                     right_s = " ".join(toks[half:])
-                    if fuzz.partial_ratio(left_s, right_s, score_cutoff=85) >= 85:
+                    if fuzz.partial_ratio(left_s, right_s, score_cutoff=92) >= 92:
                         has_internal_dup = True
                         break
 
@@ -577,7 +645,8 @@ def analyze_chunk_rules(
 
     prev_has_td = "<td" in (prev_content or "").lower()
     next_has_td = "<td" in (next_content or "").lower()
-    if has_td and ((has_table_open != has_table_close) or (not has_table_open) or prev_has_td or next_has_td):
+    has_th_header = "<th" in lower
+    if has_td and ((has_table_open != has_table_close) or (not has_table_open) or ((prev_has_td or next_has_td) and not (is_intact_table and has_th_header))):
         add("INTEGRITY", "BROKEN_TABLE")
 
     prev_lines = [ln.strip() for ln in nfc(prev_content or "").splitlines() if ln.strip()]

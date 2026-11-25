@@ -7,12 +7,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from database import get_db, get_setting, utc_now
+from database import get_current_account_key, get_db, get_setting, utc_now
 from ragflow_client import RAGFlowClient, RAGFlowError
 from llm_client import (
     jev_judge_relevance,
     llm_generate_question,
     llm_judge_relevance,
+    llm_judge_relevance_batch,
     resolve_systemone_credentials,
     systemone_requires_key,
 )
@@ -71,18 +72,26 @@ class TestcaseMetaUpdate(BaseModel):
 # ---------- Golden Dataset ----------
 @router.get("/testcases")
 def list_testcases():
+    acct = get_current_account_key()
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM golden_testcases ORDER BY tc_code").fetchall()
+        if acct:
+            rows = conn.execute(
+                "SELECT * FROM golden_testcases WHERE account_key = ? OR account_key = '' ORDER BY tc_code",
+                (acct,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM golden_testcases ORDER BY tc_code").fetchall()
         return [dict(r) for r in rows]
 
 
 @router.post("/testcases")
 def create_testcase(payload: TestcaseCreate):
+    acct = get_current_account_key()
     with get_db() as conn:
         conn.execute(
             """
-            INSERT INTO golden_testcases (tc_code, input_question, expected_outcome, reference_context, source_file, question_class, intent_type, notes, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO golden_testcases (tc_code, input_question, expected_outcome, reference_context, source_file, question_class, intent_type, notes, account_key, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(tc_code) DO UPDATE SET
                 input_question=excluded.input_question,
                 expected_outcome=excluded.expected_outcome,
@@ -90,12 +99,13 @@ def create_testcase(payload: TestcaseCreate):
                 source_file=excluded.source_file,
                 question_class=excluded.question_class,
                 intent_type=excluded.intent_type,
-                notes=excluded.notes
+                notes=excluded.notes,
+                account_key=excluded.account_key
             """,
             (
                 payload.tc_code.strip(), payload.input_question.strip(), payload.expected_outcome,
                 payload.reference_context.strip(), payload.source_file, payload.question_class,
-                payload.intent_type, payload.notes, utc_now(),
+                payload.intent_type, payload.notes, acct, utc_now(),
             ),
         )
         row = conn.execute("SELECT * FROM golden_testcases WHERE tc_code = ?", (payload.tc_code.strip(),)).fetchone()
@@ -111,31 +121,35 @@ def delete_testcase(tc_id: int):
 
 @router.delete("/testcases")
 def clear_all_testcases():
+    acct = get_current_account_key()
     with get_db() as conn:
-        cur = conn.execute("DELETE FROM golden_testcases")
+        if acct:
+            cur = conn.execute("DELETE FROM golden_testcases WHERE account_key = ? OR account_key = ''", (acct,))
+        else:
+            cur = conn.execute("DELETE FROM golden_testcases")
         deleted = cur.rowcount
     return {"ok": True, "deleted": deleted}
 
 
 class AutoGenRequest(BaseModel):
     run_id: int
-    total_count: int = 40
+    total_count: int = 50
     replace_existing: bool = True
-
-
-def _clean_chunk_text(raw: str, max_len: int = 1200) -> str:
-    txt = nfc(raw or "").strip()
-    txt = re.sub(r"<[^>]+>", " ", txt)
-    txt = re.sub(r"[ \t]+", " ", txt)
-    return txt.strip()[:max_len]
+    style_prompt: str = ""
 
 
 @router.post("/testcases/auto-generate")
 async def auto_generate_golden_testcases(payload: AutoGenRequest):
     """
-    Mandatory LLM Golden Dataset generator with exact spec class distribution:
-    Local 50%, Global 35%, Multi-hop 15% (default 40 testcases = 20 / 14 / 6).
+    Standalone Original-File Golden Dataset generator (default 50 testcases):
+    Reads directly from original source files (`documents.file_path`) — 100% independent of
+    RAGFlow chunks — allocates quotas via Bankier (1988) Adaptive √n, builds 50% Local /
+    35% Global / 15% Multi-hop (keyword-matched pairs), and batches LLM calls for low latency.
     """
+    import time
+    from golden_generator import generate_golden_dataset_from_originals
+
+    t0 = time.perf_counter()
     llm_base = get_setting("llm_base_url", "").strip()
     llm_key = get_setting("llm_api_key", "").strip()
     llm_model = get_setting("llm_model", "").strip()
@@ -145,123 +159,55 @@ async def auto_generate_golden_testcases(payload: AutoGenRequest):
             detail="Bắt buộc phải cấu hình LLM (Base URL, Model, API Key) trong Cài đặt trước khi sinh Golden Dataset.",
         )
 
-    total_count = max(5, min(payload.total_count, 100))
-    n_local = round(total_count * 0.50)
-    n_global = round(total_count * 0.35)
-    n_multihop = max(0, total_count - n_local - n_global)
-
     with get_db() as conn:
-        rows = conn.execute(
+        doc_rows = conn.execute(
             """
-            SELECT c.document_id, c.chunk_index, c.content, d.doc_code, d.filename
-            FROM chunks c
-            JOIN documents d ON d.id = c.document_id
-            WHERE c.run_id = ? AND LENGTH(TRIM(c.content)) >= 140
-            ORDER BY d.doc_code, c.chunk_index
+            SELECT DISTINCT d.id, d.doc_code, d.filename, d.file_path, d.format_group
+            FROM documents d
+            JOIN chunks c ON c.document_id = d.id
+            WHERE c.run_id = ?
+            ORDER BY d.doc_code
             """,
             (payload.run_id,),
         ).fetchall()
-        if not rows:
+        if not doc_rows:
+            doc_rows = conn.execute(
+                "SELECT id, doc_code, filename, file_path, format_group FROM documents ORDER BY doc_code"
+            ).fetchall()
+        if not doc_rows:
             raise HTTPException(
                 status_code=400,
-                detail="Phiên này chưa có chunks nào để sinh bộ câu hỏi. Hãy Đồng bộ RAGFlow ở Bước 1 trước.",
+                detail="Chưa có file tài liệu gốc nào để sinh Golden Dataset. Hãy tải tài liệu lên ở Bước 1 trước.",
             )
+        docs = [dict(r) for r in doc_rows]
 
-        if payload.replace_existing:
-            conn.execute("DELETE FROM golden_testcases")
+    final_items, class_counts, errors, meta = await generate_golden_dataset_from_originals(
+        docs=docs,
+        total_count=payload.total_count,
+        llm_base=llm_base,
+        llm_key=llm_key,
+        llm_model=llm_model,
+        style_prompt=payload.style_prompt,
+    )
 
-        existing_codes = {r["tc_code"] for r in conn.execute("SELECT tc_code FROM golden_testcases").fetchall()}
-
-    by_doc: dict = {}
-    for r in rows:
-        by_doc.setdefault(r["document_id"], []).append(dict(r))
-    doc_lists = list(by_doc.values())
-    num_docs = len(doc_lists)
-
-    jobs = []
-
-    # 1. Local (50%): 1 chunk per job, round-robin across documents
-    doc_cursor = {i: 0 for i in range(num_docs)}
-    for k in range(n_local):
-        d_idx = k % num_docs
-        clist = doc_lists[d_idx]
-        pos = (doc_cursor[d_idx] * max(1, len(clist) // 3)) % len(clist)
-        doc_cursor[d_idx] += 1
-        ch = clist[pos]
-        jobs.append((
-            "Local",
-            _clean_chunk_text(ch["content"], 1600),
-            ch["filename"],
-            f"{ch['doc_code']} #{ch['chunk_index']}",
-        ))
-
-    # 2. Global (35%): 2-3 spread-out chunks from same doc (or 2 docs if doc is short)
-    for k in range(n_global):
-        d_idx = k % num_docs
-        clist = doc_lists[d_idx]
-        if len(clist) >= 3:
-            picks = [clist[0], clist[len(clist) // 2], clist[-1]]
-            src_name = clist[0]["filename"]
-            ref_tag = f"{clist[0]['doc_code']} (tổng hợp 3 đoạn)"
-        elif len(clist) == 2:
-            picks = clist
-            src_name = clist[0]["filename"]
-            ref_tag = f"{clist[0]['doc_code']} (tổng hợp 2 đoạn)"
-        else:
-            other = doc_lists[(d_idx + 1) % num_docs]
-            picks = [clist[0], other[0]]
-            src_name = f"{clist[0]['filename']}; {other[0]['filename']}"
-            ref_tag = f"{clist[0]['doc_code']}+{other[0]['doc_code']}"
-        combined = "\n\n".join(
-            f"[Đoạn {i+1} - {c['filename']} #{c['chunk_index']}]\n{_clean_chunk_text(c['content'], 950)}"
-            for i, c in enumerate(picks)
-        )
-        jobs.append(("Global", combined, src_name, ref_tag))
-
-    # 3. Multi-hop (15%): 2 distinct chunks from different sections/docs for A -> B -> C reasoning
-    for k in range(n_multihop):
-        d1 = doc_lists[(k * 2) % num_docs]
-        d2 = doc_lists[(k * 2 + 1) % num_docs] if num_docs > 1 else d1
-        c1 = d1[min(len(d1) - 1, k % len(d1))]
-        c2 = d2[min(len(d2) - 1, (k + len(d2) // 2) % len(d2))]
-        src_name = c1["filename"] if c1["filename"] == c2["filename"] else f"{c1['filename']}; {c2['filename']}"
-        combined = (
-            f"[Đoạn A - {c1['filename']} #{c1['chunk_index']}]\n{_clean_chunk_text(c1['content'], 1300)}\n\n"
-            f"[Đoạn B - {c2['filename']} #{c2['chunk_index']}]\n{_clean_chunk_text(c2['content'], 1300)}"
-        )
-        jobs.append(("Multi-hop", combined, src_name, f"{c1['doc_code']}→{c2['doc_code']}"))
-
-    sem = asyncio.Semaphore(6)
-    results = []
-    errors = []
-
-    async def _run_job(idx_job: int, job: tuple):
-        target_class, ctx_text, src_file, ref_tag = job
-        async with sem:
-            try:
-                q, expected, q_class, intent, ref_ctx = await llm_generate_question(
-                    llm_base, llm_key, llm_model, ctx_text, src_file, target_class=target_class
-                )
-                results.append((idx_job, q, expected, ref_ctx[:600], src_file, q_class, intent, f"LLM ({llm_model}) · {ref_tag}"))
-            except Exception as e:
-                errors.append(str(e)[:180])
-
-    await asyncio.gather(*(_run_job(i, j) for i, j in enumerate(jobs)))
-
-    if not results:
+    if not final_items:
         raise HTTPException(
             status_code=502,
-            detail=f"LLM không sinh được câu hỏi nào. Lỗi gần nhất: {errors[0] if errors else 'Không rõ'}",
+            detail=f"LLM không sinh được câu hỏi nào từ file gốc. Lỗi gần nhất: {errors[0] if errors else 'Không rõ'}",
         )
 
-    results.sort(key=lambda x: x[0])
-    next_idx = 1
     now = utc_now()
+    acct = get_current_account_key()
     created = []
-    class_counts = {"Local": 0, "Global": 0, "Multi-hop": 0}
-
     with get_db() as conn:
-        for _, q, expected, ref_ctx, src_file, q_class, intent, note in results:
+        if payload.replace_existing:
+            if acct:
+                conn.execute("DELETE FROM golden_testcases WHERE account_key = ? OR account_key = ''", (acct,))
+            else:
+                conn.execute("DELETE FROM golden_testcases")
+        existing_codes = {r["tc_code"] for r in conn.execute("SELECT tc_code FROM golden_testcases").fetchall()}
+        next_idx = 1
+        for item in final_items:
             while f"TC{next_idx:02d}" in existing_codes:
                 next_idx += 1
             tc_code = f"TC{next_idx:02d}"
@@ -269,20 +215,38 @@ async def auto_generate_golden_testcases(payload: AutoGenRequest):
             next_idx += 1
             conn.execute(
                 """
-                INSERT INTO golden_testcases (tc_code, input_question, expected_outcome, reference_context, source_file, question_class, intent_type, notes, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO golden_testcases (tc_code, input_question, expected_outcome, reference_context, source_file, question_class, intent_type, notes, account_key, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (tc_code, q, expected, ref_ctx, src_file, q_class, intent, note, now),
+                (
+                    tc_code,
+                    item["question"],
+                    item["expected_outcome"],
+                    item["reference_context"][:2500],
+                    item["source_file"],
+                    item["question_class"],
+                    item["intent_type"],
+                    item["notes"],
+                    acct,
+                    now,
+                ),
             )
-            class_counts[q_class] = class_counts.get(q_class, 0) + 1
-            created.append({"tc_code": tc_code, "input_question": q, "question_class": q_class, "source_file": src_file})
+            created.append({
+                "tc_code": tc_code,
+                "input_question": item["question"],
+                "question_class": item["question_class"],
+                "source_file": item["source_file"],
+            })
 
+    elapsed = round(time.perf_counter() - t0, 2)
     return {
         "ok": True,
         "generated_count": len(created),
         "llm_used_count": len(created),
         "class_counts": class_counts,
         "failed_count": len(errors),
+        "elapsed_sec": elapsed,
+        "meta": meta,
         "testcases": created,
     }
 
@@ -425,12 +389,19 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
 
     judge_cfg = _resolve_retrieval_judge(payload.judge_engine, payload.use_llm)
 
+    acct = get_current_account_key()
     with get_db() as conn:
         run = conn.execute("SELECT * FROM runs WHERE id = ?", (payload.run_id,)).fetchone()
         if not run or not run["ragflow_dataset_id"]:
             raise HTTPException(status_code=400, detail="Run chưa gắn RAGFlow Dataset ID.")
         dataset_id = run["ragflow_dataset_id"]
-        testcases = conn.execute("SELECT * FROM golden_testcases ORDER BY tc_code").fetchall()
+        if acct:
+            testcases = conn.execute(
+                "SELECT * FROM golden_testcases WHERE account_key = ? OR account_key = '' ORDER BY tc_code",
+                (acct,),
+            ).fetchall()
+        else:
+            testcases = conn.execute("SELECT * FROM golden_testcases ORDER BY tc_code").fetchall()
         if not testcases:
             raise HTTPException(status_code=400, detail="Golden Dataset đang trống. Hãy thêm testcase trước.")
 
@@ -449,14 +420,19 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
     client = RAGFlowClient(base_url, api_key)
     now = utc_now()
 
+    t0 = time.perf_counter()
+
     cache_hits = 0
     total_retrieved = 0
     use_full_ac = bool(snap_chunks) and (len(testcases) * len(snap_chunks) <= 40000)
-    ragflow_sem = asyncio.Semaphore(1)
+
+    # Phase 1: Query RAGFlow /api/v1/retrieval cleanly with gentle concurrency Semaphore(2)
+    rag_sem = asyncio.Semaphore(2)
+    llm_sem = asyncio.Semaphore(10)
     judge_sem = _judge_semaphore(judge_cfg["engine"])
 
-    async def process_one(tc):
-        async with ragflow_sem:
+    async def fetch_from_ragflow(tc):
+        async with rag_sem:
             last_err = None
             chunks = []
             for attempt in range(6):
@@ -474,7 +450,7 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
                     )
                     chunks = resp.get("chunks", [])[: payload.top_k]
                     last_err = None
-                    await asyncio.sleep(0.25)
+                    await asyncio.sleep(0.1)
                     break
                 except RAGFlowError as e:
                     last_err = e
@@ -485,45 +461,98 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
                     raise HTTPException(status_code=400, detail=f"Lỗi Retrieval tại {tc['tc_code']}: {e}")
             if last_err is not None:
                 raise HTTPException(status_code=400, detail=f"Lỗi Retrieval tại {tc['tc_code']}: {last_err}")
+            return tc, chunks
 
+    # Phase 2: Evaluate Relevancy using Jev/Kev, batched LLM-as-a-Judge, or RapidFuzz rule
+    async def judge_testcase(tc, chunks):
         ac_pool = snap_chunks if use_full_ac else chunks
         ac = compute_answer_containment(tc["reference_context"], ac_pool) if ac_pool else "UNCHECKED"
         cov = compute_context_coverage(tc["reference_context"], chunks)
 
         t_judge_start = time.perf_counter()
-        hit_tasks = []
-        hit_meta = []
-        for rank, ch in enumerate(chunks, start=1):
-            cid = ch.get("id") or ch.get("chunk_id") or f"unk_{rank}"
-            ch_content = ch.get("content") or ch.get("content_with_weight") or ""
-            ch_doc_name = ch.get("document_keyword") or ch.get("document_name") or ch.get("docnm_kwd", "")
-            hit_meta.append((rank, cid, ch, ch_content, ch_doc_name))
-            cached = cache_map.get((tc["id"], cid))
-            if cached is not None:
-                async def _from_cache(val=cached):
-                    return val[0], "CACHED", val[1], None, 0
-                hit_tasks.append(_from_cache())
-            else:
-                hit_tasks.append(_judge_single_hit(judge_sem, judge_cfg, tc["input_question"], tc["reference_context"], ch_content))
-
-        judged_list = await asyncio.gather(*hit_tasks) if hit_tasks else []
-        tc_judge_ms = int((time.perf_counter() - t_judge_start) * 1000)
-
+        engine = judge_cfg["engine"]
         scored_hits = []
         local_cache_hits = 0
         local_calls = 0
         local_errors = 0
         first_err = None
-        for (rank, cid, ch, ch_content, ch_doc_name), (rel_val, src, reason, err_msg, ai_calls) in zip(hit_meta, judged_list):
-            if src == "CACHED":
-                local_cache_hits += 1
-            local_calls += ai_calls
-            if err_msg:
-                local_errors += 1
-                if first_err is None:
-                    first_err = err_msg
-            scored_hits.append((rank, cid, ch, ch_content, ch_doc_name, rel_val, src, reason))
 
+        if engine == "llm":
+            uncached_cands = []
+            parsed_hits = []
+            for rank, ch in enumerate(chunks, start=1):
+                cid = ch.get("id") or ch.get("chunk_id") or f"unk_{rank}"
+                ch_content = ch.get("content") or ch.get("content_with_weight") or ""
+                ch_doc_name = ch.get("document_keyword") or ch.get("document_name") or ch.get("docnm_kwd", "")
+                cached = cache_map.get((tc["id"], cid))
+                parsed_hits.append((rank, cid, ch, ch_content, ch_doc_name, cached))
+                if cached is None:
+                    uncached_cands.append({"rank": rank, "content": ch_content})
+
+            llm_verdicts: dict = {}
+            batch_err = None
+            if uncached_cands:
+                local_calls = 1
+                async with llm_sem:
+                    try:
+                        llm_verdicts = await llm_judge_relevance_batch(
+                            judge_cfg["base_url"],
+                            judge_cfg["api_key"],
+                            judge_cfg["model"],
+                            tc["input_question"],
+                            tc["reference_context"],
+                            uncached_cands,
+                        )
+                    except Exception as e:
+                        batch_err = str(e)
+                        local_errors = 1
+                        first_err = batch_err
+
+            for rank, cid, ch, ch_content, ch_doc_name, cached in parsed_hits:
+                if cached is not None:
+                    rel_val, reason = cached
+                    src = "CACHED"
+                    local_cache_hits += 1
+                elif rank in llm_verdicts:
+                    rel_val, reason = llm_verdicts[rank]
+                    src = "LLM_DRAFT"
+                else:
+                    rel_val, r_rule = score_chunk_relevance(tc["reference_context"], ch_content)
+                    src = "RULE"
+                    reason = (
+                        f"[Fallback RapidFuzz: {batch_err[:70]}] {r_rule}"[:180]
+                        if batch_err
+                        else r_rule
+                    )
+                scored_hits.append((rank, cid, ch, ch_content, ch_doc_name, rel_val, src, reason))
+        else:
+            hit_tasks = []
+            hit_meta = []
+            for rank, ch in enumerate(chunks, start=1):
+                cid = ch.get("id") or ch.get("chunk_id") or f"unk_{rank}"
+                ch_content = ch.get("content") or ch.get("content_with_weight") or ""
+                ch_doc_name = ch.get("document_keyword") or ch.get("document_name") or ch.get("docnm_kwd", "")
+                hit_meta.append((rank, cid, ch, ch_content, ch_doc_name))
+                cached = cache_map.get((tc["id"], cid))
+                if cached is not None:
+                    async def _from_cache(val=cached):
+                        return val[0], "CACHED", val[1], None, 0
+                    hit_tasks.append(_from_cache())
+                else:
+                    hit_tasks.append(_judge_single_hit(judge_sem, judge_cfg, tc["input_question"], tc["reference_context"], ch_content))
+
+            judged_list = await asyncio.gather(*hit_tasks) if hit_tasks else []
+            for (rank, cid, ch, ch_content, ch_doc_name), (rel_val, src, reason, err_msg, ai_calls) in zip(hit_meta, judged_list):
+                if src == "CACHED":
+                    local_cache_hits += 1
+                local_calls += ai_calls
+                if err_msg:
+                    local_errors += 1
+                    if first_err is None:
+                        first_err = err_msg
+                scored_hits.append((rank, cid, ch, ch_content, ch_doc_name, rel_val, src, reason))
+
+        tc_judge_ms = int((time.perf_counter() - t_judge_start) * 1000)
         rel_ranks = [h[0] for h in scored_hits if h[5] == 1]
         suggested_layer = _suggest_root_cause_layer(
             rel_ranks,
@@ -532,8 +561,11 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
             ac,
             tc["intent_type"],
         )
-
         return tc["id"], ac, cov, suggested_layer, scored_hits, local_cache_hits, tc_judge_ms, local_calls, local_errors, first_err
+
+    async def process_one(tc):
+        tc_obj, chunks = await fetch_from_ragflow(tc)
+        return await judge_testcase(tc_obj, chunks)
 
     results = await asyncio.gather(*(process_one(tc) for tc in testcases))
 
@@ -554,6 +586,7 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
             detail=f"Chấm {judge_cfg['engine'].upper()} thất bại hoàn toàn ({total_errors}/{total_calls} lượt lỗi): {first_fatal_err}",
         )
 
+    # Only insert retrieval_runs row once all queries & judging succeed (prevents half-baked orphan runs!)
     with get_db() as conn:
         cur = conn.execute(
             """
@@ -567,7 +600,6 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
             ),
         )
         rr_id = cur.lastrowid
-
         for tc_id, ac, cov, suggested_layer, scored_hits, local_cache_hits, _, _, _, _ in results:
             cache_hits += local_cache_hits
             conn.execute(
@@ -596,6 +628,7 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
                 )
                 total_retrieved += 1
 
+    elapsed = round(time.perf_counter() - t0, 2)
     return {
         "ok": True,
         "retrieval_run_id": rr_id,
@@ -606,6 +639,7 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
         "judge_duration_ms": total_judge_ms,
         "judge_call_count": total_calls,
         "judge_error_count": total_errors,
+        "elapsed_sec": elapsed,
     }
 
 

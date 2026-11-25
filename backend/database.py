@@ -268,6 +268,11 @@ def init_db():
         if "judge_error_count" not in rr_cols:
             conn.execute("ALTER TABLE retrieval_runs ADD COLUMN judge_error_count INTEGER DEFAULT 0")
 
+        # Ensure golden_testcases.account_key exists so switching RAGFlow accounts/datasets never wipes other datasets
+        gt_cols = {r["name"] for r in conn.execute("PRAGMA table_info(golden_testcases)").fetchall()}
+        if "account_key" not in gt_cols:
+            conn.execute("ALTER TABLE golden_testcases ADD COLUMN account_key TEXT DEFAULT ''")
+
 
 DEFAULT_SETTINGS: dict[str, str] = {
     # Connection
@@ -279,8 +284,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "vision_base_url": "",
     "vision_api_key": "",
     "vision_model": "",
-    # System One / Jev (Retrieval Judge via Vercel AI Gateway or TypeSafe)
-    "retrieval_judge_provider": "jev",
+    # System One / Jev (Retrieval & Chunking Judge via Colab Kev, Vercel AI Gateway, or TypeSafe)
+    "retrieval_judge_provider": "llm",
     "systemone_base_url": "https://ai-gateway.vercel.sh/typesafe",
     "systemone_api_key": "",
     "systemone_model": "typesafe-ai/jev",
@@ -293,8 +298,12 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "target_table_accuracy": "0.75",
     "target_reading_order": "0.80",
     # Step 3: Chunking
-    "chunking_judge_provider": "jev",
+    "chunking_judge_provider": "llm",
+    "chunk_sample_mode": "adaptive",
     "chunk_sample_per_doc": "5",
+    "chunk_sample_min": "5",
+    "chunk_sample_max": "20",
+    "chunk_sample_sqrt_k": "2.0",
     "min_chunk_chars": "50",
     "max_chunk_chars": "2600",
     "exempt_intact_table_from_max_chars": "true",

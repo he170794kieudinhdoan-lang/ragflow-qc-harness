@@ -10,6 +10,7 @@ from metrics import (
     RETRIEVAL_ERROR_CATALOG,
     compute_contextual_precision,
     compute_parsing_metrics,
+    compute_weighted_chunking_rates,
 )
 
 router = APIRouter(prefix="/api/analytics", tags=["analytics"])
@@ -217,21 +218,31 @@ def get_run_overview(run_id: int):
             "rated": pm["rated_units"],
         }
 
-        # Chunking stats
-        c_rows = conn.execute("SELECT * FROM chunk_evaluations WHERE run_id = ? AND is_sampled = 1", (run_id,)).fetchall()
-        def _rate(field, inv=False):
-            vals = [r[field] for r in c_rows if r[field] is not None]
-            if not vals:
-                return 0.0
-            return round(sum(1 for v in vals if (v == 0 if inv else v == 1)) / len(vals), 4)
-
+        # Chunking stats (Cochran 1977 Stratified Weighted — matches Step 3 ChunkingPage 1-for-1)
+        c_rows = conn.execute(
+            """
+            SELECT ce.*, c.document_id
+            FROM chunk_evaluations ce
+            JOIN chunks c ON c.id = ce.chunk_id
+            WHERE ce.run_id = ? AND ce.is_sampled = 1
+            """,
+            (run_id,),
+        ).fetchall()
+        doc_totals = {
+            r["document_id"]: r["cnt"]
+            for r in conn.execute(
+                "SELECT document_id, COUNT(*) AS cnt FROM chunks WHERE run_id = ? GROUP BY document_id",
+                (run_id,),
+            ).fetchall()
+        }
+        cm = compute_weighted_chunking_rates(c_rows, doc_totals)
         chunking = {
             "sampled": len(c_rows),
-            "chunk_integrity": _rate("integrity"),
-            "context_sufficiency": _rate("context_sufficiency"),
-            "noise_rate": _rate("no_noise", inv=True),
-            "duplicate_rate": _rate("no_duplicate", inv=True),
-            "valid_size_rate": _rate("valid_size"),
+            "chunk_integrity": cm["chunk_integrity"],
+            "context_sufficiency": cm["context_sufficiency"],
+            "noise_rate": cm["noise_rate"],
+            "duplicate_rate": cm["duplicate_rate"],
+            "valid_size_rate": cm["valid_size_rate"],
         }
 
         # Latest retrieval run for this run_id
@@ -374,14 +385,22 @@ def get_runs_comparison_matrix():
             pm = compute_parsing_metrics(p_rows)
 
             c_rows = conn.execute(
-                "SELECT * FROM chunk_evaluations WHERE run_id = ? AND is_sampled = 1", (rid,)
+                """
+                SELECT ce.*, c.document_id
+                FROM chunk_evaluations ce
+                JOIN chunks c ON c.id = ce.chunk_id
+                WHERE ce.run_id = ? AND ce.is_sampled = 1
+                """,
+                (rid,),
             ).fetchall()
-
-            def _rate(field, inv=False):
-                vals = [r[field] for r in c_rows if r[field] is not None]
-                if not vals:
-                    return None
-                return round(sum(1 for v in vals if (v == 0 if inv else v == 1)) / len(vals), 4)
+            doc_totals = {
+                r["document_id"]: r["cnt"]
+                for r in conn.execute(
+                    "SELECT document_id, COUNT(*) AS cnt FROM chunks WHERE run_id = ? GROUP BY document_id",
+                    (rid,),
+                ).fetchall()
+            }
+            cm = compute_weighted_chunking_rates(c_rows, doc_totals) if c_rows else None
 
             rr = conn.execute(
                 "SELECT * FROM retrieval_runs WHERE run_id = ? ORDER BY id DESC LIMIT 1", (rid,)
@@ -428,11 +447,11 @@ def get_runs_comparison_matrix():
                 },
                 "chunking": {
                     "sampled": len(c_rows),
-                    "chunk_integrity": _rate("integrity"),
-                    "context_sufficiency": _rate("context_sufficiency"),
-                    "noise_rate": _rate("no_noise", inv=True),
-                    "duplicate_rate": _rate("no_duplicate", inv=True),
-                    "size_compliance": _rate("valid_size"),
+                    "chunk_integrity": cm["chunk_integrity"] if cm else None,
+                    "context_sufficiency": cm["context_sufficiency"] if cm else None,
+                    "noise_rate": cm["noise_rate"] if cm else None,
+                    "duplicate_rate": cm["duplicate_rate"] if cm else None,
+                    "size_compliance": cm["valid_size_rate"] if cm else None,
                 },
                 "retrieval": {
                     "run_name": rr["name"] if rr else None,

@@ -9,13 +9,14 @@ import { DocumentItem, ErrorCodeDef, ParsingUnit, RunItem } from '../types';
 interface Props {
   activeRun: RunItem | null;
   errorCatalog: ErrorCodeDef[];
+  isActive?: boolean;
   onNextStep?: () => void;
   onProgressChange?: (rated: number, total: number) => void;
 }
 
 type ColorFilter = 'ALL' | 'PASS' | 'FAIL';
 
-export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextStep, onProgressChange }) => {
+export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive = true, onNextStep, onProgressChange }) => {
   const [docs, setDocs] = useState<DocumentItem[]>([]);
   const [selectedDocId, setSelectedDocId] = useState<number | undefined>(undefined);
   const [units, setUnits] = useState<ParsingUnit[]>([]);
@@ -466,6 +467,7 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
   };
 
   useEffect(() => {
+    if (!isActive) return;
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
@@ -491,7 +493,7 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, onNextSt
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [selectedUnit, filteredUnits, errCodes, charErr, notes, scoring, showErrPopover]);
+  }, [isActive, selectedUnit, filteredUnits, errCodes, charErr, notes, scoring, showErrPopover]);
 
   if (!activeRun) {
     return <div className="p-8 text-sm text-[#71717a]">Hãy chọn hoặc tạo một phiên kiểm thử trước.</div>;

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import os
 import re
 import time
@@ -30,15 +31,55 @@ class ChunkScoreUpdate(BaseModel):
     judge_source: str = "MANUAL"
 
 
+def compute_doc_sample_size(
+    n: int,
+    mode: str = "adaptive",
+    per_doc: int = 5,
+    min_per_doc: int = 5,
+    max_per_doc: int = 20,
+    sqrt_k: float = 2.0,
+) -> int:
+    """
+    Bankier (1988) Power Allocation (q = 0.5, Square-Root Allocation) by default:
+        k = clamp(round(sqrt_k * sqrt(n)), min_per_doc, max_per_doc)
+    Balances document-level reliability on short files with corpus-level coverage on long files.
+    """
+    if n <= 0:
+        return 0
+    m = (mode or "adaptive").strip().lower()
+    if m == "full" or (m == "fixed" and per_doc <= 0):
+        return n
+    if m == "fixed":
+        return min(n, max(1, per_doc))
+    lo = max(1, min_per_doc)
+    hi = max(lo, max_per_doc)
+    k = int(round(max(0.5, sqrt_k) * math.sqrt(n)))
+    return min(n, max(lo, min(hi, k)))
+
+
 @router.post("/runs/{run_id}/sample")
-async def auto_sample_chunks(run_id: int, per_doc: Optional[int] = None):
+async def auto_sample_chunks(
+    run_id: int,
+    per_doc: Optional[int] = None,
+    mode: Optional[str] = None,
+):
     """
-    Deterministic stratified sampling: picks `per_doc` chunks per document covering
-    start -> table -> middle -> end, runs the mechanical rule engine (C1..C8),
-    and automatically chains LLM-as-a-Judge (when LLM is configured).
+    Deterministic stratified sampling with 3 modes:
+      - adaptive (default): Bankier (1988) Square-Root Allocation k = clamp(round(c * sqrt(n)), min, max)
+      - fixed: fixed `per_doc` chunks per document
+      - full: 100% of chunks
+    Runs mechanical rule engine across 100% of chunks so rule_flags have full corpus coverage,
+    and chains LLM-as-a-Judge only on newly sampled (unjudged) chunks to preserve prior scores.
     """
+    eff_mode = (mode or get_setting("chunk_sample_mode", "adaptive")).strip().lower()
+    if eff_mode not in ("adaptive", "fixed", "full"):
+        eff_mode = "adaptive"
     if per_doc is None:
         per_doc = get_int_setting("chunk_sample_per_doc", 5)
+    min_per_doc = get_int_setting("chunk_sample_min", 5)
+    max_per_doc = get_int_setting("chunk_sample_max", 20)
+    sqrt_k = get_float_setting("chunk_sample_sqrt_k", 2.0)
+
     min_chars = get_int_setting("min_chunk_chars", 50)
     max_chars = get_int_setting("max_chunk_chars", 2600)
     exempt_intact_table = get_bool_setting("exempt_intact_table_from_max_chars", True)
@@ -87,40 +128,11 @@ async def auto_sample_chunks(run_id: int, per_doc: Optional[int] = None):
         now = utc_now()
         for doc_id, clist in by_doc.items():
             n = len(clist)
-            if per_doc <= 0 or n <= per_doc:
-                chosen = clist
-            elif per_doc == 1:
-                chosen = [clist[0]]
-            else:
-                # Stratified sampling: first + last + up to 2 table chunks + evenly spaced middle
-                picked_idxs = {0, n - 1}
-                table_idxs = [
-                    i for i, ch in enumerate(clist)
-                    if "<table" in (ch.get("content") or "").lower()
-                    or "<td" in (ch.get("content") or "").lower()
-                    or bool(re.search(r"(?m)^\s*\|.*\|\s*$", ch.get("content") or ""))
-                ]
-                if table_idxs and len(picked_idxs) < per_doc:
-                    cand_tables = [table_idxs[0]]
-                    if len(table_idxs) > 1:
-                        cand_tables.append(table_idxs[len(table_idxs) // 2])
-                    for ti in cand_tables:
-                        if len(picked_idxs) < per_doc:
-                            picked_idxs.add(ti)
-                for i in range(per_doc):
-                    if len(picked_idxs) >= per_doc:
-                        break
-                    pos = round(i * (n - 1) / max(per_doc - 1, 1))
-                    if pos not in picked_idxs:
-                        picked_idxs.add(pos)
-                for pos in range(n):
-                    if len(picked_idxs) >= per_doc:
-                        break
-                    picked_idxs.add(pos)
-                chosen = [clist[i] for i in sorted(picked_idxs)]
-
             rep_lines = repeated_by_doc.get(doc_id, set())
-            for ch in chosen:
+
+            # 1) Run mechanical rule engine on 100% of chunks for full corpus rule_flags coverage
+            rule_results: dict = {}
+            for ch in clist:
                 prev_ch = chunk_by_pos.get((doc_id, ch["chunk_index"] - 1))
                 next_ch = chunk_by_pos.get((doc_id, ch["chunk_index"] + 1))
                 res = analyze_chunk_rules(
@@ -134,14 +146,57 @@ async def auto_sample_chunks(run_id: int, per_doc: Optional[int] = None):
                     max_chars=max_chars,
                     exempt_intact_table=exempt_intact_table,
                 )
-
+                rule_results[ch["id"]] = res
                 conn.execute(
                     "UPDATE chunks SET rule_flags = ? WHERE id = ?",
                     (json.dumps(res["rule_flags"]), ch["id"]),
                 )
 
+            # 2) Select stratified sample according to active allocation mode
+            target_k = compute_doc_sample_size(
+                n,
+                mode=eff_mode,
+                per_doc=per_doc,
+                min_per_doc=min_per_doc,
+                max_per_doc=max_per_doc,
+                sqrt_k=sqrt_k,
+            )
+            if target_k >= n:
+                chosen = clist
+            elif target_k == 1:
+                chosen = [clist[0]]
+            else:
+                # Stratified sampling: first + last + up to 2 table chunks + evenly spaced middle
+                picked_idxs = {0, n - 1}
+                table_idxs = [
+                    i for i, ch in enumerate(clist)
+                    if "<table" in (ch.get("content") or "").lower()
+                    or "<td" in (ch.get("content") or "").lower()
+                    or bool(re.search(r"(?m)^\s*\|.*\|\s*$", ch.get("content") or ""))
+                ]
+                if table_idxs and len(picked_idxs) < target_k:
+                    cand_tables = [table_idxs[0]]
+                    if len(table_idxs) > 1:
+                        cand_tables.append(table_idxs[len(table_idxs) // 2])
+                    for ti in cand_tables:
+                        if len(picked_idxs) < target_k:
+                            picked_idxs.add(ti)
+                for i in range(target_k):
+                    if len(picked_idxs) >= target_k:
+                        break
+                    pos = round(i * (n - 1) / max(target_k - 1, 1))
+                    if pos not in picked_idxs:
+                        picked_idxs.add(pos)
+                for pos in range(n):
+                    if len(picked_idxs) >= target_k:
+                        break
+                    picked_idxs.add(pos)
+                chosen = [clist[i] for i in sorted(picked_idxs)]
+
+            for ch in chosen:
+                res = rule_results[ch["id"]]
                 existing = conn.execute(
-                    "SELECT judge_source FROM chunk_evaluations WHERE run_id = ? AND chunk_id = ?",
+                    "SELECT judge_source, error_codes FROM chunk_evaluations WHERE run_id = ? AND chunk_id = ?",
                     (run_id, ch["id"]),
                 ).fetchone()
 
@@ -149,6 +204,22 @@ async def auto_sample_chunks(run_id: int, per_doc: Optional[int] = None):
                     conn.execute(
                         "UPDATE chunk_evaluations SET is_sampled = 1 WHERE run_id = ? AND chunk_id = ?",
                         (run_id, ch["id"]),
+                    )
+                elif existing and existing["judge_source"] == "LLM":
+                    try:
+                        prev_codes = set(json.loads(existing["error_codes"] or "[]"))
+                    except Exception:
+                        prev_codes = set()
+                    sem_codes = prev_codes - {"DUPLICATE", "SIZE"}
+                    new_mech = set(res["error_codes"]) & {"DUPLICATE", "SIZE"}
+                    merged_codes = sorted(sem_codes | new_mech)
+                    conn.execute(
+                        """
+                        UPDATE chunk_evaluations
+                        SET is_sampled = 1, no_duplicate = ?, valid_size = ?, error_codes = ?
+                        WHERE run_id = ? AND chunk_id = ?
+                        """,
+                        (res["no_duplicate"], res["valid_size"], json.dumps(merged_codes), run_id, ch["id"]),
                     )
                 else:
                     conn.execute(
@@ -182,11 +253,17 @@ async def auto_sample_chunks(run_id: int, per_doc: Optional[int] = None):
 
     llm_judged = 0
     try:
-        llm_res = await llm_judge_sampled_chunks(run_id, overwrite_manual=False, judge_engine="auto")
+        llm_res = await llm_judge_sampled_chunks(run_id, overwrite_manual=False, judge_engine="auto", only_unjudged=True)
         llm_judged = int(llm_res.get("judged_count", 0))
     except HTTPException:
         pass
-    return {"ok": True, "sampled_chunks": sampled_count, "llm_judged": llm_judged}
+    return {
+        "ok": True,
+        "mode": eff_mode,
+        "total_chunks": len(all_chunks),
+        "sampled_chunks": sampled_count,
+        "llm_judged": llm_judged,
+    }
 
 
 def _resolve_chunking_judge(requested_engine: str = "auto") -> Dict[str, Any]:
@@ -194,8 +271,8 @@ def _resolve_chunking_judge(requested_engine: str = "auto") -> Dict[str, Any]:
     if raw in ("jev", "llm"):
         engine = raw
     else:
-        pref = (get_setting("chunking_judge_provider", "jev") or "jev").strip().lower()
-        engine = pref if pref in ("jev", "llm") else "jev"
+        pref = (get_setting("chunking_judge_provider", "llm") or "llm").strip().lower()
+        engine = pref if pref in ("jev", "llm") else "llm"
 
     if engine == "jev":
         sys_base, sys_key, sys_model, threshold = resolve_systemone_credentials(get_setting)
@@ -222,10 +299,12 @@ async def llm_judge_sampled_chunks(
     run_id: int,
     overwrite_manual: bool = False,
     judge_engine: str = "auto",
+    only_unjudged: bool = False,
 ):
     """
     Runs AI Chunking QC (Jev/Kev System One or Generative LLM) across sampled chunks in `run_id`,
     merging semantic verdicts (C1-C4 + reason) with deterministic mechanical rules (C5-C8).
+    When `only_unjudged=True`, skips chunks already judged by MANUAL, LLM, or JEV.
     """
     cfg = _resolve_chunking_judge(judge_engine)
     engine = cfg["engine"]
@@ -251,7 +330,10 @@ async def llm_judge_sampled_chunks(
         ).fetchall()
         pos_map = {(r["document_id"], r["chunk_index"]): r["content"] or "" for r in all_pos}
 
-    targets = [dict(r) for r in rows if overwrite_manual or r["judge_source"] != "MANUAL"]
+    if only_unjudged:
+        targets = [dict(r) for r in rows if r["judge_source"] not in ("MANUAL", "LLM", "JEV")]
+    else:
+        targets = [dict(r) for r in rows if overwrite_manual or r["judge_source"] != "MANUAL"]
     if not targets:
         return {
             "ok": True,
@@ -430,12 +512,16 @@ def get_chunking_metrics(run_id: int):
     with get_db() as conn:
         rows = conn.execute(
             """
-            SELECT ce.*, d.format_group
+            SELECT ce.*, c.document_id, d.format_group
             FROM chunk_evaluations ce
             JOIN chunks c ON c.id = ce.chunk_id
             LEFT JOIN documents d ON d.id = c.document_id
             WHERE ce.run_id = ? AND ce.is_sampled = 1
             """,
+            (run_id,),
+        ).fetchall()
+        doc_totals_rows = conn.execute(
+            "SELECT document_id, COUNT(*) AS cnt FROM chunks WHERE run_id = ? GROUP BY document_id",
             (run_id,),
         ).fetchall()
         testcases = conn.execute("SELECT reference_context FROM golden_testcases").fetchall()
@@ -445,12 +531,40 @@ def get_chunking_metrics(run_id: int):
             else []
         )
 
-    def rate(field: str, invert: bool = False):
+    doc_totals = {r["document_id"]: r["cnt"] for r in doc_totals_rows}
+    total_corpus_chunks = sum(doc_totals.values())
+
+    by_doc: dict = {}
+    for r in rows:
+        by_doc.setdefault(r["document_id"], []).append(r)
+
+    def unweighted_rate(field: str, invert: bool = False) -> float:
         vals = [r[field] for r in rows if r[field] is not None]
         if not vals:
             return 0.0
         ok = sum(1 for v in vals if (v == 0 if invert else v == 1))
         return round(ok / len(vals), 4)
+
+    def weighted_rate(field: str, invert: bool = False) -> float:
+        """
+        Cochran (1977) Stratified Weighted Estimator:
+            P_hat = sum_h (N_h * p_h) / sum_h N_h
+        Ensures long documents carry weight proportional to their true chunk count N_h.
+        """
+        num = 0.0
+        den = 0.0
+        for doc_id, doc_rows in by_doc.items():
+            vals = [r[field] for r in doc_rows if r[field] is not None]
+            if not vals:
+                continue
+            ok = sum(1 for v in vals if (v == 0 if invert else v == 1))
+            p_h = ok / len(vals)
+            w_h = float(doc_totals.get(doc_id, len(vals)))
+            num += w_h * p_h
+            den += w_h
+        if den <= 0:
+            return unweighted_rate(field, invert=invert)
+        return round(num / den, 4)
 
     ac_full = 0
     if testcases and snap_chunks:
@@ -458,17 +572,40 @@ def get_chunking_metrics(run_id: int):
             if compute_answer_containment(tc["reference_context"], snap_chunks) == "FULL":
                 ac_full += 1
 
-    size_comp = rate("valid_size")
+    size_comp = weighted_rate("valid_size")
+    sample_mode = get_setting("chunk_sample_mode", "adaptive")
+    sqrt_k = get_float_setting("chunk_sample_sqrt_k", 2.0)
+    min_s = get_int_setting("chunk_sample_min", 5)
+    max_s = get_int_setting("chunk_sample_max", 20)
+    per_doc_cfg = get_int_setting("chunk_sample_per_doc", 5)
+
     return {
         "sampled_total": len(rows),
+        "total_chunks": total_corpus_chunks,
+        "coverage_pct": round((len(rows) / total_corpus_chunks) * 100.0, 1) if total_corpus_chunks else 0.0,
         "rated_manual": sum(1 for r in rows if r["judge_source"] == "MANUAL"),
         "rated_integrity": sum(1 for r in rows if r["integrity"] is not None),
-        "chunk_integrity": rate("integrity"),
-        "context_sufficiency": rate("context_sufficiency"),
-        "noise_rate": rate("no_noise", invert=True),
-        "duplicate_rate": rate("no_duplicate", invert=True),
+        "chunk_integrity": weighted_rate("integrity"),
+        "context_sufficiency": weighted_rate("context_sufficiency"),
+        "noise_rate": weighted_rate("no_noise", invert=True),
+        "duplicate_rate": weighted_rate("no_duplicate", invert=True),
         "valid_size_rate": size_comp,
         "size_compliance": size_comp,
+        "unweighted": {
+            "chunk_integrity": unweighted_rate("integrity"),
+            "context_sufficiency": unweighted_rate("context_sufficiency"),
+            "noise_rate": unweighted_rate("no_noise", invert=True),
+            "duplicate_rate": unweighted_rate("no_duplicate", invert=True),
+            "valid_size_rate": unweighted_rate("valid_size"),
+        },
+        "sampling_meta": {
+            "mode": sample_mode,
+            "sqrt_k": sqrt_k,
+            "min_per_doc": min_s,
+            "max_per_doc": max_s,
+            "per_doc": per_doc_cfg,
+            "weighting": "cochran_1977",
+        },
         "answer_containment": round(ac_full / len(testcases), 4) if testcases else 0.0,
         "testcase_count": len(testcases),
     }
