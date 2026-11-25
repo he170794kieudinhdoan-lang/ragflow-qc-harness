@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { toast } from 'sonner';
-import { AlertTriangle, Check, FileImage, Loader2, Play, Plus, Search, Sparkles, Wand2, X } from 'lucide-react';
+import { AlertTriangle, Check, FileImage, Loader2, Play, Plus, Search, Sparkles, Trash2, Wand2, X } from 'lucide-react';
 import { api } from '../api/client';
 import { RetrievalResultGroup, RetrievalRun, RunItem } from '../types';
 
@@ -44,6 +44,7 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
   const [diagnosing, setDiagnosing] = useState(false);
   const [diagnosis, setDiagnosis] = useState<any>(null);
   const [openPdfChunkId, setOpenPdfChunkId] = useState<number | null>(null);
+  const [deletingTcId, setDeletingTcId] = useState<number | null>(null);
 
   useEffect(() => {
     setDiagnosis(null);
@@ -83,6 +84,8 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
     if (data.length > 0) {
       const keep = selectedGroup ? data.find((g: RetrievalResultGroup) => g.testcase.id === selectedGroup.testcase.id) : null;
       setSelectedGroup(keep || data[0]);
+    } else {
+      setSelectedGroup(null);
     }
   };
 
@@ -177,6 +180,30 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
       toast.error(err.message);
     } finally {
       setRejudging('');
+    }
+  };
+
+  const handleDeleteTestcase = async (tc: { id: number; tc_code: string }) => {
+    if (deletingTcId !== null) return;
+    if (!window.confirm(`Xóa testcase ${tc.tc_code}? Kết quả chấm của câu này trên các lần chạy cũng sẽ bị xóa.`)) {
+      return;
+    }
+    setDeletingTcId(tc.id);
+    try {
+      await api.deleteTestcase(tc.id);
+      const nextGroups = groups.filter((g) => g.testcase.id !== tc.id);
+      setGroups(nextGroups);
+      if (selectedGroup?.testcase.id === tc.id) {
+        setSelectedGroup(nextGroups[0] || null);
+      }
+      if (selectedRrId) {
+        await loadResults(selectedRrId);
+      }
+      toast.success(`Đã xóa testcase ${tc.tc_code}.`);
+    } catch (e: any) {
+      toast.error(e.message || `Không xóa được testcase ${tc.tc_code}`);
+    } finally {
+      setDeletingTcId(null);
     }
   };
 
@@ -332,10 +359,18 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
             </button>
           </div>
           {groups.map((g) => (
-            <button
+            <div
               key={g.testcase.id}
+              role="button"
+              tabIndex={0}
               onClick={() => setSelectedGroup(g)}
-              className={`w-full text-left px-4 py-3 border-b border-[#ededeb] transition-colors ${
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  setSelectedGroup(g);
+                }
+              }}
+              className={`group w-full text-left px-4 py-3 border-b border-[#ededeb] transition-colors cursor-pointer ${
                 selectedGroup?.testcase.id === g.testcase.id
                   ? 'bg-white border-l-2 border-l-[#18181b]'
                   : 'hover:bg-white/70'
@@ -355,19 +390,37 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
                   <span className="font-mono text-xs font-semibold text-[#18181b]">{g.testcase.tc_code}</span>
                   <span className="ts-tag-neutral text-[10px]">{g.testcase.question_class}</span>
                 </div>
-                <span
-                  className={`font-mono text-xs font-semibold tabular-nums ${
-                    g.contextual_precision >= 0.5 ? 'text-emerald-700' : 'text-rose-600'
-                  }`}
-                >
-                  {(g.contextual_precision * 100).toFixed(0)}%
-                </span>
+                <div className="flex items-center gap-1.5">
+                  <span
+                    className={`font-mono text-xs font-semibold tabular-nums ${
+                      g.contextual_precision >= 0.5 ? 'text-emerald-700' : 'text-rose-600'
+                    }`}
+                  >
+                    {(g.contextual_precision * 100).toFixed(0)}%
+                  </span>
+                  <button
+                    type="button"
+                    title={`Xóa ${g.testcase.tc_code}`}
+                    disabled={deletingTcId !== null}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleDeleteTestcase(g.testcase);
+                    }}
+                    className="p-1 rounded text-[#a1a1aa] hover:text-[#b91c1c] hover:bg-rose-50 opacity-70 group-hover:opacity-100 transition-opacity disabled:opacity-40"
+                  >
+                    {deletingTcId === g.testcase.id ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <Trash2 className="size-3.5" />
+                    )}
+                  </button>
+                </div>
               </div>
               <div className="text-[13px] text-[#27272a] line-clamp-2 mt-1.5">{g.testcase.input_question}</div>
               <div className="text-[11px] text-[#78716c] mt-1">
                 Đúng {g.relevant_count}/{g.hits.length} đoạn trả về
               </div>
-            </button>
+            </div>
           ))}
         </div>
 
@@ -384,9 +437,24 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
                       {AC_LABELS[selectedGroup.meta.answer_containment] || selectedGroup.meta.answer_containment}
                     </span>
                   </div>
-                  <span className="font-mono text-xs font-semibold text-emerald-700">
-                    Xếp hạng: {(selectedGroup.contextual_precision * 100).toFixed(0)}%
-                  </span>
+                  <div className="flex items-center gap-2.5">
+                    <span className="font-mono text-xs font-semibold text-emerald-700">
+                      Xếp hạng: {(selectedGroup.contextual_precision * 100).toFixed(0)}%
+                    </span>
+                    <button
+                      type="button"
+                      disabled={deletingTcId !== null}
+                      onClick={() => handleDeleteTestcase(selectedGroup.testcase)}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded border border-rose-200 bg-white text-[11px] font-medium text-[#b91c1c] hover:bg-rose-50 disabled:opacity-45"
+                    >
+                      {deletingTcId === selectedGroup.testcase.id ? (
+                        <Loader2 className="size-3 animate-spin" />
+                      ) : (
+                        <Trash2 className="size-3" />
+                      )}
+                      Xóa câu này
+                    </button>
+                  </div>
                 </div>
 
                 <h2 className="text-base font-semibold text-[#18181b] text-balance">
