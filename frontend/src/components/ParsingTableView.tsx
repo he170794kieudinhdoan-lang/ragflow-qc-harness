@@ -2,6 +2,7 @@ import React, { useMemo, useState } from 'react';
 import { Download, FileSpreadsheet, Filter, Search, Table2 } from 'lucide-react';
 import { api } from '../api/client';
 import { DocumentItem, ParsingUnit } from '../types';
+import { ExcelContextMenu, ExcelMenuState, extractExcelCellInfo } from './ExcelContextMenu';
 
 interface Props {
   runId?: number;
@@ -324,6 +325,27 @@ export const ParsingTableView: React.FC<Props> = ({
 
   const cellBorder = 'border border-[#d1d5db]';
   const hdrBorder = 'border border-[#cbd5e1]';
+  const SUMMARY_COLS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O'];
+  const DETAIL_COLS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K'];
+  const [ctxMenu, setCtxMenu] = useState<ExcelMenuState | null>(null);
+
+  const openCellMenu = (
+    e: React.MouseEvent<HTMLTableRowElement>,
+    cols: string[],
+    opts: { onOpen?: () => void; openLabel?: string }
+  ) => {
+    const info = extractExcelCellInfo(e.target as HTMLElement, cols);
+    if (!info) return;
+    e.preventDefault();
+    setCtxMenu({
+      x: e.clientX,
+      y: e.clientY,
+      cellRef: info.cellRef,
+      cellText: info.cellText,
+      rowTsv: info.rowTsv,
+      ...opts,
+    });
+  };
 
   return (
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden bg-white select-text">
@@ -331,9 +353,6 @@ export const ParsingTableView: React.FC<Props> = ({
       <div className="shrink-0 bg-[#f8fafc] border-b border-[#cbd5e1] px-3 py-1.5 flex flex-wrap items-center justify-between gap-2 text-[11.5px]">
         <div className="flex flex-wrap items-center divide-x divide-[#d1d5db] font-mono">
           <div className="pr-2.5 flex items-center gap-1.5 font-sans">
-            <span className="inline-flex items-center justify-center px-1.5 py-0.5 bg-[#166534] text-white font-mono text-[10px] font-bold">
-              fx
-            </span>
             <span className="font-semibold text-[#1e293b]">Score:</span>
             <span className="font-mono font-bold text-[#166534] text-xs">{fmtPct(overall.parsingScore)}</span>
           </div>
@@ -371,7 +390,7 @@ export const ParsingTableView: React.FC<Props> = ({
 
         <div className="flex items-center gap-2.5">
           <div className="text-[11px] text-[#64748b] font-sans hidden xl:block">
-            Click dòng để mở đối chiếu · {overall.docCount}/{docs.length || overall.docCount} tài liệu · {overall.totalUnits} đoạn
+            Chuột phải ô để Copy · Nhấp đúp dòng để mở đối chiếu · {overall.docCount}/{docs.length || overall.docCount} tài liệu · {overall.totalUnits} đoạn
           </div>
           {runId && (
             <a
@@ -469,13 +488,24 @@ export const ParsingTableView: React.FC<Props> = ({
               {docSummaryRows.map((r, rowIdx) => (
                 <tr
                   key={r.doc_code}
-                  onClick={() => {
+                  onDoubleClick={() => {
                     setDocCodeFilter(r.doc_code);
                     setMetricTab('ALL');
                     setVerdictFilter('ALL');
                     setSubTab('detail');
                   }}
-                  className="bg-white even:bg-[#f9fafb] hover:bg-[#eff6ff] cursor-pointer group"
+                  onContextMenu={(e) =>
+                    openCellMenu(e, SUMMARY_COLS, {
+                      onOpen: () => {
+                        setDocCodeFilter(r.doc_code);
+                        setMetricTab('ALL');
+                        setVerdictFilter('ALL');
+                        setSubTab('detail');
+                      },
+                      openLabel: `Lọc chi tiết ${r.doc_code}`,
+                    })
+                  }
+                  className="bg-white even:bg-[#f9fafb] hover:bg-[#f2fbf6] cursor-cell group"
                 >
                   <td
                     className={`sticky left-0 z-10 bg-[#f1f5f9] group-hover:bg-[#dbeafe] ${cellBorder} text-center font-mono text-[10.5px] text-[#64748b] py-1.5 select-none`}
@@ -710,8 +740,14 @@ export const ParsingTableView: React.FC<Props> = ({
                     return (
                       <tr
                         key={u.id}
-                        onClick={() => onSelectUnit(u)}
-                        className="bg-white even:bg-[#f9fafb] hover:bg-[#eff6ff] cursor-pointer align-top group"
+                        onDoubleClick={() => onSelectUnit(u)}
+                        onContextMenu={(e) =>
+                          openCellMenu(e, DETAIL_COLS, {
+                            onOpen: () => onSelectUnit(u),
+                            openLabel: `Mở đối chiếu ${u.doc_code || ''} #${u.unit_index}`,
+                          })
+                        }
+                        className="bg-white even:bg-[#f9fafb] hover:bg-[#f2fbf6] cursor-cell align-top group"
                       >
                         <td
                           className={`sticky left-0 z-10 bg-[#f1f5f9] group-hover:bg-[#dbeafe] ${cellBorder} text-center font-mono text-[10.5px] text-[#64748b] py-1.5 select-none`}
@@ -824,6 +860,8 @@ export const ParsingTableView: React.FC<Props> = ({
           Sheet: {subTab === 'summary' ? `A1:O${docSummaryRows.length + 3}` : `A1:K${detailRows.length + 2}`}
         </div>
       </div>
+
+      <ExcelContextMenu menu={ctxMenu} onClose={() => setCtxMenu(null)} />
     </div>
   );
 };

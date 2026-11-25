@@ -7,6 +7,7 @@ import {
   Scissors,
   SearchCheck,
   RotateCcw,
+  AlertCircle,
   X,
 } from 'lucide-react';
 import { api } from '../api/client';
@@ -35,7 +36,11 @@ const SECTION_KEYS: Record<SectionId, string[]> = {
     'target_reading_order',
   ],
   step3: [
+    'chunk_sample_mode',
     'chunk_sample_per_doc',
+    'chunk_sample_min',
+    'chunk_sample_max',
+    'chunk_sample_sqrt_k',
     'min_chunk_chars',
     'max_chunk_chars',
     'exempt_intact_table_from_max_chars',
@@ -457,19 +462,104 @@ export default function SettingsModal({
             {section === 'step3' && (
               <div className="space-y-5">
                 <div className="space-y-3">
-                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
-                    Lấy mẫu &amp; Kích thước chunk (SIZE)
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
+                      Lấy mẫu phân tầng &amp; Kích thước chunk (SIZE)
+                    </span>
+                    <div className="relative group inline-flex items-center">
+                      <span
+                        className="inline-flex items-center justify-center size-4 rounded-full border border-[#d4d4d8] bg-white text-[#52525b] group-hover:border-[#18181b] group-hover:text-[#18181b] cursor-help transition-colors"
+                        aria-label="Chi tiết phương pháp phân bổ mẫu"
+                      >
+                        <AlertCircle className="size-3" />
+                      </span>
+                      <div className="pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity duration-150 absolute left-0 top-full mt-2 z-50 w-[340px] rounded-md border border-[#e4e4e2] bg-white p-3.5 shadow-lg text-[11px] text-[#3f3f46] leading-relaxed">
+                        <div className="font-semibold text-[#18181b] mb-1.5">
+                          Cơ sở phương pháp phân bổ mẫu Chunking
+                        </div>
+                        <ul className="space-y-1.5 list-disc pl-3.5">
+                          <li>
+                            <span className="font-semibold text-[#18181b]">Adaptive √n (Bankier, 1988):</span>{' '}
+                            <span className="font-mono text-[10px] bg-[#f4f4f2] px-1 py-0.5 rounded">
+                              k = clamp(round(c × √n), min, max)
+                            </span>{' '}
+                            — cân bằng độ tin cậy file ngắn (luôn giữ sàn) và độ phủ file dài (tăng theo √n).
+                          </li>
+                          <li>
+                            <span className="font-semibold text-[#18181b]">Rule-based 100%:</span> Quét lỗi cơ học trên toàn bộ chunks; LLM-as-a-Judge tập trung chấm ngữ nghĩa trên tập mẫu.
+                          </li>
+                          <li>
+                            <span className="font-semibold text-[#18181b]">Weighted Score (Cochran, 1977):</span> Điểm tổng nhân trọng số theo số chunk thật <span className="font-mono text-[10px]">N_h</span> của từng tài liệu để tránh thiên lệch.
+                          </li>
+                        </ul>
+                      </div>
+                    </div>
                   </div>
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                    <FieldRow label="Số chunk mẫu / tài liệu" hint="0 = lấy tất cả. Mặc định: 5">
-                      <input
-                        type="number"
-                        min={0}
-                        className="ts-input w-full font-mono text-xs"
-                        value={val('chunk_sample_per_doc', '5')}
-                        onChange={(e) => setKey('chunk_sample_per_doc', e.target.value)}
-                      />
+                    <FieldRow label="Chế độ lấy mẫu" hint="Mặc định: Adaptive √n (Bankier 1988)">
+                      <select
+                        className="ts-input w-full text-xs bg-white"
+                        value={val('chunk_sample_mode', 'adaptive')}
+                        onChange={(e) => setKey('chunk_sample_mode', e.target.value)}
+                      >
+                        <option value="adaptive">Adaptive √n (Bankier 1988)</option>
+                        <option value="fixed">Cố định (N mẫu / file)</option>
+                        <option value="full">Toàn bộ (100% chunks)</option>
+                      </select>
                     </FieldRow>
+                    {val('chunk_sample_mode', 'adaptive') === 'fixed' ? (
+                      <FieldRow label="Số chunk mẫu / tài liệu" hint="0 = lấy tất cả. Mặc định: 5">
+                        <input
+                          type="number"
+                          min={0}
+                          className="ts-input w-full font-mono text-xs"
+                          value={val('chunk_sample_per_doc', '5')}
+                          onChange={(e) => setKey('chunk_sample_per_doc', e.target.value)}
+                        />
+                      </FieldRow>
+                    ) : val('chunk_sample_mode', 'adaptive') === 'adaptive' ? (
+                      <>
+                        <FieldRow label="Hệ số √n (c)" hint="k = round(c × √n). Mặc định: 2.0">
+                          <input
+                            type="number"
+                            step="0.25"
+                            min={0.5}
+                            max={6}
+                            className="ts-input w-full font-mono text-xs"
+                            value={val('chunk_sample_sqrt_k', '2.0')}
+                            onChange={(e) => setKey('chunk_sample_sqrt_k', e.target.value)}
+                          />
+                        </FieldRow>
+                        <div className="grid grid-cols-2 gap-2">
+                          <FieldRow label="Sàn (min)" hint="Mặc định: 5">
+                            <input
+                              type="number"
+                              min={1}
+                              max={50}
+                              className="ts-input w-full font-mono text-xs"
+                              value={val('chunk_sample_min', '5')}
+                              onChange={(e) => setKey('chunk_sample_min', e.target.value)}
+                            />
+                          </FieldRow>
+                          <FieldRow label="Trần (max)" hint="Mặc định: 20">
+                            <input
+                              type="number"
+                              min={5}
+                              max={100}
+                              className="ts-input w-full font-mono text-xs"
+                              value={val('chunk_sample_max', '20')}
+                              onChange={(e) => setKey('chunk_sample_max', e.target.value)}
+                            />
+                          </FieldRow>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="sm:col-span-2 flex items-center text-xs text-[#52525b] bg-[#fafaf9] border border-[#ededeb] rounded px-3 py-2">
+                        Chấm toàn bộ 100% chunks trong Run bằng cả Rule-based và LLM-as-a-Judge (khuyến nghị khi corpus &lt; 1.000 chunks).
+                      </div>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <FieldRow label="Độ dài tối thiểu (ký tự)" hint="Dưới ngưỡng → TOO_SHORT">
                       <input
                         type="number"

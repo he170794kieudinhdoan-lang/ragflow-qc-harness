@@ -100,8 +100,19 @@ export const api = {
   getParsingMetrics: (runId: number) => req<any>(`/api/parsing/runs/${runId}/metrics`),
 
   // Chunking
-  sampleChunks: (runId: number, perDoc = 5) =>
-    req<any>(`/api/chunking/runs/${runId}/sample?per_doc=${perDoc}`, { method: 'POST' }),
+  sampleChunks: (runId: number, opts?: number | { mode?: 'adaptive' | 'fixed' | 'full'; perDoc?: number }) => {
+    const sp = new URLSearchParams();
+    if (typeof opts === 'number') {
+      sp.set('per_doc', String(opts));
+    } else if (opts) {
+      if (opts.mode) sp.set('mode', opts.mode);
+      if (opts.mode === 'fixed' && typeof opts.perDoc === 'number') {
+        sp.set('per_doc', String(opts.perDoc));
+      }
+    }
+    const qs = sp.toString();
+    return req<any>(`/api/chunking/runs/${runId}/sample${qs ? `?${qs}` : ''}`, { method: 'POST' });
+  },
   llmJudgeChunks: (runId: number, overwriteManual = false) =>
     req<any>(`/api/chunking/runs/${runId}/llm-judge?overwrite_manual=${overwriteManual}`, { method: 'POST' }),
   listChunkEvals: (runId: number, sampledOnly = true) =>
@@ -144,10 +155,15 @@ export const api = {
   listTestcases: () => req<any[]>('/api/retrieval/testcases'),
   createTestcase: (payload: any) =>
     req<any>('/api/retrieval/testcases', { method: 'POST', body: JSON.stringify(payload) }),
-  autoGenerateTestcases: (runId: number, totalCount = 40, replaceExisting = true) =>
+  autoGenerateTestcases: (runId: number, totalCount = 50, replaceExisting = true, stylePrompt = '') =>
     req<any>('/api/retrieval/testcases/auto-generate', {
       method: 'POST',
-      body: JSON.stringify({ run_id: runId, total_count: totalCount, replace_existing: replaceExisting }),
+      body: JSON.stringify({
+        run_id: runId,
+        total_count: totalCount,
+        replace_existing: replaceExisting,
+        style_prompt: stylePrompt,
+      }),
     }),
   deleteTestcase: (id: number) => req<any>(`/api/retrieval/testcases/${id}`, { method: 'DELETE' }),
   clearTestcases: () => req<any>('/api/retrieval/testcases', { method: 'DELETE' }),

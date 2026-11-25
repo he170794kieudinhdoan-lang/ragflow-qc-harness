@@ -2,6 +2,7 @@ import React, { useMemo, useState } from 'react';
 import { Download, FileSpreadsheet, Filter, Search, Table2 } from 'lucide-react';
 import { api } from '../api/client';
 import { ChunkEvalItem } from '../types';
+import { ExcelContextMenu, ExcelMenuState, extractExcelCellInfo } from './ExcelContextMenu';
 
 interface Props {
   runId?: number;
@@ -168,6 +169,25 @@ export const ChunkingTableView: React.FC<Props> = ({
 
   const cellBorder = 'border border-[#d1d5db]';
   const hdrBorder = 'border border-[#cbd5e1]';
+  const [ctxMenu, setCtxMenu] = useState<ExcelMenuState | null>(null);
+
+  const openCellMenu = (
+    e: React.MouseEvent<HTMLTableRowElement>,
+    cols: string[],
+    opts: { onOpen?: () => void; openLabel?: string }
+  ) => {
+    const info = extractExcelCellInfo(e.target as HTMLElement, cols);
+    if (!info) return;
+    e.preventDefault();
+    setCtxMenu({
+      x: e.clientX,
+      y: e.clientY,
+      cellRef: info.cellRef,
+      cellText: info.cellText,
+      rowTsv: info.rowTsv,
+      ...opts,
+    });
+  };
 
   return (
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden bg-white select-text">
@@ -175,9 +195,6 @@ export const ChunkingTableView: React.FC<Props> = ({
       <div className="shrink-0 bg-[#f8fafc] border-b border-[#cbd5e1] px-3 py-1.5 flex flex-wrap items-center justify-between gap-2 text-[11.5px]">
         <div className="flex flex-wrap items-center divide-x divide-[#d1d5db] font-mono">
           <div className="pr-2.5 flex items-center gap-1.5 font-sans">
-            <span className="inline-flex items-center justify-center px-1.5 py-0.5 bg-[#166534] text-white font-mono text-[10px] font-bold">
-              fx
-            </span>
             <span className="font-semibold text-[#1e293b]">Chunk Score:</span>
             <span className="font-mono font-bold text-[#166534] text-xs">{fmtPct(overall.score)}</span>
           </div>
@@ -205,7 +222,7 @@ export const ChunkingTableView: React.FC<Props> = ({
 
         <div className="flex items-center gap-2.5">
           <span className="text-[11px] text-[#64748b] font-sans hidden xl:inline">
-            Click dòng để mở chế độ chấm · {overall.docCount} tài liệu · {overall.total} mẫu
+            Chuột phải ô để Copy · Nhấp đúp dòng để mở chế độ chấm · {overall.docCount} tài liệu · {overall.total} mẫu
           </span>
           {runId && (
             <a
@@ -264,13 +281,24 @@ export const ChunkingTableView: React.FC<Props> = ({
               {docRows.map((r, rowIdx) => (
                 <tr
                   key={r.doc_code}
-                  onClick={() => {
+                  onDoubleClick={() => {
                     setDocCodeFilter(r.doc_code);
                     setCodeFilter('ALL');
                     setStatusFilter('ALL');
                     setSheet('detail');
                   }}
-                  className="bg-white even:bg-[#f9fafb] hover:bg-[#eff6ff] cursor-pointer group"
+                  onContextMenu={(e) =>
+                    openCellMenu(e, SUMMARY_COLS, {
+                      onOpen: () => {
+                        setDocCodeFilter(r.doc_code);
+                        setCodeFilter('ALL');
+                        setStatusFilter('ALL');
+                        setSheet('detail');
+                      },
+                      openLabel: `Lọc chi tiết ${r.doc_code}`,
+                    })
+                  }
+                  className="bg-white even:bg-[#f9fafb] hover:bg-[#f2fbf6] cursor-cell group"
                 >
                   <td className={`sticky left-0 z-10 bg-[#f1f5f9] group-hover:bg-[#dbeafe] ${cellBorder} text-center font-mono text-[10.5px] text-[#64748b] py-1.5 select-none`}>
                     {rowIdx + 1}
@@ -464,8 +492,14 @@ export const ChunkingTableView: React.FC<Props> = ({
                     return (
                       <tr
                         key={c.chunk_pk}
-                        onClick={() => onSelectChunk(c)}
-                        className="bg-white even:bg-[#f9fafb] hover:bg-[#eff6ff] cursor-pointer align-top group"
+                        onDoubleClick={() => onSelectChunk(c)}
+                        onContextMenu={(e) =>
+                          openCellMenu(e, DETAIL_COLS, {
+                            onOpen: () => onSelectChunk(c),
+                            openLabel: `Mở chế độ chấm ${c.doc_code || ''} #${c.chunk_index}`,
+                          })
+                        }
+                        className="bg-white even:bg-[#f9fafb] hover:bg-[#f2fbf6] cursor-cell align-top group"
                       >
                         <td className={`sticky left-0 z-10 bg-[#f1f5f9] group-hover:bg-[#dbeafe] ${cellBorder} text-center font-mono text-[10.5px] text-[#64748b] py-1.5 select-none`}>
                           {idx + 1}
@@ -542,6 +576,8 @@ export const ChunkingTableView: React.FC<Props> = ({
           Sheet: {sheet === 'summary' ? `A1:K${docRows.length + 2}` : `A1:L${detailRows.length + 2}`}
         </div>
       </div>
+
+      <ExcelContextMenu menu={ctxMenu} onClose={() => setCtxMenu(null)} />
     </div>
   );
 };

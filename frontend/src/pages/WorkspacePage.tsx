@@ -562,16 +562,6 @@ export const WorkspacePage: React.FC<Props> = ({
                   )}
                   {busy === 'sync' ? 'Đang đồng bộ...' : 'Đồng bộ RAGFlow'}
                 </button>
-
-                <button
-                  onClick={handleCheckStatusManual}
-                  disabled={!!busy}
-                  className="ts-btn-secondary p-1.5 text-[#52525b] disabled:opacity-45 disabled:pointer-events-none"
-                  title="Kiểm tra tiến độ parse hiện tại trên RAGFlow"
-                  aria-label="Kiểm tra tiến độ"
-                >
-                  <RefreshCw className={`size-3.5 ${busy === 'status' ? 'animate-spin text-[#03aa5c]' : ''}`} />
-                </button>
               </>
             )}
 

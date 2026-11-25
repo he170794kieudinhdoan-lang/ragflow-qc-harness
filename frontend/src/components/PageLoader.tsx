@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import gsap from 'gsap';
+import { BrandWordmark } from './BrandWordmark';
 
 interface Props {
   /** Increment to replay the loader as a page transition curtain */
@@ -69,10 +70,10 @@ export const PageLoader: React.FC<Props> = ({ transitionKey = 0, onMidpoint, onC
             '-=0.14'
           )
           .fromTo(
-            '.loader-wordmark',
-            { opacity: 0, y: 6 },
-            { opacity: 1, y: 0, duration: 0.32, ease: 'power2.out' },
-            '-=0.20'
+            '.loader-wordmark .brand-char',
+            { y: 12, opacity: 0 },
+            { y: 0, opacity: 1, duration: 0.36, stagger: 0.032, ease: 'power3.out' },
+            '-=0.22'
           )
           .fromTo(
             '.loader-hairline',
@@ -108,10 +109,10 @@ export const PageLoader: React.FC<Props> = ({ transitionKey = 0, onMidpoint, onC
             '-=0.15'
           )
           .fromTo(
-            '.loader-wordmark',
-            { opacity: 0, y: 6 },
-            { opacity: 1, y: 0, duration: 0.35, ease: 'power2.out' },
-            '-=0.22'
+            '.loader-wordmark .brand-char',
+            { y: 12, opacity: 0 },
+            { y: 0, opacity: 1, duration: 0.38, stagger: 0.032, ease: 'power3.out' },
+            '-=0.24'
           )
           .fromTo(
             '.loader-hairline',
@@ -178,9 +179,9 @@ export const PageLoader: React.FC<Props> = ({ transitionKey = 0, onMidpoint, onC
             <rect className="loader-bar" x="12.5" y="20.4" width="11.5" height="2.6" rx="0.6" fill="#141414" />
             <circle className="loader-dot" cx="9.3" cy="21.7" r="1.4" fill="#03aa5c" />
           </svg>
-          <span className="loader-wordmark font-mono text-[22px] font-bold tracking-[0.2em] text-[#141414]">
-            RAGFLOW<span className="text-[#027a42] ml-2 font-semibold">QC</span>
-          </span>
+          <div className="loader-wordmark flex items-center">
+            <BrandWordmark className="h-[34px] w-auto" />
+          </div>
         </div>
         <div className="w-56 h-[2px] bg-[#e5e7eb] overflow-hidden">
           <div className="loader-hairline w-full h-full bg-[#03aa5c]" />
