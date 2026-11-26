@@ -3,15 +3,18 @@ import {
   AlertTriangle,
   ArrowDownRight,
   ArrowUpRight,
+  Bot,
   Bug,
   CheckCircle2,
   Copy,
   Download,
   GitCompare,
+  Loader2,
+  Sparkles,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { api } from '../api/client';
-import { RetrievalRun, RunItem } from '../types';
+import { RetrievalRun, RunItem, SwarmDiagnosisReport } from '../types';
 
 const pct = (v: number | null | undefined) => (v === null || v === undefined ? '—' : `${(v * 100).toFixed(0)}%`);
 
@@ -27,6 +30,8 @@ export const CompareLabPage: React.FC<Props> = ({ activeRun }) => {
   const [diag, setDiag] = useState<any>(null);
   const [matrix, setMatrix] = useState<any[]>([]);
   const [bugReport, setBugReport] = useState<any>(null);
+  const [autopsy, setAutopsy] = useState<SwarmDiagnosisReport | null>(null);
+  const [loadingAutopsy, setLoadingAutopsy] = useState(false);
 
   useEffect(() => {
     api
@@ -56,10 +61,25 @@ export const CompareLabPage: React.FC<Props> = ({ activeRun }) => {
   }, []);
 
   useEffect(() => {
+    setAutopsy(null);
     if (baseId && candId && baseId !== candId) {
       api.compareRuns(Number(baseId), Number(candId)).then(setDiff);
     }
   }, [baseId, candId]);
+
+  const handleRunAutopsy = async (forceRefresh = false) => {
+    if (!baseId || !candId || baseId === candId || loadingAutopsy) return;
+    setLoadingAutopsy(true);
+    try {
+      const res: SwarmDiagnosisReport = await api.runCompareAutopsy(Number(baseId), Number(candId), forceRefresh);
+      setAutopsy(res);
+      toast.success(`Đã hoàn tất giải phẫu ${res.regressions_analyzed?.length || 0} câu Regression.`);
+    } catch (e: any) {
+      toast.error(e.message || 'Không chạy được giải phẫu Regression');
+    } finally {
+      setLoadingAutopsy(false);
+    }
+  };
 
   const bSum = diff?.baseline?.summary;
   const cSum = diff?.candidate?.summary;
@@ -472,15 +492,105 @@ export const CompareLabPage: React.FC<Props> = ({ activeRun }) => {
               </div>
 
               <div className="border border-[#e4e4e2] rounded-lg bg-white overflow-hidden shadow-2xs">
-                <div className="px-4 py-3 border-b border-[#e4e4e2] bg-[#fafaf9] flex items-center justify-between">
+                <div className="px-4 py-3 border-b border-[#e4e4e2] bg-[#fafaf9] flex items-center justify-between gap-2">
                   <span className="ts-eyebrow text-rose-800">CÁC CÂU BỊ TỤT (PASS → FAIL)</span>
-                  <span className="font-mono text-[11px] px-2 py-0.5 rounded-full bg-rose-50 text-rose-700 font-semibold">
-                    {diff.regressions_pass_to_fail.length}
-                  </span>
+                  <div className="flex items-center gap-2">
+                    {diff.regressions_pass_to_fail.length > 0 && (
+                      <button
+                        type="button"
+                        disabled={loadingAutopsy}
+                        onClick={() => handleRunAutopsy(Boolean(autopsy))}
+                        className="ts-btn-primary text-[11px] py-1 px-2.5"
+                        title="Dùng Multi-Agent phân tích nguyên nhân các câu Pass → Fail bị tụt điểm"
+                      >
+                        {loadingAutopsy ? (
+                          <Loader2 className="size-3 animate-spin" />
+                        ) : (
+                          <Sparkles className="size-3 text-[#03aa5c]" />
+                        )}
+                        {loadingAutopsy ? 'Đang phân tích...' : autopsy ? 'Phân tích lại' : 'Phân tích câu bị tụt (AI)'}
+                      </button>
+                    )}
+                    <span className="font-mono text-[11px] px-2 py-0.5 rounded-full bg-rose-50 text-rose-700 font-semibold">
+                      {diff.regressions_pass_to_fail.length}
+                    </span>
+                  </div>
                 </div>
                 <DiffList rows={diff.regressions_pass_to_fail} />
               </div>
             </div>
+
+            {/* Multi-Agent Regression Autopsy Report */}
+            {autopsy && (
+              <div className="border border-[#e4e4e2] rounded-lg bg-white p-5 space-y-4 shadow-2xs">
+                <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-[#ededeb]">
+                  <div>
+                    <div className="ts-eyebrow flex items-center gap-1.5">
+                      <Bot className="size-3.5 text-[#03aa5c]" />
+                      PHÂN TÍCH CÁC CÂU BỊ TỤT ĐIỂM (PASS → FAIL)
+                    </div>
+                    <p className="text-xs text-[#161616] font-medium mt-1">{autopsy.executive_summary}</p>
+                  </div>
+                  <div className="font-mono text-[11px] text-[#71717a]">
+                    {autopsy.model_used} · {autopsy.llm_calls} calls · {autopsy.duration_ms}ms
+                  </div>
+                </div>
+
+                {autopsy.regressions_analyzed?.length > 0 && (
+                  <div className="divide-y divide-[#ededeb] border border-[#ededeb] rounded-md">
+                    {autopsy.regressions_analyzed.map((item) => (
+                      <div key={item.tc_code} className="p-3 text-xs space-y-1 bg-[#fafaf9]/50">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-mono font-semibold text-[#161616]">{item.tc_code}</span>
+                            <span className="ts-tag-neutral text-[10px]">{item.question_class}</span>
+                          </div>
+                          <span className="font-mono text-[11px] text-rose-700">
+                            {(item.baseline_cp * 100).toFixed(0)}% → {(item.candidate_cp * 100).toFixed(0)}%
+                          </span>
+                        </div>
+                        <div className="text-[#27272a]">{item.question}</div>
+                        {item.why_failed && (
+                          <div className="text-[#52525b]">
+                            <strong className="text-[#161616]">Nguyên nhân:</strong> {item.why_failed}
+                          </div>
+                        )}
+                        {item.fix_hint && (
+                          <div className="text-[#027a42]">
+                            <strong>Hướng dung hòa:</strong> {item.fix_hint}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {autopsy.hypothesis_packs?.length > 0 && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {autopsy.hypothesis_packs.map((p) => (
+                      <div key={p.id} className="p-3.5 rounded-md border border-[#e4e4e2] bg-[#fafaf9] space-y-2 text-xs">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-semibold text-[#161616]">{p.name}</span>
+                          <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-[#161616] text-white">
+                            {p.scope}
+                          </span>
+                        </div>
+                        <p className="text-[#3d3d3d] leading-relaxed">{p.hypothesis_statement}</p>
+                        {p.diff?.length > 0 && (
+                          <div className="font-mono text-[11px] text-[#027a42] space-y-0.5">
+                            {p.diff.map((d, i) => (
+                              <div key={i}>
+                                • {d.param}: {String(d.from ?? '—')} → <strong>{String(d.to)}</strong>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </>
         )}
       </div>

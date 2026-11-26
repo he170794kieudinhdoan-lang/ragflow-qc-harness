@@ -32,27 +32,17 @@ def _extract_json(text: str) -> Dict[str, Any]:
     raise LLMError(f"LLM không trả về JSON hợp lệ: {s[:160]}")
 
 
-async def call_llm_json(
+async def _post_chat_completion_json(
     base_url: str,
     api_key: str,
-    model: str,
-    system_prompt: str,
-    user_prompt: str,
+    body: Dict[str, Any],
     timeout: float = 45.0,
 ) -> Dict[str, Any]:
+    """Posts a chat completion payload with 429 exponential backoff and parses JSON output."""
     url = f"{base_url.rstrip('/')}/chat/completions"
     headers = {"Content-Type": "application/json"}
     if api_key.strip():
         headers["Authorization"] = f"Bearer {api_key.strip()}"
-
-    body: Dict[str, Any] = {
-        "model": model.strip(),
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.2,
-    }
 
     client = get_shared_http_client()
     last_resp = None
@@ -72,6 +62,55 @@ async def call_llm_json(
         raise LLMError("LLM trả về phản hồi rỗng.")
     content = choices[0].get("message", {}).get("content", "")
     return _extract_json(content)
+
+
+async def call_llm_json(
+    base_url: str,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    timeout: float = 45.0,
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {
+        "model": model.strip(),
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.2,
+    }
+    return await _post_chat_completion_json(base_url, api_key, body, timeout=timeout)
+
+
+async def call_llm_vision_json(
+    base_url: str,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    user_text: str,
+    images: List[Tuple[str, bytes]],
+    timeout: float = 75.0,
+) -> Dict[str, Any]:
+    """Calls a Vision-capable OpenAI-compatible LLM with labeled images and returns parsed JSON."""
+    user_content: List[Dict[str, Any]] = [{"type": "text", "text": user_text}]
+    for label, img_bytes in images:
+        if not img_bytes:
+            continue
+        mime = _detect_image_mime(img_bytes)
+        b64 = base64.b64encode(img_bytes).decode("ascii")
+        user_content.append({"type": "text", "text": f"[{label}]"})
+        user_content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+
+    body: Dict[str, Any] = {
+        "model": model.strip(),
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0.15,
+    }
+    return await _post_chat_completion_json(base_url, api_key, body, timeout=timeout)
 
 
 async def test_llm_connection(base_url: str, api_key: str, model: str) -> Dict[str, Any]:

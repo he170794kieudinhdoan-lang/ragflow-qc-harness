@@ -1,8 +1,10 @@
 import json
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
+from pydantic import BaseModel
 
 from database import get_current_account_key, get_db, get_float_setting
+from diagnostic_swarm import run_compare_regression_autopsy
 from exporter import export_run_workbook
 from metrics import (
     CHUNKING_ERROR_CATALOG,
@@ -636,6 +638,26 @@ def export_excel(run_id: int):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="ragflow_qc_run_{run_id}.xlsx"'},
     )
+
+
+class CompareAutopsyRequest(BaseModel):
+    baseline_rr_id: int
+    candidate_rr_id: int
+    force_refresh: bool = False
+
+
+@router.post("/compare/autopsy")
+async def compare_regression_autopsy(payload: CompareAutopsyRequest):
+    try:
+        return await run_compare_regression_autopsy(
+            baseline_rr_id=payload.baseline_rr_id,
+            candidate_rr_id=payload.candidate_rr_id,
+            force_refresh=payload.force_refresh,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi giải phẫu Regression: {e}")
 
 
 @router.post("/seed-canonical")

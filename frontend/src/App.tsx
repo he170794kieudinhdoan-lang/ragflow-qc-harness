@@ -14,6 +14,7 @@ import {
   Lock,
   Search,
   Settings,
+  SlidersHorizontal,
   X,
 } from 'lucide-react';
 import { api } from './api/client';
@@ -25,10 +26,11 @@ import { ChunkingPage } from './pages/ChunkingPage';
 import { RetrievalPage } from './pages/RetrievalPage';
 import { BrandWordmark } from './components/BrandWordmark';
 import { CompareLabPage } from './pages/CompareLabPage';
+import { OptimizationLabPage } from './pages/OptimizationLabPage';
 import SettingsModal from './components/SettingsModal';
 import { PageLoader } from './components/PageLoader';
 
-type StepId = 'workspace' | 'parsing' | 'chunking' | 'retrieval' | 'compare';
+type StepId = 'workspace' | 'parsing' | 'chunking' | 'retrieval' | 'compare' | 'optimizer';
 
 interface WorkflowStepDef {
   id: StepId;
@@ -43,10 +45,12 @@ const WORKFLOW_STEPS: Record<WorkflowModeId, WorkflowStepDef[]> = {
     { id: 'chunking', num: '03', label: 'Chunking' },
     { id: 'retrieval', num: '04', label: 'Golden & Retrieval' },
     { id: 'compare', num: '05', label: 'So sánh A/B' },
+    { id: 'optimizer', num: '06', label: 'Tối ưu cấu hình' },
   ],
   retrieval_only: [
     { id: 'retrieval', num: '01', label: 'Golden & Retrieval' },
     { id: 'compare', num: '02', label: 'So sánh A/B' },
+    { id: 'optimizer', num: '03', label: 'Tối ưu cấu hình' },
   ],
 };
 
@@ -56,6 +60,7 @@ const MODULE_ICONS: Record<StepId, React.FC<{ className?: string }>> = {
   chunking: Layers,
   retrieval: Search,
   compare: GitCompare,
+  optimizer: SlidersHorizontal,
 };
 
 export default function App() {
@@ -291,7 +296,7 @@ export default function App() {
   const isParsingComplete = parsingProgress.total > 0 && parsingProgress.rated >= parsingProgress.total;
 
   const isStepLocked = (stepId: StepId): { locked: boolean; reason: string } => {
-    if (stepId === 'workspace' || stepId === 'retrieval' || stepId === 'compare') {
+    if (stepId === 'workspace' || stepId === 'retrieval' || stepId === 'compare' || stepId === 'optimizer') {
       return { locked: false, reason: '' };
     }
     if ((stepId === 'parsing' || stepId === 'chunking') && !hasSyncedChunks) {
@@ -541,6 +546,18 @@ export default function App() {
         {hasVisited('compare') && (
           <div className={tab === 'compare' ? '' : 'hidden'}>
             <CompareLabPage activeRun={activeRun} />
+          </div>
+        )}
+        {hasVisited('optimizer') && (
+          <div className={tab === 'optimizer' ? '' : 'hidden'}>
+            <OptimizationLabPage
+              activeRun={activeRun}
+              isActive={tab === 'optimizer'}
+              onReloadRuns={loadRuns}
+              onSelectRun={persistActiveRun}
+              onOpenWorkspace={() => setTab('workspace')}
+              onOpenRetrieval={() => setTab('retrieval')}
+            />
           </div>
         )}
       </main>

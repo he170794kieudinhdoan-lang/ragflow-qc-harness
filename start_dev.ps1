@@ -13,10 +13,20 @@ Get-NetTCPConnection -LocalPort 8000,5173 -ErrorAction SilentlyContinue |
 
 Start-Sleep -Milliseconds 400
 
-Write-Host "Starting Backend (http://127.0.0.1:8000) in dedicated window..." -ForegroundColor Green
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "Set-Location '$PSScriptRoot\backend'; python -m uvicorn main:app --host 127.0.0.1 --port 8000"
+$BackendPy = Join-Path $PSScriptRoot "backend\.venv\Scripts\python.exe"
+if (-not (Test-Path $BackendPy)) {
+    $RootVenvPy = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+    if (Test-Path $RootVenvPy) {
+        $BackendPy = $RootVenvPy
+    } else {
+        $BackendPy = "python"
+    }
+}
+
+Write-Host "Starting Backend (http://127.0.0.1:8000) using $BackendPy..." -ForegroundColor Green
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "Set-Location '$PSScriptRoot\backend'; & '$BackendPy' -m uvicorn main:app --host 127.0.0.1 --port 8000"
 
 Write-Host "Starting Frontend (http://localhost:5173) in dedicated window..." -ForegroundColor Green
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "Set-Location '$PSScriptRoot\frontend'; npm run dev -- --host localhost --port 5173"
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "Set-Location '$PSScriptRoot\frontend'; npm run dev"
 
 Write-Host "Done! Open http://localhost:5173 in your browser." -ForegroundColor Yellow

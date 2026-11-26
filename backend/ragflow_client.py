@@ -182,6 +182,24 @@ class RAGFlowClient:
                 return self._unwrap(r2)
             raise
 
+    async def delete_datasets(self, dataset_ids: List[str]) -> Any:
+        """
+        Deletes specific RAGFlow datasets by ID.
+        Guards strictly against sending empty/null `ids` (RAGFlow deletes ALL datasets if `ids` is null).
+        """
+        clean_ids = [str(i).strip() for i in (dataset_ids or []) if str(i).strip()]
+        if not clean_ids:
+            return {"skipped": True}
+        client = get_shared_http_client()
+        r = await client.request(
+            "DELETE",
+            f"{self.base_url}/api/v1/datasets",
+            headers=self._headers(),
+            json={"ids": clean_ids},
+            timeout=self.timeout,
+        )
+        return self._unwrap(r)
+
     # --- Documents ---
     async def list_documents(
         self, dataset_id: str, page: int = 1, page_size: int = 100
@@ -342,6 +360,7 @@ class RAGFlowClient:
         keyword: bool = False,
         page: int = 1,
         page_size: int = 10,
+        use_kg: bool = False,
     ) -> Dict[str, Any]:
         body: Dict[str, Any] = {
             "question": question,
@@ -355,6 +374,8 @@ class RAGFlowClient:
         }
         if rerank_id:
             body["rerank_id"] = rerank_id
+        if use_kg:
+            body["use_kg"] = True
         client = get_shared_http_client()
         r = await client.post(
             f"{self.base_url}/api/v1/retrieval",

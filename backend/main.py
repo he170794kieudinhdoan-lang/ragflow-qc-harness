@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from database import init_db
 from ragflow_client import close_shared_http_client
-from routers import settings, workspace, parsing, chunking, retrieval, analytics
+from routers import settings, workspace, parsing, chunking, retrieval, analytics, optimizer
 
 app = FastAPI(title="RAGFlow QC Harness API", version="0.1.0")
 
@@ -37,3 +37,4 @@ app.include_router(parsing.router)
 app.include_router(chunking.router)
 app.include_router(retrieval.router)
 app.include_router(analytics.router)
+app.include_router(optimizer.router)

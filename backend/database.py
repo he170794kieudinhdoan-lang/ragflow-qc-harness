@@ -222,6 +222,57 @@ def init_db():
                 PRIMARY KEY (testcase_id, ragflow_chunk_id)
             );
 
+            CREATE TABLE IF NOT EXISTS relevancy_content_cache (
+                testcase_id INTEGER NOT NULL REFERENCES golden_testcases(id) ON DELETE CASCADE,
+                content_hash TEXT NOT NULL,
+                relevant INTEGER NOT NULL,
+                reason TEXT DEFAULT '',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (testcase_id, content_hash)
+            );
+
+            CREATE TABLE IF NOT EXISTS optimization_studies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                study_type TEXT NOT NULL DEFAULT 'RETRIEVAL_SWEEP',
+                objective_profile TEXT NOT NULL DEFAULT 'balanced',
+                search_space_json TEXT DEFAULT '{}',
+                status TEXT DEFAULT 'RUNNING',
+                progress_done INTEGER DEFAULT 0,
+                progress_total INTEGER DEFAULT 0,
+                stage_label TEXT DEFAULT '',
+                best_trial_id INTEGER,
+                summary_json TEXT DEFAULT '{}',
+                error_message TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS optimization_trials (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                study_id INTEGER NOT NULL REFERENCES optimization_studies(id) ON DELETE CASCADE,
+                trial_index INTEGER NOT NULL,
+                stage TEXT DEFAULT '1_SCREENING',
+                config_json TEXT NOT NULL,
+                testcase_count INTEGER DEFAULT 0,
+                avg_cp REAL DEFAULT 0.0,
+                avg_cc REAL DEFAULT 0.0,
+                avg_mrr REAL DEFAULT 0.0,
+                hit_at_1 REAL DEFAULT 0.0,
+                hit_at_3 REAL DEFAULT 0.0,
+                hit_at_k REAL DEFAULT 0.0,
+                avg_latency_ms REAL DEFAULT 0.0,
+                avg_context_tokens REAL DEFAULT 0.0,
+                objective_score REAL DEFAULT 0.0,
+                is_pareto INTEGER DEFAULT 0,
+                cache_hits INTEGER DEFAULT 0,
+                judge_calls INTEGER DEFAULT 0,
+                retrieval_run_id INTEGER,
+                status TEXT DEFAULT 'DONE',
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS testcase_eval_meta (
                 retrieval_run_id INTEGER NOT NULL REFERENCES retrieval_runs(id) ON DELETE CASCADE,
                 testcase_id INTEGER NOT NULL REFERENCES golden_testcases(id) ON DELETE CASCADE,
@@ -231,6 +282,21 @@ def init_db():
                 root_cause_notes TEXT DEFAULT '',
                 PRIMARY KEY (retrieval_run_id, testcase_id)
             );
+
+            CREATE TABLE IF NOT EXISTS agent_diagnostic_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                report_type TEXT NOT NULL DEFAULT 'ADVISOR_SWARM', -- ADVISOR_SWARM | REGRESSION_AUTOPSY
+                ref_key TEXT NOT NULL DEFAULT '',                  -- '' or '<baseline_rr_id>:<candidate_rr_id>'
+                evidence_sig TEXT NOT NULL DEFAULT '',
+                summary_json TEXT NOT NULL DEFAULT '{}',
+                model_used TEXT DEFAULT '',
+                duration_ms INTEGER DEFAULT 0,
+                llm_calls INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_diag_lookup
+                ON agent_diagnostic_reports(run_id, report_type, ref_key, id DESC);
             """
         )
 
@@ -272,6 +338,11 @@ def init_db():
         gt_cols = {r["name"] for r in conn.execute("PRAGMA table_info(golden_testcases)").fetchall()}
         if "account_key" not in gt_cols:
             conn.execute("ALTER TABLE golden_testcases ADD COLUMN account_key TEXT DEFAULT ''")
+
+        # Ensure optimization_trials.metrics_json exists for 3-layer Canary Variant breakdowns
+        ot_cols = {r["name"] for r in conn.execute("PRAGMA table_info(optimization_trials)").fetchall()}
+        if "metrics_json" not in ot_cols:
+            conn.execute("ALTER TABLE optimization_trials ADD COLUMN metrics_json TEXT DEFAULT '{}'")
 
 
 DEFAULT_SETTINGS: dict[str, str] = {

@@ -199,4 +199,37 @@ export const api = {
   compareRuns: (baselineRrId: number, candidateRrId: number) =>
     req<any>(`/api/analytics/compare?baseline_rr_id=${baselineRrId}&candidate_rr_id=${candidateRrId}`),
   exportXlsxUrl: (runId: number) => `/api/analytics/runs/${runId}/export-xlsx`,
+
+  // Optimizer & Config Advisor
+  getConfigAdvisor: (runId: number) => req<any>(`/api/optimizer/runs/${runId}/advisor`),
+  listOptimizationStudies: (runId: number) => req<any[]>(`/api/optimizer/runs/${runId}/studies`),
+  getOptimizationStudy: (studyId: number) => req<any>(`/api/optimizer/studies/${studyId}`),
+  startRetrievalSweep: (runId: number, payload: any) =>
+    req<any>(`/api/optimizer/runs/${runId}/sweep`, { method: 'POST', body: JSON.stringify(payload) }),
+  cancelOptimizationStudy: (studyId: number) =>
+    req<any>(`/api/optimizer/studies/${studyId}/cancel`, { method: 'POST' }),
+  deleteOptimizationStudy: (studyId: number) =>
+    req<any>(`/api/optimizer/studies/${studyId}`, { method: 'DELETE' }),
+  applyRecommendedConfig: (runId: number, payload: any) =>
+    req<any>(`/api/optimizer/runs/${runId}/apply-config`, { method: 'POST', body: JSON.stringify(payload) }),
+  getCanaryCandidates: (runId: number, maxDocs = 4) =>
+    req<any>(`/api/optimizer/runs/${runId}/canary-candidates?max_docs=${maxDocs}`),
+  startCanarySweep: (runId: number, payload: any) =>
+    req<any>(`/api/optimizer/runs/${runId}/canary-sweep`, { method: 'POST', body: JSON.stringify(payload) }),
+  getLatestAgentDiagnose: (runId: number) =>
+    req<{ ok: boolean; report: any | null; is_stale?: boolean }>(`/api/optimizer/runs/${runId}/agent-diagnose/latest`),
+  runAgentDiagnose: (runId: number, forceRefresh = false, includeVision = true) =>
+    req<any>(`/api/optimizer/runs/${runId}/agent-diagnose`, {
+      method: 'POST',
+      body: JSON.stringify({ force_refresh: forceRefresh, include_vision: includeVision }),
+    }),
+  runCompareAutopsy: (baselineRrId: number, candidateRrId: number, forceRefresh = false) =>
+    req<any>('/api/analytics/compare/autopsy', {
+      method: 'POST',
+      body: JSON.stringify({
+        baseline_rr_id: baselineRrId,
+        candidate_rr_id: candidateRrId,
+        force_refresh: forceRefresh,
+      }),
+    }),
 };

@@ -180,3 +180,222 @@ export interface RetrievalResultGroup {
   rated_count: number;
   hits: RetrievalHit[];
 }
+
+export interface ConfigDiffItem {
+  param: string;
+  from: any;
+  to: any;
+}
+
+export interface CandidateConfigPack {
+  id: string;
+  name: string;
+  scope: 'RETRIEVAL' | 'INDEX' | 'JOINT';
+  reparse_required: boolean;
+  priority: string;
+  summary: string;
+  reasons: string[];
+  tradeoff: string;
+  index_patch: Record<string, any>;
+  retrieval_patch: Record<string, any>;
+  diff: ConfigDiffItem[];
+}
+
+export interface AdvisorResponse {
+  ok: boolean;
+  run_id: number;
+  run_name: string;
+  current_config: {
+    index: Record<string, any>;
+    retrieval: {
+      top_k: number;
+      similarity_threshold: number;
+      vector_similarity_weight: number;
+      rerank_id: string;
+      keyword_enabled: boolean;
+    };
+  };
+  corpus_profile: {
+    doc_count: number;
+    total_chunks: number;
+    avg_chunk_tokens: number;
+    pdf_docs: number;
+    scan_docs: number;
+    scan_ratio: number;
+    table_ratio: number;
+    legal_ratio: number;
+    zero_chunk_docs: number;
+    archetype: string;
+    flag_counts: Record<string, number>;
+  };
+  failure_signals: {
+    layer: string;
+    code: string;
+    severity: 'high' | 'medium' | 'low';
+    metric: string;
+    detail: string;
+  }[];
+  candidate_packs: CandidateConfigPack[];
+  recommended_sweep_space: {
+    vector_similarity_weight: number[];
+    similarity_threshold: number[];
+    top_k: number[];
+    keyword_enabled: boolean[];
+    rerank_ids: string[];
+  };
+}
+
+export interface OptimizationTrial {
+  id: number;
+  study_id: number;
+  trial_index: number;
+  stage: '1_SCREENING' | '2_FULL' | 'CANARY_VARIANT';
+  config: {
+    vector_similarity_weight: number;
+    similarity_threshold: number;
+    top_k: number;
+    keyword_enabled: boolean;
+    rerank_id: string;
+    variant_id?: string;
+    variant_name?: string;
+    is_baseline?: boolean;
+    index_patch?: Record<string, any>;
+    chunk_method?: string;
+  };
+  testcase_count: number;
+  avg_cp: number;
+  avg_cc: number;
+  avg_mrr: number;
+  hit_at_1: number;
+  hit_at_3: number;
+  hit_at_k: number;
+  avg_latency_ms: number;
+  avg_context_tokens: number;
+  objective_score: number;
+  is_pareto: boolean;
+  cache_hits: number;
+  judge_calls: number;
+  retrieval_run_id: number | null;
+  status: string;
+  created_at: string;
+  metrics?: Record<string, any>;
+}
+
+export interface SensitivityItem {
+  param: string;
+  label: string;
+  swing: number;
+  best_value: string;
+  best_avg_score: number;
+  worst_value: string;
+  worst_avg_score: number;
+  levels: { value: string; avg_score: number; count: number }[];
+}
+
+export interface OptimizationStudy {
+  id: number;
+  run_id: number;
+  name: string;
+  study_type: string;
+  objective_profile: 'balanced' | 'high_precision' | 'high_recall' | 'low_latency';
+  search_space: Record<string, any>;
+  status: 'RUNNING' | 'COMPLETED' | 'CANCELLED' | 'FAILED';
+  progress_done: number;
+  progress_total: number;
+  stage_label: string;
+  best_trial_id: number | null;
+  summary: {
+    total_candidates?: number;
+    two_stage?: boolean;
+    subset_size?: number;
+    full_size?: number;
+    best_trial_id?: number;
+    best_config?: Record<string, any>;
+    best_score?: number;
+    baseline_score?: number | null;
+    delta_score?: number | null;
+    saved_retrieval_run_id?: number | null;
+    sensitivity?: SensitivityItem[];
+    study_mode?: string;
+    canary_doc_count?: number;
+    canary_testcase_count?: number;
+    best_variant_name?: string;
+    best_index_patch?: Record<string, any>;
+    best_retrieval_config?: Record<string, any>;
+  };
+  error_message: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ForensicFinding {
+  pattern: string;
+  severity: 'high' | 'medium' | 'low';
+  summary: string;
+  evidence_refs: string[];
+}
+
+export interface LayerDiagnosis {
+  layer: 'PARSING' | 'CHUNKING' | 'RETRIEVAL';
+  status: 'OK' | 'ISSUES_FOUND' | 'SKIPPED_NO_DATA' | 'FALLBACK_ERROR';
+  headline: string;
+  findings: ForensicFinding[];
+  recommended_knobs: Record<string, any>;
+  vision_used?: boolean;
+}
+
+export interface HypothesisPack {
+  id: string;
+  name: string;
+  scope: 'RETRIEVAL' | 'INDEX' | 'JOINT';
+  reparse_required: boolean;
+  priority: string;
+  hypothesis_statement: string;
+  conflict_resolution?: string;
+  evidence_refs: string[];
+  expected_gains: string[];
+  regression_warnings: string[];
+  index_patch: Record<string, any>;
+  retrieval_patch: Record<string, any>;
+  diff: ConfigDiffItem[];
+}
+
+export interface RegressionAutopsyItem {
+  tc_code: string;
+  question_class: string;
+  question: string;
+  baseline_cp: number;
+  candidate_cp: number;
+  why_failed: string;
+  fix_hint: string;
+}
+
+export interface SwarmDiagnosisReport {
+  ok: boolean;
+  run_id: number;
+  run_name: string;
+  report_type: 'ADVISOR_SWARM' | 'REGRESSION_AUTOPSY';
+  cached: boolean;
+  evidence_sig: string;
+  model_used: string;
+  duration_ms: number;
+  llm_calls: number;
+  executive_summary: string;
+  improvement_plan?: string[];
+  architecture_mode?: string;
+  drilldown_triggered?: boolean;
+  supervisor_notes?: string[];
+  evidence_counts: Record<string, number>;
+  layer_diagnoses: LayerDiagnosis[];
+  hypothesis_packs: HypothesisPack[];
+  regressions_analyzed: RegressionAutopsyItem[];
+  created_at: string;
+}
+
+export interface CanaryVariantDef {
+  id: string;
+  name: string;
+  description: string;
+  index_patch: Record<string, any>;
+  is_baseline?: boolean;
+}

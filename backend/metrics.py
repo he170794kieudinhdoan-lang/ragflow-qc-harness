@@ -1,3 +1,4 @@
+import hashlib
 import re
 import unicodedata
 from difflib import SequenceMatcher
@@ -1036,6 +1037,136 @@ def compute_context_coverage(reference_context: str, retrieved_chunks: List[Dict
         txt = ch.get("content") or ch.get("content_with_weight") or ""
         union_tokens |= {t for t in re.findall(r"\w+", normalize_text(txt)) if len(t) >= 2}
     return round(len(ref_tokens & union_tokens) / len(ref_tokens), 4)
+
+
+def compute_content_hash(text: str) -> str:
+    """Stable SHA-256 prefix over normalized text so relevancy cache survives chunk re-IDs."""
+    norm = normalize_text(text)
+    if not norm:
+        return ""
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:32]
+
+
+def compute_mrr(relevancies: List[int]) -> float:
+    """Mean Reciprocal Rank component for a single query: 1 / rank of first relevant chunk."""
+    for idx, rel in enumerate(relevancies, start=1):
+        if rel == 1:
+            return round(1.0 / idx, 4)
+    return 0.0
+
+
+def compute_hit_at_k(relevancies: List[int], k: int) -> float:
+    """Binary Hit@K (1.0 if at least 1 relevant chunk appears in top-K, else 0.0)."""
+    if k <= 0 or not relevancies:
+        return 0.0
+    return 1.0 if any(r == 1 for r in relevancies[:k]) else 0.0
+
+
+def compute_multi_objective_score(
+    avg_cp: float,
+    avg_cc: float,
+    avg_mrr: float,
+    hit_1: float,
+    hit_3: float,
+    hit_k: float,
+    avg_latency_ms: float = 0.0,
+    avg_context_tokens: float = 0.0,
+    profile: str = "balanced",
+) -> float:
+    """
+    Computes a unified [0, 1] optimization objective score tailored to user priority:
+      - balanced:       0.40*CP + 0.30*Coverage + 0.20*MRR + 0.10*Hit@3
+      - high_precision: 0.45*CP + 0.30*MRR + 0.15*Hit@1 + 0.10*Coverage
+      - high_recall:    0.50*Coverage + 0.25*Hit@K + 0.15*CP + 0.10*MRR
+      - low_latency:    0.45*CP + 0.30*Coverage + 0.15*MRR - latency/token penalty
+    """
+    prof = (profile or "balanced").strip().lower()
+    if prof == "high_precision":
+        raw = 0.45 * avg_cp + 0.30 * avg_mrr + 0.15 * hit_1 + 0.10 * avg_cc
+    elif prof == "high_recall":
+        raw = 0.50 * avg_cc + 0.25 * hit_k + 0.15 * avg_cp + 0.10 * avg_mrr
+    elif prof == "low_latency":
+        lat_pen = min(0.18, max(0.0, (avg_latency_ms - 180.0) / 3500.0))
+        tok_pen = min(0.10, max(0.0, (avg_context_tokens - 1500.0) / 18000.0))
+        raw = 0.45 * avg_cp + 0.30 * avg_cc + 0.15 * avg_mrr + 0.10 * hit_3 - lat_pen - tok_pen
+    else:
+        raw = 0.40 * avg_cp + 0.30 * avg_cc + 0.20 * avg_mrr + 0.10 * hit_3
+    return round(max(0.0, min(1.0, raw)), 4)
+
+
+def mark_pareto_frontier(
+    trials: List[Dict[str, Any]],
+    x_key: str = "avg_latency_ms",
+    y_key: str = "objective_score",
+) -> List[Dict[str, Any]]:
+    """
+    Marks non-dominated trials on the Pareto frontier (maximize y_key, minimize x_key).
+    """
+    if not trials:
+        return trials
+    for i, t in enumerate(trials):
+        tx = float(t.get(x_key) or 0.0)
+        ty = float(t.get(y_key) or 0.0)
+        dominated = False
+        for j, other in enumerate(trials):
+            if i == j:
+                continue
+            ox = float(other.get(x_key) or 0.0)
+            oy = float(other.get(y_key) or 0.0)
+            if oy >= ty and ox <= tx and (oy > ty or ox < tx):
+                dominated = True
+                break
+        t["is_pareto"] = not dominated
+    return trials
+
+
+def compute_parameter_sensitivity(trials: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Computes main-effect sensitivity for each swept retrieval parameter across trials:
+    identifies which parameter creates the largest objective_score swing and its best value.
+    """
+    if len(trials) < 2:
+        return []
+    param_keys = [
+        ("vector_similarity_weight", "Tỷ trọng Vector"),
+        ("similarity_threshold", "Ngưỡng lọc (Threshold)"),
+        ("top_k", "Top-K trả về"),
+        ("keyword_enabled", "Tìm kiếm từ khóa (BM25)"),
+        ("rerank_id", "Model Rerank"),
+    ]
+    results: List[Dict[str, Any]] = []
+    for key, label in param_keys:
+        buckets: Dict[str, List[float]] = {}
+        for t in trials:
+            cfg = t.get("config") or {}
+            if key not in cfg:
+                continue
+            raw_v = cfg[key]
+            if key == "rerank_id":
+                v_str = str(raw_v).strip() or "Tắt"
+            elif key == "keyword_enabled":
+                v_str = "Bật" if raw_v else "Tắt"
+            else:
+                v_str = str(raw_v)
+            buckets.setdefault(v_str, []).append(float(t.get("objective_score") or 0.0))
+        if len(buckets) < 2:
+            continue
+        means = {k: round(sum(vs) / len(vs), 4) for k, vs in buckets.items() if vs}
+        best_val = max(means.keys(), key=lambda k: means[k])
+        worst_val = min(means.keys(), key=lambda k: means[k])
+        swing = round(means[best_val] - means[worst_val], 4)
+        results.append({
+            "param": key,
+            "label": label,
+            "swing": swing,
+            "best_value": best_val,
+            "best_avg_score": means[best_val],
+            "worst_value": worst_val,
+            "worst_avg_score": means[worst_val],
+            "levels": [{"value": k, "avg_score": v, "count": len(buckets[k])} for k, v in means.items()],
+        })
+    results.sort(key=lambda x: -x["swing"])
+    return results
 
 
 def compute_parsing_metrics(rows: List[Any]) -> Dict[str, Any]:

@@ -165,6 +165,7 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
   const [threshold, setThreshold] = useState(0.2);
   const [vecWeight, setVecWeight] = useState(0.3);
   const [rerankId, setRerankId] = useState('');
+  const [keywordEnabled, setKeywordEnabled] = useState(true);
 
   const [diagnosing, setDiagnosing] = useState(false);
   const [diagnosis, setDiagnosis] = useState<any>(null);
@@ -215,7 +216,13 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
   useEffect(() => {
     loadTestcases();
     loadRuns();
-  }, [activeRun?.id]);
+    const rc = (activeRun?.retrieval_config || {}) as Record<string, any>;
+    if (rc.top_k !== undefined) setTopK(Number(rc.top_k) || 10);
+    if (rc.similarity_threshold !== undefined) setThreshold(Number(rc.similarity_threshold));
+    if (rc.vector_similarity_weight !== undefined) setVecWeight(Number(rc.vector_similarity_weight));
+    if (rc.rerank_id !== undefined) setRerankId(String(rc.rerank_id || ''));
+    if (rc.keyword_enabled !== undefined) setKeywordEnabled(Boolean(rc.keyword_enabled));
+  }, [activeRun?.id, activeRun?.retrieval_config]);
 
   useEffect(() => {
     api
@@ -385,7 +392,7 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
         similarity_threshold: threshold,
         vector_similarity_weight: vecWeight,
         rerank_id: rerankId,
-        keyword_enabled: true,
+        keyword_enabled: keywordEnabled,
         use_llm: judgeEngine !== 'rule',
         judge_engine: judgeEngine,
         bypass_cache: bypassCache,

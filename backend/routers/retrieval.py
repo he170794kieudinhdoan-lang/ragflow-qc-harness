@@ -19,6 +19,7 @@ from llm_client import (
 )
 from metrics import (
     compute_answer_containment,
+    compute_content_hash,
     compute_context_coverage,
     compute_contextual_precision,
     nfc,
@@ -405,11 +406,14 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
         if not testcases:
             raise HTTPException(status_code=400, detail="Golden Dataset đang trống. Hãy thêm testcase trước.")
 
-        # Load Smart Relevancy Cache
+        # Load Smart Relevancy Cache (chunk_id exact + content_hash fallback)
         cache_map = {}
+        content_cache_map = {}
         if not payload.bypass_cache:
             cache_rows = conn.execute("SELECT * FROM relevancy_cache").fetchall()
             cache_map = {(c["testcase_id"], c["ragflow_chunk_id"]): (c["relevant"], c["reason"]) for c in cache_rows}
+            cc_rows = conn.execute("SELECT * FROM relevancy_content_cache").fetchall()
+            content_cache_map = {(c["testcase_id"], c["content_hash"]): (c["relevant"], c["reason"]) for c in cc_rows}
 
         # Load local snapshot chunks for Answer Containment check
         snap_chunks = [
@@ -485,7 +489,14 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
                 ch_content = ch.get("content") or ch.get("content_with_weight") or ""
                 ch_doc_name = ch.get("document_keyword") or ch.get("document_name") or ch.get("docnm_kwd", "")
                 cached = cache_map.get((tc["id"], cid))
-                parsed_hits.append((rank, cid, ch, ch_content, ch_doc_name, cached))
+                cache_src = "CACHED"
+                if cached is None and not payload.bypass_cache and ch_content:
+                    ch_hash = compute_content_hash(ch_content)
+                    if ch_hash:
+                        cached = content_cache_map.get((tc["id"], ch_hash))
+                        if cached is not None:
+                            cache_src = "CACHED"
+                parsed_hits.append((rank, cid, ch, ch_content, ch_doc_name, cached, cache_src))
                 if cached is None:
                     uncached_cands.append({"rank": rank, "content": ch_content})
 
@@ -508,10 +519,10 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
                         local_errors = 1
                         first_err = batch_err
 
-            for rank, cid, ch, ch_content, ch_doc_name, cached in parsed_hits:
+            for rank, cid, ch, ch_content, ch_doc_name, cached, cache_src in parsed_hits:
                 if cached is not None:
                     rel_val, reason = cached
-                    src = "CACHED"
+                    src = cache_src
                     local_cache_hits += 1
                 elif rank in llm_verdicts:
                     rel_val, reason = llm_verdicts[rank]
@@ -534,6 +545,10 @@ async def execute_retrieval_benchmark(payload: RetrievalRunCreate):
                 ch_doc_name = ch.get("document_keyword") or ch.get("document_name") or ch.get("docnm_kwd", "")
                 hit_meta.append((rank, cid, ch, ch_content, ch_doc_name))
                 cached = cache_map.get((tc["id"], cid))
+                if cached is None and not payload.bypass_cache and ch_content:
+                    ch_hash = compute_content_hash(ch_content)
+                    if ch_hash:
+                        cached = content_cache_map.get((tc["id"], ch_hash))
                 if cached is not None:
                     async def _from_cache(val=cached):
                         return val[0], "CACHED", val[1], None, 0
@@ -862,7 +877,8 @@ def score_retrieval_result(result_id: int, payload: ResultScoreUpdate):
             """,
             (payload.relevant, payload.reason, result_id),
         )
-        # Update Smart Relevancy Cache!
+        # Update Smart Relevancy Cache (both chunk_id and content_hash)
+        now = utc_now()
         conn.execute(
             """
             INSERT INTO relevancy_cache (testcase_id, ragflow_chunk_id, relevant, reason, updated_at)
@@ -872,8 +888,21 @@ def score_retrieval_result(result_id: int, payload: ResultScoreUpdate):
                 reason=excluded.reason,
                 updated_at=excluded.updated_at
             """,
-            (row["testcase_id"], row["ragflow_chunk_id"], payload.relevant, payload.reason, utc_now()),
+            (row["testcase_id"], row["ragflow_chunk_id"], payload.relevant, payload.reason, now),
         )
+        ch_hash = compute_content_hash(row["content"] or "")
+        if ch_hash:
+            conn.execute(
+                """
+                INSERT INTO relevancy_content_cache (testcase_id, content_hash, relevant, reason, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(testcase_id, content_hash) DO UPDATE SET
+                    relevant=excluded.relevant,
+                    reason=excluded.reason,
+                    updated_at=excluded.updated_at
+                """,
+                (row["testcase_id"], ch_hash, payload.relevant, payload.reason, now),
+            )
     return {"ok": True}
 
 
