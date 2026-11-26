@@ -13,6 +13,7 @@ import {
   Info,
   Layers,
   Lock,
+  Plus,
   Search,
   Settings,
   X,
@@ -37,6 +38,9 @@ const PlatformGuidePage = lazy(() =>
 );
 const SettingsModal = lazy(() => import('./components/SettingsModal'));
 const GlossaryModal = lazy(() => import('./components/GlossaryModal').then((m) => ({ default: m.GlossaryModal })));
+const DatasetFlowModal = lazy(() =>
+  import('./components/DatasetFlowModal').then((m) => ({ default: m.DatasetFlowModal }))
+);
 
 type StepId = 'workspace' | 'parsing' | 'chunking' | 'retrieval' | 'studio';
 
@@ -200,6 +204,7 @@ export default function App() {
   // Settings Modal & Session Switcher
   const [showSettings, setShowSettings] = useState(false);
   const [showGlossary, setShowGlossary] = useState(false);
+  const [showCreateDataset, setShowCreateDataset] = useState(false);
   const [settingDefaults, setSettingDefaults] = useState<Record<string, string>>({});
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
   const sessionMenuRef = useRef<HTMLDivElement | null>(null);
@@ -515,6 +520,19 @@ export default function App() {
                     })
                   )}
                 </div>
+                <div className="border-t border-[#ededeb] bg-[#fafaf9] p-1.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSessionMenuOpen(false);
+                      setShowCreateDataset(true);
+                    }}
+                    className="w-full px-2.5 py-1.5 rounded-[3px] text-xs font-medium text-[#161616] hover:bg-[#ededeb] flex items-center gap-1.5 transition-colors"
+                  >
+                    <Plus className="size-3.5 text-[#03aa5c]" />
+                    Tạo Dataset mới
+                  </button>
+                </div>
               </div>
             )}
           </div>
@@ -678,6 +696,19 @@ export default function App() {
       {showGlossary && (
         <Suspense fallback={null}>
           <GlossaryModal onClose={() => setShowGlossary(false)} />
+        </Suspense>
+      )}
+
+      {/* Create New RAGFlow Dataset Modal */}
+      {showCreateDataset && (
+        <Suspense fallback={null}>
+          <DatasetFlowModal
+            onClose={() => setShowCreateDataset(false)}
+            onCreated={async (created) => {
+              persistActiveRun(created);
+              await loadRuns(created.id);
+            }}
+          />
         </Suspense>
       )}
 

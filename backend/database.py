@@ -275,6 +275,12 @@ def init_db():
                 result_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS baseline_advisor_reports (
+                run_id INTEGER PRIMARY KEY,
+                report_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
 

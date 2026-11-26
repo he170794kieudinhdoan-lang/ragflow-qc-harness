@@ -99,7 +99,8 @@ export const RagflowParserConfigModal: React.FC<Props> = ({ run, onClose, onSave
         if (cKey && pc[cKey]) {
           const c = pc[cKey];
           setChunkTokenSize(Number(c.chunk_token_size ?? 512));
-          setOverlappedPercent(Number(c.overlapped_percent ?? 0));
+          const rawOv = Number(c.overlapped_percent ?? 0);
+          setOverlappedPercent(rawOv > 0 && rawOv <= 1 ? Math.round(rawOv * 100) : Math.round(rawOv));
           const delims: string[] = Array.isArray(c.delimiters) ? c.delimiters : ['\n', '!', '?', ';'];
           setDelimitersText(delims.map((d) => (d === '\n' ? '\\n' : d)).join(' '));
           setTableContextSize(Number(c.table_context_size ?? 0));
@@ -164,7 +165,8 @@ export const RagflowParserConfigModal: React.FC<Props> = ({ run, onClose, onSave
       }
       if (cKey && next[cKey]) {
         next[cKey].chunk_token_size = Number(chunkTokenSize) || 512;
-        next[cKey].overlapped_percent = Number(overlappedPercent) || 0;
+        const ovNum = Number(overlappedPercent) || 0;
+        next[cKey].overlapped_percent = ovNum > 1 ? Math.round((ovNum / 100) * 10000) / 10000 : ovNum;
         next[cKey].delimiters = parsedDelims.length > 0 ? parsedDelims : ['\n'];
         next[cKey].table_context_size = Number(tableContextSize) || 0;
         next[cKey].image_context_size = Number(imageContextSize) || 0;

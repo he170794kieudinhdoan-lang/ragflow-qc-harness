@@ -546,13 +546,6 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActiv
                 <Maximize2 className="size-3" />
                 Chế độ chấm
               </button>
-
-              {onNextStep && (
-                <button onClick={onNextStep} className="ts-btn-secondary py-1 px-2.5 text-xs rounded-md">
-                  Bước 4
-                  <ArrowRight className="size-3" />
-                </button>
-              )}
             </div>
           </div>
 

@@ -35,11 +35,12 @@ function findNodeKey(pc: Record<string, any>, prefix: string): string | null {
 }
 
 interface Props {
-  mode: 'baseline' | 'clone';
+  mode: 'baseline' | 'clone' | 'edit';
   baselineRun: RunItem;
   aiPatch?: Record<string, any> | null;
   onClose: () => void;
   onStarted?: (job: PipelineJob) => void;
+  onSaved?: () => void;
   onCloneFromBaseline?: () => void;
 }
 
@@ -49,9 +50,11 @@ export const CloneConfigWorkbench: React.FC<Props> = ({
   aiPatch,
   onClose,
   onStarted,
+  onSaved,
   onCloneFromBaseline,
 }) => {
   const isReadOnly = mode === 'baseline';
+  const isEditMode = mode === 'edit';
   const modalRef = useRef<HTMLDivElement>(null);
 
   const [loading, setLoading] = useState(true);
@@ -64,7 +67,7 @@ export const CloneConfigWorkbench: React.FC<Props> = ({
 
   // Section 1: General
   const [name, setName] = useState(
-    isReadOnly ? baselineRun.name : `${baselineRun.name} · Thí nghiệm mới`
+    isReadOnly || isEditMode ? baselineRun.name : `${baselineRun.name} · Thí nghiệm mới`
   );
   const [parserId, setParserId] = useState('general');
   const [embeddingModel, setEmbeddingModel] = useState('');
@@ -229,7 +232,10 @@ export const CloneConfigWorkbench: React.FC<Props> = ({
         mdFlattenMedia: Boolean(pNode.markdown?.flatten_media_to_text),
         sheetFlattenMedia: Boolean(pNode.spreadsheet?.flatten_media_to_text),
         chunkTokenSize: Number(cNode.chunk_token_size ?? pc.chunk_token_num ?? 512),
-        overlappedPercent: Number(cNode.overlapped_percent ?? 0),
+        overlappedPercent: (() => {
+          const rawOv = Number(cNode.overlapped_percent ?? 0);
+          return rawOv > 0 && rawOv <= 1 ? Math.round(rawOv * 100) : Math.round(rawOv);
+        })(),
         delimitersText: bDelims.map((d) => (d === '\n' ? '\\n' : d)).join(' '),
         tableContextSize: Number(cNode.table_context_size ?? 0),
         imageContextSize: Number(cNode.image_context_size ?? 0),
@@ -370,7 +376,10 @@ export const CloneConfigWorkbench: React.FC<Props> = ({
     nextPc[cKey] = {
       ...(nextPc[cKey] || {}),
       chunk_token_size: Number(chunkTokenSize),
-      overlapped_percent: Number(overlappedPercent),
+      overlapped_percent:
+        Number(overlappedPercent) > 1
+          ? Math.round((Number(overlappedPercent) / 100) * 10000) / 10000
+          : Number(overlappedPercent),
       delimiters: delims.length ? delims : ['\n', '!', '?', ';'],
       table_context_size: Number(tableContextSize),
       image_context_size: Number(imageContextSize),
@@ -439,6 +448,31 @@ export const CloneConfigWorkbench: React.FC<Props> = ({
     }
   };
 
+  const handleSaveEdit = async () => {
+    setLaunching(true);
+    try {
+      const res = await api.updateRunParserConfig(baselineRun.id, {
+        chunk_method: parserId,
+        pagerank: Number(pagerank),
+        parser_config: buildParserConfig(),
+        sync_remote: true,
+      });
+      if (res?.remote_synced) {
+        toast.success('Đã lưu & đồng bộ cấu hình trực tiếp lên RAGFlow.');
+      } else if (res?.remote_warning) {
+        toast.warning(`Đã lưu cấu hình local (RAGFlow báo: ${res.remote_warning}).`);
+      } else {
+        toast.success('Đã lưu cấu hình Parse.');
+      }
+      onSaved?.();
+      onClose();
+    } catch (e: any) {
+      toast.error(e.message || 'Không lưu được cấu hình');
+    } finally {
+      setLaunching(false);
+    }
+  };
+
   const inp =
     'w-full h-7 px-2 text-[11.5px] border border-[#dcdcd8] rounded-[3px] bg-white disabled:bg-[#f5f5f3] disabled:text-[#3f3f46] disabled:cursor-default focus:outline-none focus:border-[#03aa5c]';
 
@@ -458,6 +492,10 @@ export const CloneConfigWorkbench: React.FC<Props> = ({
               <span className="font-mono text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-[3px] bg-[#161616] text-white shrink-0">
                 BASELINE [A] · RUN #{baselineRun.id}
               </span>
+            ) : isEditMode ? (
+              <span className="font-mono text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-[3px] bg-[#161616] text-white shrink-0">
+                CẤU HÌNH BASELINE · RUN #{baselineRun.id}
+              </span>
             ) : (
               <span className="font-mono text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-[3px] bg-[#03aa5c] text-white shrink-0">
                 THÍ NGHIỆM [B] · DATASET MỚI
@@ -466,7 +504,7 @@ export const CloneConfigWorkbench: React.FC<Props> = ({
 
             <input
               value={name}
-              disabled={isReadOnly}
+              disabled={isReadOnly || isEditMode}
               onChange={(e) => setName(e.target.value)}
               className="h-7 px-2.5 text-[12px] font-semibold text-[#161616] border border-[#e4e4e0] rounded-[4px] bg-[#fafaf9] disabled:bg-transparent disabled:border-transparent w-[260px] sm:w-[320px] truncate focus:outline-none focus:border-[#03aa5c]"
               placeholder="Tên nhánh thí nghiệm [B]"
@@ -1044,7 +1082,7 @@ export const CloneConfigWorkbench: React.FC<Props> = ({
                     'col-span-3'
                   )}
 
-                  {!isReadOnly && (
+                  {mode === 'clone' && (
                     <div className="col-span-3 flex items-center justify-between gap-2 px-2 py-1 rounded-[4px] border border-[#ececea] bg-[#fafaf9]">
                       <span className="text-[10.5px] font-medium text-[#3f3f46]">Chấm Parsing tự động:</span>
                       <div className="inline-flex rounded border border-[#dcdcd8] overflow-hidden text-[10.5px]">
@@ -1081,7 +1119,9 @@ export const CloneConfigWorkbench: React.FC<Props> = ({
             <Cpu className="size-3.5 text-[#03aa5c] shrink-0" />
             {isReadOnly
               ? 'Toàn bộ cấu hình Baseline [A] đồng bộ trực tiếp từ RAGFlow'
-              : 'Tự động: Tạo Dataset → Đẩy file → RAGFlow Parse → Chấm Parse → Chấm Chunk → Chấm Golden'}
+              : isEditMode
+                ? 'Chỉnh sửa & đồng bộ trực tiếp lên Dataset của phiên này trên RAGFlow (không tự Parse lại)'
+                : 'Tự động: Tạo Dataset → Đẩy file → RAGFlow Parse → Chấm Parse → Chấm Chunk → Chấm Golden'}
           </div>
           <div className="flex items-center gap-2 shrink-0">
             <button
@@ -1102,6 +1142,15 @@ export const CloneConfigWorkbench: React.FC<Props> = ({
                   Nhân bản cấu hình này sang [B]
                 </button>
               )
+            ) : isEditMode ? (
+              <button
+                onClick={handleSaveEdit}
+                disabled={loading || launching}
+                className="inline-flex items-center gap-1.5 px-4 h-8 text-[12px] font-semibold text-white bg-[#161616] hover:bg-black rounded-[4px] disabled:opacity-50"
+              >
+                {launching && <Loader2 className="size-3.5 animate-spin" />}
+                Lưu &amp; Đồng bộ RAGFlow
+              </button>
             ) : (
               <button
                 onClick={handleLaunch}

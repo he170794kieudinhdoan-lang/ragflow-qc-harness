@@ -140,8 +140,12 @@ export const api = {
     req<any>('/api/workspace/documents/upload', { method: 'POST', body: formData }),
   uploadDocumentsBatch: (formData: FormData) =>
     req<any>('/api/workspace/documents/upload-batch', { method: 'POST', body: formData }),
-  deleteDocument: (id: number) =>
-    req<any>(`/api/workspace/documents/${id}`, { method: 'DELETE' }),
+  deleteDocument: (id: number, runId?: number, deleteRemote = true) => {
+    const qs = new URLSearchParams();
+    if (runId !== undefined) qs.set('run_id', String(runId));
+    qs.set('delete_remote', String(deleteRemote));
+    return req<any>(`/api/workspace/documents/${id}?${qs.toString()}`, { method: 'DELETE' });
+  },
   clearDocuments: (syncedOnly = false) =>
     req<any>(`/api/workspace/documents?synced_only=${syncedOnly}`, { method: 'DELETE' }),
 
@@ -161,10 +165,30 @@ export const api = {
     req<any>(`/api/workspace/runs/${runId}/upload-and-parse`, { method: 'POST' }),
   parseSingleDocument: (runId: number, docId: number) =>
     req<any>(`/api/workspace/runs/${runId}/documents/${docId}/parse`, { method: 'POST' }),
+  getBaselineAdvisor: (runId: number) =>
+    req<any>(`/api/workspace/runs/${runId}/baseline-advisor`),
+  runBaselineAdvisor: (runId: number, useLlm = true, force = true) =>
+    req<any>(`/api/workspace/runs/${runId}/baseline-advisor?use_llm=${useLlm}&force=${force}`, {
+      method: 'POST',
+    }),
+  applyBaselineAdvisor: (
+    runId: number,
+    payload: {
+      chunk_method: string;
+      layout_recognize: string;
+      chunk_token_num: number;
+      overlapped_percent: number;
+      table_context_size: number;
+    }
+  ) =>
+    req<any>(`/api/workspace/runs/${runId}/baseline-advisor/apply`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 
   // Parsing
   listParsingUnits: (runId: number, docId?: number) =>
-    req<any[]>(`/api/parsing/runs/${runId}/units${docId ? `?document_id=${docId}` : ''}`),
+    cachedGet<any[]>(`/api/parsing/runs/${runId}/units${docId ? `?document_id=${docId}` : ''}`, 30000),
   createParsingUnit: (runId: number, payload: any) =>
     req<any>(`/api/parsing/runs/${runId}/units`, { method: 'POST', body: JSON.stringify(payload) }),
   autoExtractUnits: (runId: number, docId: number) =>

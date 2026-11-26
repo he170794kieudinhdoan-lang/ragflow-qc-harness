@@ -266,12 +266,40 @@ def open_document_file(doc_id: int):
 
 
 @router.delete("/documents/{doc_id}")
-def delete_document(doc_id: int, run_id: Optional[int] = None):
+async def delete_document(
+    doc_id: int,
+    run_id: Optional[int] = None,
+    delete_remote: bool = True,
+):
     """
-    Remove a document from ONE run by default (run-scoped). Chunks of that run are dropped so the
-    next sync re-pulls a clean snapshot. The global document row is only deleted when no other run
-    still references it, which keeps other datasets intact.
+    Remove a document from ONE run (and delete it on RAGFlow Dataset when delete_remote=True and
+    linked to a ragflow_doc_id). Chunks & parsing_units of that run are dropped cleanly, and the
+    global document row is deleted when no other run still references it.
     """
+    remote_deleted = False
+    remote_warning = ""
+    dataset_id = ""
+    ragflow_doc_id = ""
+
+    if delete_remote and run_id is not None:
+        with get_db() as conn:
+            run_row = conn.execute(
+                "SELECT ragflow_dataset_id FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            rd_row = conn.execute(
+                "SELECT ragflow_doc_id FROM run_documents WHERE run_id = ? AND document_id = ?",
+                (run_id, doc_id),
+            ).fetchone()
+            dataset_id = (run_row["ragflow_dataset_id"] if run_row else "") or ""
+            ragflow_doc_id = (rd_row["ragflow_doc_id"] if rd_row else "") or ""
+
+        if dataset_id and ragflow_doc_id:
+            try:
+                await _get_client().delete_documents(dataset_id, [ragflow_doc_id])
+                remote_deleted = True
+            except Exception as e:
+                remote_warning = str(e)
+
     with get_db() as conn:
         if run_id is not None:
             conn.execute(
@@ -286,6 +314,10 @@ def delete_document(doc_id: int, run_id: Optional[int] = None):
                 "DELETE FROM parsing_units WHERE run_id = ? AND document_id = ?",
                 (run_id, doc_id),
             )
+            conn.execute(
+                "DELETE FROM baseline_advisor_reports WHERE run_id = ?",
+                (run_id,),
+            )
             still_linked = conn.execute(
                 "SELECT COUNT(*) FROM run_documents WHERE document_id = ?", (doc_id,)
             ).fetchone()[0]
@@ -295,11 +327,10 @@ def delete_document(doc_id: int, run_id: Optional[int] = None):
             if still_linked == 0 and still_chunked == 0:
                 conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
         else:
-            # Global removal: drop chunks & parsing_units first so they don't become orphans.
             conn.execute("DELETE FROM parsing_units WHERE document_id = ?", (doc_id,))
             conn.execute("DELETE FROM chunks WHERE document_id = ?", (doc_id,))
             conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
-    return {"ok": True}
+    return {"ok": True, "remote_deleted": remote_deleted, "remote_warning": remote_warning}
 
 
 @router.delete("/documents")
@@ -535,6 +566,7 @@ def delete_run(run_id: int):
 
         conn.execute("DELETE FROM ai_advisor_reports WHERE run_id = ?", (run_id,))
         conn.execute("DELETE FROM auto_tune_reports WHERE run_id = ?", (run_id,))
+        conn.execute("DELETE FROM baseline_advisor_reports WHERE run_id = ?", (run_id,))
         conn.execute("DELETE FROM pipeline_jobs WHERE source_run_id = ? OR target_run_id = ?", (run_id, run_id))
         conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
         conn.execute(
@@ -1048,6 +1080,32 @@ async def sync_run_from_ragflow(
                 (local_doc_id, r_doc_id, local_doc["doc_code"], r_name, local_doc.get("file_path") or "")
             )
 
+        # Prune documents that were deleted on RAGFlow (only rows already linked to a ragflow_doc_id,
+        # preserving newly uploaded local-only files waiting to be pushed).
+        active_remote_doc_ids = [meta["ragflow_doc_id"] for meta, _local in plan if meta.get("ragflow_doc_id")]
+        removed_docs = 0
+        if active_remote_doc_ids:
+            ph = ",".join("?" for _ in active_remote_doc_ids)
+            conn.execute(
+                f"DELETE FROM chunks WHERE run_id = ? AND ragflow_doc_id IS NOT NULL AND ragflow_doc_id != '' AND ragflow_doc_id NOT IN ({ph})",
+                [run_id, *active_remote_doc_ids],
+            )
+            cur_rm = conn.execute(
+                f"DELETE FROM run_documents WHERE run_id = ? AND ragflow_doc_id IS NOT NULL AND ragflow_doc_id != '' AND ragflow_doc_id NOT IN ({ph})",
+                [run_id, *active_remote_doc_ids],
+            )
+            removed_docs = cur_rm.rowcount or 0
+        else:
+            conn.execute(
+                "DELETE FROM chunks WHERE run_id = ? AND ragflow_doc_id IS NOT NULL AND ragflow_doc_id != ''",
+                (run_id,),
+            )
+            cur_rm = conn.execute(
+                "DELETE FROM run_documents WHERE run_id = ? AND ragflow_doc_id IS NOT NULL AND ragflow_doc_id != ''",
+                (run_id,),
+            )
+            removed_docs = cur_rm.rowcount or 0
+
         # Legacy repair: chunks whose document row was deleted in an older version.
         repair_chunk_document_links(conn)
         conn.execute("UPDATE runs SET status = 'SYNCED' WHERE id = ?", (run_id,))
@@ -1059,6 +1117,7 @@ async def sync_run_from_ragflow(
     return {
         "ok": True,
         "synced_documents": synced_docs,
+        "removed_documents": removed_docs,
         "synced_chunks": synced_chunks,
         "auto_extracted_units": 0,
         "realigned_units": 0,
@@ -1183,3 +1242,446 @@ async def upload_local_docs_and_parse(run_id: int):
                 )
 
     return {"ok": True, "uploaded_and_triggered": len(uploaded_ids), "ragflow_doc_ids": uploaded_ids}
+
+
+# ---------- Pre-flight Document Profiler & Baseline Advisor ----------
+@router.get("/runs/{run_id}/baseline-advisor")
+def get_baseline_advisor_report(run_id: int):
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT report_json, updated_at FROM baseline_advisor_reports WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+    if not row:
+        return {"found": False, "report": None, "updated_at": None}
+    try:
+        report = json.loads(row["report_json"] or "{}")
+    except Exception:
+        return {"found": False, "report": None, "updated_at": None}
+    report["updated_at"] = row["updated_at"]
+    return {"found": True, "report": report, "updated_at": row["updated_at"]}
+
+
+def _find_pipeline_key(pc: Dict[str, Any], prefix: str) -> Optional[str]:
+    for k in pc.keys():
+        if isinstance(k, str) and k.startswith(prefix):
+            return k
+    return None
+
+
+def _extract_current_baseline_config(remote_ds: Optional[Dict[str, Any]], local_pc: Dict[str, Any]) -> Dict[str, Any]:
+    """Read current parser config cleanly from RAGFlow v1.0 Pipeline schema or legacy flat schema."""
+    pc = (
+        remote_ds.get("parser_config")
+        if remote_ds and isinstance(remote_ds.get("parser_config"), dict)
+        else local_pc
+    ) or {}
+    parser_id = (
+        (remote_ds.get("parser_id") or remote_ds.get("chunk_method"))
+        if remote_ds
+        else (local_pc.get("chunk_method") or local_pc.get("parser_id"))
+    ) or "general"
+    if parser_id == "naive":
+        parser_id = "general"
+
+    p_key = _find_pipeline_key(pc, "Parser:")
+    c_key = _find_pipeline_key(pc, "GeneralChunker:")
+
+    layout_recognize = "DeepDOC"
+    if p_key and isinstance(pc.get(p_key), dict):
+        p_node = pc[p_key]
+        layout_recognize = str((p_node.get("pdf") or {}).get("parse_method") or "DeepDOC")
+    elif pc.get("layout_recognize"):
+        layout_recognize = str(pc.get("layout_recognize"))
+
+    chunk_token_num = 512
+    overlapped_percent = 0
+    table_context_size = 0
+    if c_key and isinstance(pc.get(c_key), dict):
+        c_node = pc[c_key]
+        chunk_token_num = int(c_node.get("chunk_token_size") or 512)
+        raw_ov = float(c_node.get("overlapped_percent") or 0)
+        # RAGFlow Pipeline stores overlapped_percent as 0..1 ratio (e.g. 0.1 -> 10% on RAGFlow UI)
+        overlapped_percent = int(round(raw_ov * 100)) if 0 < raw_ov <= 1 else int(round(raw_ov))
+        table_context_size = int(c_node.get("table_context_size") or 0)
+    else:
+        chunk_token_num = int(pc.get("chunk_token_num") or pc.get("chunk_token_size") or 512)
+        raw_ov = float(pc.get("overlapped_percent") or 0)
+        overlapped_percent = int(round(raw_ov * 100)) if 0 < raw_ov <= 1 else int(round(raw_ov))
+        table_context_size = int(pc.get("table_context_size") or 0)
+
+    return {
+        "chunk_method": str(parser_id),
+        "layout_recognize": layout_recognize,
+        "chunk_token_num": chunk_token_num,
+        "overlapped_percent": overlapped_percent,
+        "table_context_size": table_context_size,
+    }
+
+
+def _merge_baseline_into_parser_config(base_pc: Dict[str, Any], rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Safely patch RAGFlow v1.0 Pipeline nodes (preserving Extractor/Tokenizer/VLM) or legacy flat keys."""
+    next_pc = json.loads(json.dumps(base_pc or {}))
+    p_key = _find_pipeline_key(next_pc, "Parser:")
+    c_key = _find_pipeline_key(next_pc, "GeneralChunker:")
+
+    layout = str(rec.get("layout_recognize") or "DeepDOC")
+    tok = int(rec.get("chunk_token_num") or 512)
+    overlap_pct = float(rec.get("overlapped_percent") or 0)
+    # Convert human percentage (e.g. 10 -> 0.1) for RAGFlow Pipeline API
+    overlap_ratio = round(overlap_pct / 100.0, 4) if overlap_pct > 1 else round(overlap_pct, 4)
+    tbl_ctx = int(rec.get("table_context_size") or 0)
+
+    if p_key or c_key:
+        if p_key and isinstance(next_pc.get(p_key), dict):
+            if isinstance(next_pc[p_key].get("pdf"), dict):
+                next_pc[p_key]["pdf"]["parse_method"] = layout
+            if isinstance(next_pc[p_key].get("spreadsheet"), dict):
+                next_pc[p_key]["spreadsheet"]["parse_method"] = layout
+        if c_key and isinstance(next_pc.get(c_key), dict):
+            next_pc[c_key]["chunk_token_size"] = tok
+            next_pc[c_key]["overlapped_percent"] = overlap_ratio
+            next_pc[c_key]["table_context_size"] = tbl_ctx
+        return next_pc
+
+    next_pc["chunk_token_num"] = tok
+    next_pc["layout_recognize"] = layout
+    next_pc["overlapped_percent"] = overlap_ratio
+    next_pc["table_context_size"] = tbl_ctx
+    return next_pc
+
+
+@router.post("/runs/{run_id}/baseline-advisor")
+async def run_baseline_advisor(run_id: int, use_llm: bool = True, force: bool = False):
+    """
+    Pre-flight Document Profiler & Baseline Config Recommender:
+    - Phase A: Fast parallel Python structural scan (PDF/DOCX/XLSX/PPTX/HTML/MD) in worker threads.
+    - Phase B (optional): Single lightweight LLM synthesis call (~1000-token JSON summary, ~$0.001)
+      to refine RAGFlow Baseline parser_config & Vietnamese rationale.
+    """
+    import time as _time
+    from baseline_profiler import aggregate_corpus_profile, profile_document_sync
+    from database import get_bool_setting
+    from progress_tracker import progress_inc, progress_stage, progress_start
+
+    t0 = _time.perf_counter()
+    is_demo = get_bool_setting("demo_mode", False)
+
+    with get_db() as conn:
+        run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if not run:
+            raise HTTPException(status_code=404, detail="Phiên kiểm thử không tồn tại.")
+        dataset_id = run["ragflow_dataset_id"] or ""
+        local_pc = json.loads(run["parser_config"] or "{}")
+        if not force and not is_demo:
+            cached = conn.execute(
+                "SELECT report_json, updated_at FROM baseline_advisor_reports WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if cached:
+                try:
+                    rep = json.loads(cached["report_json"])
+                    rep["updated_at"] = cached["updated_at"]
+                    rep["from_cache"] = True
+                    return rep
+                except Exception:
+                    pass
+
+        docs = [
+            dict(r)
+            for r in conn.execute(
+                """
+                SELECT d.id, d.doc_code, d.filename, d.format_group, d.page_count, d.is_scan, d.file_path
+                FROM documents d
+                WHERE EXISTS (
+                        SELECT 1 FROM run_documents rd
+                         WHERE rd.run_id = ? AND rd.document_id = d.id
+                      )
+                   OR (
+                        d.file_path != ''
+                        AND NOT EXISTS (
+                            SELECT 1 FROM run_documents rd2 WHERE rd2.document_id = d.id
+                        )
+                      )
+                ORDER BY d.doc_code
+                """,
+                (run_id,),
+            ).fetchall()
+        ]
+        if not docs:
+            raise HTTPException(status_code=400, detail="Dataset này chưa có tài liệu nào để phân tích.")
+
+    # Fetch live RAGFlow dataset config so current_config reflects exact RAGFlow values
+    remote_ds = None
+    if dataset_id and not is_demo:
+        try:
+            remote_ds = await _get_client().get_dataset(dataset_id)
+        except Exception:
+            remote_ds = None
+    current_config = _extract_current_baseline_config(remote_ds, local_pc)
+
+    # Phase A: Parallel structural scan in worker threads
+    progress_start(len(docs), "Đang quét cấu trúc tài liệu gốc", f"{len(docs)} tài liệu")
+    sem = asyncio.Semaphore(6)
+
+    async def _scan_one(d: dict) -> dict:
+        async with sem:
+            res = await asyncio.to_thread(profile_document_sync, d)
+            progress_inc(1)
+            return res
+
+    file_profiles = await asyncio.gather(*(_scan_one(d) for d in docs))
+    agg = aggregate_corpus_profile(file_profiles)
+
+    recommended = dict(agg["recommended"])
+    param_reasons = dict(agg["param_reasons"])
+    split_warnings = list(agg["split_warnings"])
+    _method_vn = {
+        "general": "Tổng hợp",
+        "naive": "Tổng hợp",
+        "laws": "Văn bản quy phạm",
+        "paper": "Bài báo học thuật",
+        "table": "Chuyên bảng biểu",
+        "qa": "Hỏi – Đáp",
+        "presentation": "Slide trình chiếu",
+    }
+    _layout_vn = "đọc bố cục & OCR (DeepDOC)" if recommended["layout_recognize"] == "DeepDOC" else "lấy chữ thuần"
+    _approx_chunk_words = int(round(int(recommended["chunk_token_num"]) * 0.75))
+    _scan_note = (
+        f", trong đó có {agg['summary']['scan_doc_count']} tài liệu ảnh scan cần nhận dạng chữ"
+        if agg["summary"]["scan_doc_count"] > 0
+        else ""
+    )
+    _tbl_note = (
+        f" và {agg['summary']['total_tables']} bảng biểu"
+        if agg["summary"]["total_tables"] > 0
+        else ""
+    )
+    executive_summary = (
+        f"Bộ {agg['summary']['total_docs']} tài liệu ({agg['summary']['format_count']} định dạng{_scan_note}{_tbl_note}) "
+        f"phù hợp nhất với chế độ {_method_vn.get(recommended['chunk_method'], recommended['chunk_method'])}, "
+        f"bật {_layout_vn} và chia mỗi đoạn khoảng {recommended['chunk_token_num']} token (~{_approx_chunk_words} từ)."
+    )
+    engine_used = "rule"
+    llm_model_used = ""
+
+    # Phase B: Optional single lightweight LLM call (~1k tokens JSON summary)
+    if use_llm and not is_demo:
+        llm_base = get_setting("llm_base_url", "").strip()
+        llm_key = get_setting("llm_api_key", "").strip()
+        llm_model = get_setting("llm_model", "").strip()
+        if llm_base and llm_model and (llm_key or "localhost" in llm_base or "127.0.0.1" in llm_base):
+            progress_stage("Đang tổng hợp đề xuất Baseline bằng LLM", f"Model: {llm_model}")
+            from llm_client import call_llm_json
+
+            compact_payload = {
+                "summary": agg["summary"],
+                "format_breakdown": agg["format_breakdown"],
+                "current_config": current_config,
+                "rule_baseline": recommended,
+                "split_warnings": split_warnings,
+                "sample_excerpts": agg["excerpts"][:4],
+            }
+            sys_prompt = (
+                "Bạn là chuyên gia tư vấn hệ thống tìm kiếm tài liệu (RAGFlow), giải thích cho NGƯỜI DÙNG PHỔ THÔNG dễ hiểu ngay.\n"
+                "Dựa trên số liệu quét thực tế (TUYỆT ĐỐI KHÔNG bịa số liệu), hãy chốt bộ cấu hình Baseline tối ưu cho RAGFlow.\n"
+                "Quy tắc viết tiếng Việt BẮT BUỘC cho executive_summary và param_reasons:\n"
+                "1. Viết tự nhiên, mạch lạc, rõ ý như tư vấn viên: nêu thực tế bộ tài liệu -> lý do chọn cài đặt -> lợi ích cụ thể.\n"
+                "2. CẤM dùng thuật ngữ thống kê/lập trình khó hiểu như 'p50', 'p75', 'section', 'max_table_tokens', 'naive', 'overlapped_percent', 'table_context_size', 'tok'.\n"
+                "3. Thay vào đó dùng từ ngữ đời thường: 'độ dài đoạn văn phổ biến (~X từ)', 'chế độ Tổng hợp', 'bộ đọc bố cục & OCR (DeepDOC)', 'độ chồng lấn giữa các đoạn', 'ngữ cảnh xung quanh bảng biểu'. Khi nhắc đến kích thước đoạn (token), kèm ước lượng số từ (1 token ~ 0.75 từ tiếng Việt) để người đọc dễ hình dung.\n"
+                "4. Số liệu lớn dùng dấu chấm ngăn cách hàng nghìn (ví dụ: 1.024, 5.020).\n"
+                "Trả về DUY NHẤT JSON hợp lệ với schema:\n"
+                "{\n"
+                '  "chunk_method": "general"|"laws"|"paper"|"table"|"qa"|"presentation",\n'
+                '  "layout_recognize": "DeepDOC"|"Plain Text",\n'
+                '  "chunk_token_num": 256|384|512|768|1024,\n'
+                '  "overlapped_percent": 0|5|10|15,\n'
+                '  "table_context_size": 0|64|128|256,\n'
+                '  "executive_summary": "2 câu tóm tắt sắc bén, thân thiện, nêu rõ đặc điểm nổi bật của bộ tài liệu và hướng cấu hình chốt",\n'
+                '  "param_reasons": {\n'
+                '    "chunk_method": "1 câu giải thích tự nhiên, dẫn số liệu thật dễ hiểu",\n'
+                '    "layout_recognize": "1 câu giải thích tự nhiên, dẫn số liệu thật dễ hiểu",\n'
+                '    "chunk_token_num": "1 câu giải thích tự nhiên, quy đổi dễ hình dung",\n'
+                '    "overlapped_percent": "1 câu giải thích tự nhiên",\n'
+                '    "table_context_size": "1 câu giải thích tự nhiên"\n'
+                "  }\n"
+                "}"
+            )
+            try:
+                llm_out = await call_llm_json(
+                    base_url=llm_base,
+                    api_key=llm_key,
+                    model=llm_model,
+                    system_prompt=sys_prompt,
+                    user_prompt=json.dumps(compact_payload, ensure_ascii=False),
+                    timeout=35.0,
+                )
+                valid_methods = {"general", "naive", "laws", "paper", "table", "qa", "presentation"}
+                valid_layouts = {"DeepDOC", "Plain Text"}
+                valid_tokens = {256, 384, 512, 768, 1024}
+                valid_overlaps = {0, 5, 10, 15}
+                valid_tbl_ctx = {0, 64, 128, 256}
+
+                cm = str(llm_out.get("chunk_method") or "")
+                if cm in valid_methods:
+                    recommended["chunk_method"] = "general" if cm == "naive" else cm
+                if str(llm_out.get("layout_recognize") or "") in valid_layouts:
+                    recommended["layout_recognize"] = str(llm_out["layout_recognize"])
+                try:
+                    t_num = int(llm_out.get("chunk_token_num") or 0)
+                    if t_num in valid_tokens:
+                        recommended["chunk_token_num"] = t_num
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    ov = int(llm_out.get("overlapped_percent"))
+                    if ov in valid_overlaps:
+                        recommended["overlapped_percent"] = ov
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    tc = int(llm_out.get("table_context_size"))
+                    if tc in valid_tbl_ctx:
+                        recommended["table_context_size"] = tc
+                except (TypeError, ValueError):
+                    pass
+                if isinstance(llm_out.get("executive_summary"), str) and llm_out["executive_summary"].strip():
+                    executive_summary = llm_out["executive_summary"].strip()
+                if isinstance(llm_out.get("param_reasons"), dict):
+                    for k in ("chunk_method", "layout_recognize", "chunk_token_num", "overlapped_percent", "table_context_size"):
+                        v = llm_out["param_reasons"].get(k)
+                        if isinstance(v, str) and v.strip():
+                            param_reasons[k] = v.strip()
+                engine_used = "llm"
+                llm_model_used = llm_model
+            except Exception:
+                # Graceful fallback to deterministic rule recommendation
+                engine_used = "rule"
+
+    elapsed_sec = round(_time.perf_counter() - t0, 2)
+    now = utc_now()
+    report = {
+        "ok": True,
+        "run_id": run_id,
+        "engine_used": engine_used,
+        "model_used": llm_model_used,
+        "elapsed_sec": elapsed_sec,
+        "updated_at": now,
+        "demo": is_demo,
+        "from_cache": False,
+        "executive_summary": executive_summary,
+        "summary": agg["summary"],
+        "format_breakdown": agg["format_breakdown"],
+        "current_config": current_config,
+        "recommended": recommended,
+        "param_reasons": param_reasons,
+        "split_warnings": split_warnings,
+        "files": agg["files"],
+    }
+
+    if not is_demo:
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO baseline_advisor_reports (run_id, report_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    report_json = excluded.report_json,
+                    updated_at = excluded.updated_at
+                """,
+                (run_id, json.dumps(report, ensure_ascii=False), now),
+            )
+
+    return report
+
+
+class ApplyBaselinePayload(BaseModel):
+    chunk_method: str = "general"
+    layout_recognize: str = "DeepDOC"
+    chunk_token_num: int = 512
+    overlapped_percent: int = 0
+    table_context_size: int = 0
+
+
+@router.post("/runs/{run_id}/baseline-advisor/apply")
+async def apply_baseline_advisor(run_id: int, payload: ApplyBaselinePayload):
+    """Safely merge recommended baseline settings into the live RAGFlow Dataset pipeline config and persist."""
+    with get_db() as conn:
+        run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if not run:
+            raise HTTPException(status_code=404, detail="Phiên kiểm thử không tồn tại.")
+        dataset_id = run["ragflow_dataset_id"] or ""
+        local_pc = json.loads(run["parser_config"] or "{}")
+
+    remote_ds = None
+    remote_synced = False
+    remote_warning = ""
+    client = None
+    if dataset_id:
+        try:
+            client = _get_client()
+            remote_ds = await client.get_dataset(dataset_id)
+        except Exception as e:
+            remote_warning = str(e)
+
+    base_pc = (
+        remote_ds.get("parser_config")
+        if remote_ds and isinstance(remote_ds.get("parser_config"), dict)
+        else local_pc
+    ) or {}
+    rec_dict = payload.model_dump()
+    target_method = "general" if rec_dict["chunk_method"] == "naive" else rec_dict["chunk_method"]
+    merged_pc = _merge_baseline_into_parser_config(base_pc, rec_dict)
+
+    verified_config = None
+    if dataset_id and client is not None:
+        try:
+            await client.update_dataset(
+                dataset_id=dataset_id,
+                chunk_method=target_method,
+                parser_config=merged_pc,
+            )
+            remote_synced = True
+            refreshed = await client.get_dataset(dataset_id)
+            if refreshed:
+                verified_config = _extract_current_baseline_config(refreshed, merged_pc)
+                if isinstance(refreshed.get("parser_config"), dict):
+                    merged_pc = refreshed["parser_config"]
+        except Exception as e:
+            remote_warning = str(e)
+
+    stored_pc = dict(merged_pc)
+    stored_pc["chunk_method"] = target_method
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE runs SET parser_config = ? WHERE id = ?",
+            (json.dumps(stored_pc, ensure_ascii=False), run_id),
+        )
+        cached = conn.execute(
+            "SELECT report_json FROM baseline_advisor_reports WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if cached:
+            try:
+                rep = json.loads(cached["report_json"])
+                rep["current_config"] = verified_config or {
+                    "chunk_method": target_method,
+                    "layout_recognize": rec_dict["layout_recognize"],
+                    "chunk_token_num": int(rec_dict["chunk_token_num"]),
+                    "overlapped_percent": int(rec_dict["overlapped_percent"]),
+                    "table_context_size": int(rec_dict["table_context_size"]),
+                }
+                conn.execute(
+                    "UPDATE baseline_advisor_reports SET report_json = ? WHERE run_id = ?",
+                    (json.dumps(rep, ensure_ascii=False), run_id),
+                )
+            except Exception:
+                pass
+
+    return {
+        "ok": True,
+        "remote_synced": remote_synced,
+        "remote_warning": remote_warning,
+        "verified_config": verified_config,
+        "parser_config": stored_pc,
+    }

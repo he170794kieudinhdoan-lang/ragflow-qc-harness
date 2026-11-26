@@ -1974,11 +1974,7 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
       <FloatingProgressOverlay
         state={taskProgress}
         fallback={
-          loading && units.length === 0
-            ? {
-                title: 'Đang tải Parsing',
-              }
-            : bulkApproving
+          bulkApproving
             ? {
                 title: 'Đang duyệt hàng loạt',
               }

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import {
   AlertCircle,
@@ -14,15 +14,21 @@ import {
   Search,
   Settings,
   SlidersHorizontal,
+  Sparkles,
   Trash2,
   Upload,
   X,
 } from 'lucide-react';
 import { api } from '../api/client';
 import { DocumentItem, RunDocumentItem, RunItem } from '../types';
-import { RagflowParserConfigModal } from '../components/RagflowParserConfigModal';
+import { CloneConfigWorkbench } from '../components/CloneConfigWorkbench';
 import { DatasetFlowModal } from '../components/DatasetFlowModal';
 import { clearAutoTuneCacheForRun } from '../components/RetrievalAutoTuneView';
+import { FloatingProgressOverlay, useProgressTask } from '../components/FloatingProgressOverlay';
+
+const BaselineAdvisorModal = lazy(() =>
+  import('../components/BaselineAdvisorModal').then((m) => ({ default: m.BaselineAdvisorModal }))
+);
 
 interface Props {
   activeRun: RunItem | null;
@@ -78,6 +84,8 @@ export const WorkspacePage: React.FC<Props> = ({
 
   const [showNewRun, setShowNewRun] = useState(false);
   const [showUpload, setShowUpload] = useState(false);
+  const [showBaselineAdvisor, setShowBaselineAdvisor] = useState(false);
+  const { progress: taskProgress, runTracked } = useProgressTask();
   const [confirmDialog, setConfirmDialog] = useState<{
     title: string;
     description: string;
@@ -293,22 +301,7 @@ export const WorkspacePage: React.FC<Props> = ({
       setUpFiles([]);
       setUpUrl('');
       setShowUpload(false);
-      // Automatically push & parse on RAGFlow if an active run with dataset_id is selected
-      if (activeRun?.ragflow_dataset_id) {
-        try {
-          const pushRes = await api.uploadAndParseRun(activeRun.id);
-          await loadAll();
-          if (pushRes.uploaded_and_triggered > 0) {
-            updatePolling(true);
-            toast.info(`Đã tự động đẩy ${pushRes.uploaded_and_triggered} file lên RAGFlow và bắt đầu parse...`);
-          }
-        } catch (pushErr: any) {
-          await loadAll();
-          toast.warning(`Đã lưu local nhưng chưa đẩy được lên RAGFlow: ${pushErr.message}`);
-        }
-      } else {
-        await loadAll();
-      }
+      await loadAll();
     } catch (err: any) {
       toast.error(err.message);
     } finally {
@@ -430,33 +423,20 @@ export const WorkspacePage: React.FC<Props> = ({
               </button>
             </div>
           ) : (
-            <p className="text-xs text-[#78716c] mt-1">Tạo phiên mới để gắn với Dataset trên RAGFlow.</p>
+            <p className="text-xs text-[#78716c] mt-1">Chọn Dataset đã đồng bộ từ RAGFlow ở góc trên bên phải để bắt đầu.</p>
           )}
         </div>
 
         <div className="flex items-center gap-2">
-          {activeRun && (
+          {activeRun && docs.length > 0 && (
             <button
+              onClick={() => setShowBaselineAdvisor(true)}
               disabled={isLocked}
-              onClick={() =>
-                setConfirmDialog({
-                  title: `Xóa phiên "${activeRun.name}"?`,
-                  description: 'Toàn bộ dữ liệu chunks và kết quả chấm thuộc phiên này sẽ bị xóa khỏi local.',
-                  confirmLabel: 'Xóa phiên',
-                  onConfirm: async () => {
-                    const deletedId = activeRun.id;
-                    const deletedName = activeRun.name;
-                    await api.deleteRun(deletedId);
-                    clearAutoTuneCacheForRun(deletedId);
-                    await onReloadRuns();
-                    toast.success(`Đã xóa phiên "${deletedName}".`);
-                  },
-                })
-              }
-              title={`Xóa phiên "${activeRun.name}"`}
-              className="ts-btn-ghost text-xs text-[#71717a] hover:text-rose-600 hover:bg-rose-50 px-2 disabled:opacity-40 disabled:pointer-events-none"
+              className="ts-btn-secondary text-xs disabled:opacity-45"
+              title="Quét cấu trúc tài liệu gốc và đề xuất cấu hình Baseline tối ưu cho RAGFlow"
             >
-              <Trash2 className="size-3.5" />
+              <Sparkles className="size-3.5 text-[#03aa5c]" />
+              Gợi ý Baseline
             </button>
           )}
           {activeRun && (
@@ -464,20 +444,10 @@ export const WorkspacePage: React.FC<Props> = ({
               onClick={openParserConfigModal}
               disabled={isLocked}
               className="ts-btn-secondary text-xs disabled:opacity-45"
-              title="Chỉnh cấu hình Parsing / Chunking của phiên này"
+              title="Xem và chỉnh toàn bộ cấu hình Baseline của Dataset này"
             >
               <SlidersHorizontal className="size-3.5" />
-              Cấu hình Parse
-            </button>
-          )}
-          <button onClick={openNewRunModal} className="ts-btn-secondary text-xs">
-            <Plus className="size-3.5" />
-            Tạo phiên mới
-          </button>
-          {activeRun && (activeRun.chunk_count ?? 0) > 0 && (
-            <button onClick={onNextStep} className="ts-btn-primary text-xs">
-              Sang Bước 2: Chấm đọc file
-              <ArrowRight className="size-3.5" />
+              Cấu hình Baseline
             </button>
           )}
         </div>
@@ -741,42 +711,39 @@ export const WorkspacePage: React.FC<Props> = ({
                           </button>
                         )}
                         {d.file_path && (
-                          <>
-                            <a
-                              href={`/api/workspace/documents/${d.id}/file`}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              title="Xem trước file gốc"
-                              className="p-1 text-[#71717a] hover:text-[#161616] rounded-[3px] transition-colors"
-                            >
-                              <Eye className="size-3.5" />
-                            </a>
-                            <a
-                              href={`/api/workspace/documents/${d.id}/file`}
-                              download={d.filename}
-                              title="Tải xuống file gốc"
-                              className="p-1 text-[#71717a] hover:text-[#161616] rounded-[3px] transition-colors"
-                            >
-                              <Download className="size-3.5" />
-                            </a>
-                          </>
+                          <a
+                            href={`/api/workspace/documents/${d.id}/file`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            title="Xem trước file gốc"
+                            className="p-1 text-[#71717a] hover:text-[#161616] rounded-[3px] transition-colors"
+                          >
+                            <Eye className="size-3.5" />
+                          </a>
                         )}
                         <button
                           disabled={isLocked}
                           onClick={() =>
                             setConfirmDialog({
                               title: `Xóa tài liệu ${d.doc_code}?`,
-                              description: `Tài liệu "${d.filename}" sẽ bị xóa khỏi danh sách kiểm thử local.`,
-                              confirmLabel: 'Xóa tài liệu',
+                              description: `Tài liệu "${d.filename}" sẽ bị xóa vĩnh viễn trên cả RAGFlow (Dataset hiện tại) và local.`,
+                              confirmLabel: 'Xóa trên RAGFlow & Local',
                               onConfirm: async () => {
-                                await api.deleteDocument(d.id);
+                                const res = await api.deleteDocument(d.id, activeRun?.id, true);
                                 await loadAll();
-                                toast.success(`Đã xóa tài liệu ${d.doc_code}.`);
+                                onReloadRuns();
+                                if (res?.remote_deleted) {
+                                  toast.success(`Đã xóa ${d.doc_code} trên RAGFlow và local.`);
+                                } else if (res?.remote_warning) {
+                                  toast.warning(`Đã xóa local (RAGFlow báo: ${res.remote_warning}).`);
+                                } else {
+                                  toast.success(`Đã xóa tài liệu ${d.doc_code}.`);
+                                }
                               },
                             })
                           }
-                          aria-label="Xóa tài liệu"
-                          title="Xóa tài liệu"
+                          aria-label="Xóa tài liệu trên RAGFlow và local"
+                          title="Xóa tài liệu trên RAGFlow và local"
                           className="p-1 text-[#a1a1aa] hover:text-rose-600 rounded-[3px] transition-colors disabled:opacity-25 disabled:pointer-events-none"
                         >
                           <Trash2 className="size-3.5" />
@@ -960,21 +927,11 @@ export const WorkspacePage: React.FC<Props> = ({
       </aside>
       </div>
 
-      {/* Modal: 2-Step Dataset Picker & RAGFlow Create */}
-      {showNewRun && (
-        <DatasetFlowModal
-          onClose={() => setShowNewRun(false)}
-          onCreated={(created) => {
-            onSelectRun(created);
-            onReloadRuns(created.id);
-          }}
-        />
-      )}
-
-      {/* Modal: Full RAGFlow Dataset Configuration */}
+      {/* Modal: Unified Full RAGFlow Dataset Configuration (same cockpit as Experiment Studio) */}
       {showParserCfg && activeRun && (
-        <RagflowParserConfigModal
-          run={activeRun}
+        <CloneConfigWorkbench
+          mode="edit"
+          baselineRun={activeRun}
           onClose={() => setShowParserCfg(false)}
           onSaved={() => onReloadRuns(activeRun.id)}
         />
@@ -1171,6 +1128,23 @@ export const WorkspacePage: React.FC<Props> = ({
           </div>
         </div>
       )}
+
+      {showBaselineAdvisor && activeRun && (
+        <Suspense fallback={null}>
+          <BaselineAdvisorModal
+            activeRun={activeRun}
+            docCount={docs.length}
+            onClose={() => setShowBaselineAdvisor(false)}
+            onApplied={async () => {
+              onReloadRuns(activeRun.id);
+              await loadAll();
+            }}
+            runTracked={runTracked}
+          />
+        </Suspense>
+      )}
+
+      <FloatingProgressOverlay state={taskProgress} moduleLabel="BASELINE ADVISOR" />
     </div>
     </div>
   );

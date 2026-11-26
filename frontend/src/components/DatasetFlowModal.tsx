@@ -92,7 +92,10 @@ export const DatasetFlowModal: React.FC<Props> = ({ onClose, onCreated }) => {
         chunk_method: parserId,
         parser_config: {
           chunk_token_num: Number(chunkTokenSize) || 512,
-          overlapped_percent: Number(overlappedPercent) || 0,
+          overlapped_percent:
+            Number(overlappedPercent) > 1
+              ? Math.round((Number(overlappedPercent) / 100) * 10000) / 10000
+              : Number(overlappedPercent) || 0,
           layout_recognize: pdfParser,
           delimiter: delims.join(''),
           enable_vision_enhancement: visionEnhance,

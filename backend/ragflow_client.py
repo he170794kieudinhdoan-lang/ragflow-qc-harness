@@ -288,6 +288,17 @@ class RAGFlowClient:
         )
         return self._unwrap(r)
 
+    async def delete_documents(self, dataset_id: str, document_ids: List[str]) -> Any:
+        client = get_shared_http_client()
+        r = await client.request(
+            "DELETE",
+            f"{self.base_url}/api/v1/datasets/{dataset_id}/documents",
+            headers=self._headers(),
+            json={"ids": document_ids},
+            timeout=self.timeout,
+        )
+        return self._unwrap(r)
+
     async def stop_parsing(self, dataset_id: str, document_ids: List[str]) -> Any:
         client = get_shared_http_client()
         r = await client.request(

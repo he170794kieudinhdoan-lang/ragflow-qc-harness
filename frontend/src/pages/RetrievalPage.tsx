@@ -2304,15 +2304,6 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun, isActive = true }) =
                   <option value="rule">RapidFuzz Rule (0-AI · Miễn phí)</option>
                 </select>
               </div>
-              <label className="flex items-center gap-2 text-xs text-[#3f3f46] cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={bypassCache}
-                  onChange={(e) => setBypassCache(e.target.checked)}
-                  className="rounded border-[#d4d4d8]"
-                />
-                Bỏ qua Smart Cache (chấm mới toàn bộ thay vì kế thừa nhãn cũ)
-              </label>
             </div>
             <div className="flex justify-end gap-2 pt-2 border-t border-[#ededeb]">
               <button type="button" onClick={() => setShowRunModal(false)} className="ts-btn-secondary">Hủy</button>
