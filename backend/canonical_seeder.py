@@ -222,9 +222,9 @@ def seed_full_canonical_dataset() -> dict:
 
             conn.execute(
                 """
-                INSERT INTO golden_testcases (tc_code, input_question, expected_outcome, reference_context, source_file, question_class, intent_type, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(tc_code) DO UPDATE SET
+                INSERT INTO golden_testcases (run_id, tc_code, input_question, expected_outcome, reference_context, source_file, question_class, intent_type, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, tc_code) DO UPDATE SET
                     input_question = excluded.input_question,
                     expected_outcome = excluded.expected_outcome,
                     reference_context = excluded.reference_context,
@@ -232,10 +232,11 @@ def seed_full_canonical_dataset() -> dict:
                     question_class = excluded.question_class,
                     intent_type = excluded.intent_type
                 """,
-                (code, q, ans, ref, src, q_class, intent, now),
+                (run_id, code, q, ans, ref, src, q_class, intent, now),
             )
-            tc_row = conn.execute("SELECT id FROM golden_testcases WHERE tc_code = ?", (code,)).fetchone()
+            tc_row = conn.execute("SELECT id FROM golden_testcases WHERE run_id = ? AND tc_code = ?", (run_id, code)).fetchone()
             tc_pk_map[code] = tc_row["id"]
+        wb_tc.close()
 
         # 5. Insert Baseline Retrieval Run & Results
         rr_base = conn.execute("SELECT id FROM retrieval_runs WHERE run_id = ? AND name = 'Baseline_Top10_v1'", (run_id,)).fetchone()

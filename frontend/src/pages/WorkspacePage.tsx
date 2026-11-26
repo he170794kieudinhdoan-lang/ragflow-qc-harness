@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import {
   AlertCircle,
@@ -22,11 +22,13 @@ import { api } from '../api/client';
 import { DocumentItem, RunDocumentItem, RunItem } from '../types';
 import { RagflowParserConfigModal } from '../components/RagflowParserConfigModal';
 import { DatasetFlowModal } from '../components/DatasetFlowModal';
+import { clearAutoTuneCacheForRun } from '../components/RetrievalAutoTuneView';
 
 interface Props {
   activeRun: RunItem | null;
   runs: RunItem[];
   refreshKey?: number;
+  isActive?: boolean;
   onReloadRuns: (preferredRunId?: number) => void;
   onSelectRun: (run: RunItem) => void;
   onOpenSettings: () => void;
@@ -55,6 +57,7 @@ const CHUNK_METHODS = [
 export const WorkspacePage: React.FC<Props> = ({
   activeRun,
   refreshKey = 0,
+  isActive = true,
   onReloadRuns,
   onSelectRun,
   onOpenSettings,
@@ -62,12 +65,12 @@ export const WorkspacePage: React.FC<Props> = ({
 }) => {
   const [docs, setDocs] = useState<DocumentItem[]>([]);
   const [runDocs, setRunDocs] = useState<RunDocumentItem[]>([]);
-  const [remoteDatasets, setRemoteDatasets] = useState<any[]>([]);
   const [busy, setBusy] = useState('');
   const [polling, setPolling] = useState(false);
   const [parseErrors, setParseErrors] = useState<Record<number, string>>({});
   const pollBusyRef = useRef(false);
   const pollingRef = useRef(false);
+  const loadSeqRef = useRef(0);
   const updatePolling = (v: boolean) => {
     pollingRef.current = v;
     setPolling(v);
@@ -144,25 +147,34 @@ export const WorkspacePage: React.FC<Props> = ({
   const [searchQuery, setSearchQuery] = useState('');
 
   const loadAll = async () => {
-    const dRes = await api.listDocuments(activeRun?.id);
-    setDocs(dRes);
-    setUpCode(`DOC${String(dRes.length + 1).padStart(2, '0')}`);
-    if (activeRun) {
-      const rd = await api.getRunDocuments(activeRun.id);
-      setRunDocs(rd);
-      if (rd.some((item: RunDocumentItem) => item.parse_status === 'RUNNING')) {
-        updatePolling(true);
+    const seq = ++loadSeqRef.current;
+    try {
+      const dRes = await api.listDocuments(activeRun?.id);
+      if (seq !== loadSeqRef.current) return;
+      setDocs(dRes);
+      setUpCode(`DOC${String(dRes.length + 1).padStart(2, '0')}`);
+      if (activeRun) {
+        const rd = await api.getRunDocuments(activeRun.id);
+        if (seq !== loadSeqRef.current) return;
+        setRunDocs(rd);
+        if (rd.some((item: RunDocumentItem) => item.parse_status === 'RUNNING')) {
+          updatePolling(true);
+        } else {
+          updatePolling(false);
+        }
       } else {
+        setRunDocs([]);
         updatePolling(false);
       }
-    } else {
-      setRunDocs([]);
-      setPolling(false);
+    } catch (err: any) {
+      if (seq === loadSeqRef.current) {
+        toast.error(err?.message || 'Không tải được danh sách tài liệu.');
+      }
     }
   };
 
   useEffect(() => {
-    setPolling(false);
+    updatePolling(false);
     setParseErrors({});
     loadAll();
   }, [activeRun?.id, refreshKey]);
@@ -203,22 +215,16 @@ export const WorkspacePage: React.FC<Props> = ({
   };
 
   useEffect(() => {
-    if (!polling || !activeRun) return;
+    if (!polling || !activeRun || !isActive) return;
     const timer = window.setInterval(() => {
-      if (!pollingRef.current) return;
+      if (!pollingRef.current || document.hidden) return;
       checkParseStatus(true);
     }, 4000);
     return () => window.clearInterval(timer);
-  }, [polling, activeRun?.id]);
+  }, [polling, activeRun?.id, isActive]);
 
-  const openNewRunModal = async () => {
+  const openNewRunModal = () => {
     setShowNewRun(true);
-    try {
-      const res = await api.testRagflow();
-      setRemoteDatasets(res.datasets || []);
-    } catch {
-      setRemoteDatasets([]);
-    }
   };
 
   const handleCreateRun = async (e: React.FormEvent) => {
@@ -273,31 +279,35 @@ export const WorkspacePage: React.FC<Props> = ({
         fd.append('doc_code', upCode);
         fd.append('format_group', upGroup === 'AUTO' ? FORMAT_GROUPS[0] : upGroup);
         fd.append('source_url', upUrl);
+        if (activeRun) fd.append('run_id', String(activeRun.id));
         await api.uploadDocument(fd);
         toast.success(`Đã thêm tài liệu "${upFiles[0].name}" vào kho.`);
       } else {
         const fd = new FormData();
         upFiles.forEach((f) => fd.append('files', f));
         fd.append('format_group', upGroup);
+        if (activeRun) fd.append('run_id', String(activeRun.id));
         const res = await api.uploadDocumentsBatch(fd);
         toast.success(`Đã tải lên ${res.uploaded_count} tài liệu gốc vào kho.`);
       }
       setUpFiles([]);
       setUpUrl('');
       setShowUpload(false);
-      await loadAll();
       // Automatically push & parse on RAGFlow if an active run with dataset_id is selected
       if (activeRun?.ragflow_dataset_id) {
         try {
           const pushRes = await api.uploadAndParseRun(activeRun.id);
           await loadAll();
           if (pushRes.uploaded_and_triggered > 0) {
-            setPolling(true);
+            updatePolling(true);
             toast.info(`Đã tự động đẩy ${pushRes.uploaded_and_triggered} file lên RAGFlow và bắt đầu parse...`);
           }
         } catch (pushErr: any) {
+          await loadAll();
           toast.warning(`Đã lưu local nhưng chưa đẩy được lên RAGFlow: ${pushErr.message}`);
         }
+      } else {
+        await loadAll();
       }
     } catch (err: any) {
       toast.error(err.message);
@@ -334,9 +344,9 @@ export const WorkspacePage: React.FC<Props> = ({
       const res = await api.uploadAndParseRun(activeRun.id);
       await loadAll();
       if (res.uploaded_and_triggered > 0) {
-        setPolling(true);
+        updatePolling(true);
         toast.info(
-          `Đã đẩy ${res.uploaded_and_triggered} tài liệu lên RAGFlow. Đang tự động theo dõi tiến độ parse (mỗi 3 giây)...`
+          `Đã đẩy ${res.uploaded_and_triggered} tài liệu lên RAGFlow. Đang tự động theo dõi tiến độ parse (mỗi 4 giây)...`
         );
       } else {
         toast.warning('Chưa có file gốc nào trong kho để đẩy lên RAGFlow. Hãy bấm "Thêm file gốc" trước.');
@@ -358,10 +368,20 @@ export const WorkspacePage: React.FC<Props> = ({
     }
   };
 
-  const hasPendingUpload = docs.some((d) => {
-    const rd = runDocs.find((x) => x.document_id === d.id);
-    return !rd || !rd.ragflow_doc_id || rd.parse_status === 'FAIL';
-  });
+  const runDocMap = useMemo(() => {
+    const m = new Map<number, RunDocumentItem>();
+    for (const rd of runDocs) m.set(rd.document_id, rd);
+    return m;
+  }, [runDocs]);
+
+  const hasPendingUpload = useMemo(
+    () =>
+      docs.some((d) => {
+        const rd = runDocMap.get(d.id);
+        return !rd || !rd.ragflow_doc_id || rd.parse_status === 'FAIL';
+      }),
+    [docs, runDocMap]
+  );
   const isLocked = !!busy || polling;
 
   return (
@@ -424,10 +444,12 @@ export const WorkspacePage: React.FC<Props> = ({
                   description: 'Toàn bộ dữ liệu chunks và kết quả chấm thuộc phiên này sẽ bị xóa khỏi local.',
                   confirmLabel: 'Xóa phiên',
                   onConfirm: async () => {
-                    await api.deleteRun(activeRun.id);
+                    const deletedId = activeRun.id;
+                    const deletedName = activeRun.name;
+                    await api.deleteRun(deletedId);
+                    clearAutoTuneCacheForRun(deletedId);
                     await onReloadRuns();
-                    await loadAll();
-                    toast.success(`Đã xóa phiên "${activeRun.name}".`);
+                    toast.success(`Đã xóa phiên "${deletedName}".`);
                   },
                 })
               }

@@ -1,11 +1,12 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
-import { AlertCircle, ArrowRight, BarChart3, ChevronLeft, ChevronRight, LayoutGrid, List, Loader2, Maximize2, Search, Shuffle, Sparkles, Table2, Wand2, X } from 'lucide-react';
+import { AlertCircle, ArrowRight, BarChart3, ChevronLeft, ChevronRight, LayoutGrid, List, Loader2, Maximize2, Search, Shuffle, Sparkles, Table2, X } from 'lucide-react';
 import { api } from '../api/client';
 import { ChunkEvalItem, ErrorCodeDef, RunItem } from '../types';
 import { ChunkExplorer } from '../components/ChunkExplorer';
 import { ChunkingTableView } from '../components/ChunkingTableView';
 import { ChunkContentView } from '../components/ChunkContentView';
+import { FloatingProgressOverlay, useProgressTask } from '../components/FloatingProgressOverlay';
 
 interface Props {
   activeRun: RunItem | null;
@@ -48,6 +49,7 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActiv
   const [sampling, setSampling] = useState(false);
   const [judgingEngine, setJudgingEngine] = useState<'' | 'jev' | 'llm'>('');
   const [saving, setSaving] = useState(false);
+  const { progress: taskProgress, runTracked } = useProgressTask();
 
   const [integrity, setIntegrity] = useState<number>(1);
   const [contextSuff, setContextSuff] = useState<number>(1);
@@ -88,29 +90,43 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActiv
     setNotes(c.notes || '');
   };
 
+  const loadSeqRef = useRef(0);
+
   const load = async (advanceFromPk?: number, autoSampleIfEmpty = false) => {
     if (!activeRun) return;
+    const seq = ++loadSeqRef.current;
+    const targetRunId = activeRun.id;
     const [list, m] = await Promise.all([
-      api.listChunkEvals(activeRun.id, true),
-      api.getChunkingMetrics(activeRun.id),
+      api.listChunkEvals(targetRunId, true),
+      api.getChunkingMetrics(targetRunId),
     ]);
+    if (seq !== loadSeqRef.current) return;
     if (list.length === 0 && autoSampleIfEmpty && (activeRun.chunk_count ?? 0) > 0) {
       setSampling(true);
       try {
-        await api.sampleChunks(activeRun.id, { mode: sampleMode, perDoc });
+        await runTracked(
+          {
+            title: 'Đang lấy mẫu & quét lỗi Chunking',
+            subtitle: 'Chạy rule engine 100% corpus và phân tầng mẫu tự động',
+            estimatedMs: 14000,
+          },
+          () => api.sampleChunks(targetRunId, { mode: sampleMode, perDoc })
+        );
+        if (seq !== loadSeqRef.current) return;
         const [list2, m2] = await Promise.all([
-          api.listChunkEvals(activeRun.id, true),
-          api.getChunkingMetrics(activeRun.id),
+          api.listChunkEvals(targetRunId, true),
+          api.getChunkingMetrics(targetRunId),
         ]);
+        if (seq !== loadSeqRef.current) return;
         setChunks(list2);
         setMetrics(m2);
         if (m2?.sampling_meta?.mode) {
           setSampleMode(m2.sampling_meta.mode);
         }
       } catch (e: any) {
-        toast.error(e.message);
+        if (seq === loadSeqRef.current) toast.error(e.message);
       } finally {
-        setSampling(false);
+        if (seq === loadSeqRef.current) setSampling(false);
       }
       return;
     }
@@ -138,14 +154,25 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActiv
   useEffect(() => {
     setSelected(null);
     setHovered(null);
+    setDocFilter('');
+    setChunks([]);
+    setMetrics(null);
     load(undefined, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeRun?.id]);
 
   const handleAutoSample = async () => {
     if (!activeRun || sampling) return;
     setSampling(true);
     try {
-      const res = await api.sampleChunks(activeRun.id, { mode: sampleMode, perDoc });
+      const res = await runTracked(
+        {
+          title: 'Đang lấy mẫu & quét lỗi Chunking',
+          subtitle: 'Quét rule 100% chunks & chấm AI các mẫu mới',
+          estimatedMs: 15000,
+        },
+        () => api.sampleChunks(activeRun.id, { mode: sampleMode, perDoc })
+      );
       setSelected(null);
       await load();
       const modeLabel =
@@ -164,7 +191,14 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActiv
     if (!activeRun || judgingEngine || sampling) return;
     setJudgingEngine(engine);
     try {
-      const res = await api.llmJudgeChunks(activeRun.id, false, engine);
+      const res = await runTracked(
+        {
+          title: engine === 'jev' ? 'Đang chấm Chunking bằng Kev/Jev' : 'Đang chấm Chunking bằng LLM',
+          subtitle: 'Đánh giá tính toàn vẹn, ngữ cảnh và nhiễu cho từng chunk mẫu',
+          estimatedMs: 16000,
+        },
+        () => api.llmJudgeChunks(activeRun.id, false, engine)
+      );
       setSelected(null);
       await load();
       const engLabel = (res.judge_engine || engine) === 'jev' ? 'Kev/Jev' : 'LLM';
@@ -302,7 +336,7 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActiv
   const preview = hovered || selected;
 
   return (
-    <div className="h-[calc(100dvh-48px)] flex flex-col bg-white">
+    <div className="h-full flex flex-col bg-white">
       {/* Sub-navigation Tabs */}
       <div className="px-5 border-b border-[#e8e8e6] bg-white flex items-center justify-between gap-3 shrink-0">
         <div className="flex items-center gap-1">
@@ -411,73 +445,63 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActiv
                 >
                   <AlertCircle className="size-3.5" />
                 </button>
-                <div className="pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity duration-150 absolute left-0 top-full mt-2 z-50 w-[370px] rounded-lg border border-[#e4e4e2] bg-white p-4 shadow-xl text-[11px] text-[#3f3f46] leading-relaxed">
+                <div className="pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity duration-150 absolute left-0 top-full mt-2 z-50 w-[390px] rounded-lg border border-[#e4e4e2] bg-white p-4 shadow-xl text-[11px] text-[#3f3f46] leading-relaxed">
                   <div className="flex items-center justify-between gap-2 pb-2 mb-2.5 border-b border-[#f0f0ee]">
                     <span className="font-semibold text-xs text-[#18181b]">
-                      Phương pháp phân bổ mẫu &amp; chấm điểm
+                      Cách chọn mẫu &amp; tính điểm Chunking
                     </span>
                     <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-[#03aa5c]/10 text-[#027a42] font-semibold">
                       {metrics?.sampled_total ?? chunks.length}/{metrics?.total_chunks ?? activeRun.chunk_count ?? 0} ({metrics?.coverage_pct ?? 0}%)
                     </span>
                   </div>
-                  <div className="space-y-2.5">
+                  <div className="space-y-3">
                     <div>
-                      <div className="font-semibold text-[#18181b] mb-0.5">
-                        1. Adaptive √n — Power Allocation (Bankier, 1988)
+                      <div className="text-[10px] font-semibold uppercase tracking-wider text-[#71717a] mb-1.5">
+                        3 chế độ chọn số chunk mẫu mỗi file
                       </div>
-                      <p>
-                        Số mẫu mỗi tài liệu tính theo{' '}
-                        <span className="font-mono text-[10px] bg-[#f4f4f2] px-1 py-0.5 rounded text-[#18181b]">
-                          k = clamp(round({metrics?.sampling_meta?.sqrt_k ?? 2} × √n), {metrics?.sampling_meta?.min_per_doc ?? 5}, {metrics?.sampling_meta?.max_per_doc ?? 20})
-                        </span>
-                        . Cân bằng giữa độ tin cậy file ngắn (luôn giữ sàn ≥ {metrics?.sampling_meta?.min_per_doc ?? 5}) và độ phủ file dài (tăng theo √n thay vì cố định 5 mẫu/file).
-                      </p>
-                      <p className="text-[10px] text-[#71717a] mt-0.5">
-                        Phân tầng trong file: Đầu file → Bảng biểu → Giữa file (chia đều) → Cuối file.
+                      <ul className="space-y-1.5">
+                        <li className={`px-2 py-1 rounded ${sampleMode === 'adaptive' ? 'bg-[#f4f4f2] text-[#18181b]' : ''}`}>
+                          <span className="font-semibold text-[#18181b]">• Adaptive √n (Khuyên dùng):</span>{' '}
+                          File càng dài lấy càng nhiều mẫu (từ {metrics?.sampling_meta?.min_per_doc ?? 5} đến {metrics?.sampling_meta?.max_per_doc ?? 20} chunk/file, tỷ lệ theo <span className="font-mono text-[10px]">√n</span> — Bankier 1988). Cân bằng giữa độ phủ và tốc độ.
+                        </li>
+                        <li className={`px-2 py-1 rounded ${sampleMode === 'fixed' ? 'bg-[#f4f4f2] text-[#18181b]' : ''}`}>
+                          <span className="font-semibold text-[#18181b]">• Cố định:</span>{' '}
+                          Lấy đúng số lượng N chunk/file bạn nhập (file ít hơn N thì lấy hết).
+                        </li>
+                        <li className={`px-2 py-1 rounded ${sampleMode === 'full' ? 'bg-[#f4f4f2] text-[#18181b]' : ''}`}>
+                          <span className="font-semibold text-[#18181b]">• Toàn bộ 100%:</span>{' '}
+                          Chấm tất cả chunk trong Run — chính xác tuyệt đối nhưng tốn thời gian LLM hơn nếu nhiều chunk.
+                        </li>
+                      </ul>
+                      <p className="text-[10.5px] text-[#71717a] mt-1.5 px-2">
+                        <strong className="text-[#52525b]">Vị trí lấy trong file:</strong> ưu tiên lấy đủ đầu file, chunk chứa bảng, rải đều phần giữa và cuối file (không lấy ngẫu nhiên).
                       </p>
                     </div>
-                    <div>
-                      <div className="font-semibold text-[#18181b] mb-0.5">
-                        2. Quét Rule-based 100% + LLM-as-a-Judge
+                    <div className="border-t border-[#f0f0ee] pt-2.5 space-y-1.5">
+                      <div className="text-[10px] font-semibold uppercase tracking-wider text-[#71717a]">
+                        Cách chấm &amp; tính điểm tổng
                       </div>
                       <p>
-                        Bộ quy tắc tự động quét <strong className="text-[#18181b]">100% toàn bộ chunks</strong> để bắt sạch lỗi cơ học (SIZE, DUPLICATE, NOISE). LLM-as-a-Judge chấm ngữ nghĩa trên tập mẫu (tự giữ nguyên các mẫu đã chấm khi đổi cỡ mẫu).
+                        <strong className="text-[#18181b]">Quét 2 lớp:</strong> Quy tắc tự động kiểm tra độ dài, trùng lặp, rác trên <strong className="text-[#18181b]">100% chunks</strong>; LLM chấm ngữ nghĩa trên tập mẫu (giữ nguyên các chunk đã chấm khi đổi cỡ mẫu).
                       </p>
-                    </div>
-                    <div>
-                      <div className="font-semibold text-[#18181b] mb-0.5">
-                        3. Điểm tổng có trọng số — Cochran (1977)
-                      </div>
                       <p>
-                        Điểm tổng áp dụng <span className="font-mono text-[10px] bg-[#f4f4f2] px-1 py-0.5 rounded text-[#18181b]">P̂ = Σ (Nₕ / N) · pₕ</span> — nhân trọng số theo tổng số chunk thật (<span className="font-mono text-[10px]">Nₕ</span>) của từng tài liệu để file ngắn không làm lệch điểm toàn corpus.
+                        <strong className="text-[#18181b]">Điểm tổng có trọng số (Cochran 1977):</strong> File có nhiều chunk chiếm tỷ trọng lớn hơn trong điểm tổng, tránh việc vài file ngắn làm lệch kết quả cả bộ dữ liệu.
                       </p>
                     </div>
                   </div>
                 </div>
               </div>
               {chunks.length > 0 && (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => handleAiJudge('jev')}
-                    disabled={!!judgingEngine || sampling}
-                    className="ts-btn-ghost py-1 px-2 text-xs rounded-md border border-emerald-200 bg-emerald-50/70 text-emerald-800 hover:bg-emerald-100 disabled:opacity-45"
-                    title="Chấm lại toàn bộ chunk mẫu bằng Kev / Jev System One (giữ nguyên các chunk đã duyệt tay)"
-                  >
-                    {judgingEngine === 'jev' ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5" />}
-                    {judgingEngine === 'jev' ? 'Kev/Jev đang chấm...' : 'Chấm lại Kev / Jev'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleAiJudge('llm')}
-                    disabled={!!judgingEngine || sampling}
-                    className="ts-btn-ghost py-1 px-2 text-xs rounded-md disabled:opacity-45"
-                    title="Chấm lại toàn bộ chunk mẫu bằng Generative LLM (giữ nguyên các chunk đã duyệt tay)"
-                  >
-                    {judgingEngine === 'llm' ? <Loader2 className="size-3.5 animate-spin" /> : <Wand2 className="size-3.5" />}
-                    {judgingEngine === 'llm' ? 'Đang chấm LLM...' : 'Chấm lại LLM'}
-                  </button>
-                </>
+                <button
+                  type="button"
+                  onClick={() => handleAiJudge('llm')}
+                  disabled={!!judgingEngine || sampling}
+                  className="ts-btn-ghost py-1 px-2 text-xs rounded-md disabled:opacity-45"
+                  title="Chấm lại toàn bộ chunk mẫu bằng Generative LLM (giữ nguyên các chunk đã duyệt tay)"
+                >
+                  {judgingEngine === 'llm' ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5" />}
+                  {judgingEngine === 'llm' ? 'Đang chấm LLM...' : 'Chấm lại LLM'}
+                </button>
               )}
             </div>
 
@@ -593,8 +617,8 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActiv
                 </div>
 
                 {sampling && chunks.length === 0 ? (
-                  <div className="py-12 flex items-center justify-center gap-2 text-xs text-[#71717a]">
-                    <Loader2 className="size-4 animate-spin" /> Đang lấy mẫu &amp; quét lỗi tự động...
+                  <div className="py-12 text-center text-xs text-[#71717a] bg-[#fafaf9]">
+                    Đang chuẩn bị dữ liệu mẫu Chunking...
                   </div>
                 ) : visibleChunks.length === 0 ? (
                   <div className="py-12 text-center text-xs text-[#71717a] bg-[#fafaf9]">
@@ -968,7 +992,7 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActiv
 
           {/* Fullscreen Scoring Mode — opened via "Chế độ chấm", clicking a tile, or clicking an Excel row */}
           {selected && (
-            <div className="fixed inset-0 z-30 flex flex-col bg-white">
+            <div className="fixed inset-0 z-40 flex flex-col bg-white">
               <div className="px-5 py-2 border-b border-[#ededeb] bg-[#fafaf9] flex items-center justify-between text-xs shrink-0">
                 <div className="flex items-center gap-2.5">
                   <div className="inline-flex items-center border border-[#e4e4e2] bg-white">
@@ -1083,7 +1107,7 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActiv
                         <span className="font-mono text-[10px] uppercase tracking-wide text-[#a1a1aa] mr-2">
                           Cuối Chunk #{selected.chunk_index - 1}:
                         </span>
-                        …{selected.prev_tail}
+                        {selected.prev_tail.length >= 160 ? `…${selected.prev_tail}` : selected.prev_tail}
                       </div>
                     )}
 
@@ -1096,7 +1120,7 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActiv
                         <span className="font-mono text-[10px] uppercase tracking-wide text-[#a1a1aa] mr-2">
                           Đầu Chunk #{selected.chunk_index + 1}:
                         </span>
-                        {selected.next_head}…
+                        {selected.next_head.length >= 160 ? `${selected.next_head}…` : selected.next_head}
                       </div>
                     )}
                   </div>
@@ -1116,7 +1140,7 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActiv
                             <span>
                               Danh sách{' '}
                               <span className="font-mono font-normal text-[#71717a]">
-                                ({chunks.length}/{chunks.length})
+                                ({chunks.filter((c) => c.judge_source === 'MANUAL').length}/{chunks.length})
                               </span>
                             </span>
                             <div className="inline-flex items-center rounded-[2px] border border-[#e4e4e2] bg-white p-0.5">
@@ -1157,7 +1181,10 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActiv
                           >
                             {groupsList.map((grp) => {
                               const okCnt = grp.items.filter((c) => getChunkState(c) === 'OK').length;
-                              const cleanName = (grp.filename || '').replace(new RegExp(`^${grp.doc_code}[_\\-\\s]*`, 'i'), '');
+                              const escCode = (grp.doc_code || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                              const cleanName = escCode
+                                ? (grp.filename || '').replace(new RegExp(`^${escCode}[_\\-\\s]*`, 'i'), '')
+                                : grp.filename || '';
                               return (
                                 <option key={grp.doc_code} value={grp.doc_code}>
                                   {grp.doc_code} ({okCnt}/{grp.items.length}) · {cleanName}
@@ -1295,6 +1322,8 @@ export const ChunkingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActiv
           )}
         </>
       )}
+
+      <FloatingProgressOverlay state={taskProgress} moduleLabel="CHUNKING QC" />
     </div>
   );
 };

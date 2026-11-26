@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   FlaskConical,
   Plug,
@@ -19,8 +19,9 @@ interface SettingsModalProps {
   defaults: Record<string, string>;
   setSettings: React.Dispatch<React.SetStateAction<Record<string, string>>>;
   onClose: () => void;
-  onSave: () => Promise<void>;
-  onTestRagflow: () => Promise<void>;
+  onSave: () => Promise<boolean>;
+  onSaveSilent?: () => Promise<boolean>;
+  onTestRagflow: () => Promise<boolean>;
   testing: boolean;
   connMsg: { ok?: boolean; text?: string };
   setConnMsg: React.Dispatch<React.SetStateAction<{ ok?: boolean; text?: string }>>;
@@ -98,6 +99,7 @@ export default function SettingsModal({
   setSettings,
   onClose,
   onSave,
+  onSaveSilent,
   onTestRagflow,
   testing,
   connMsg,
@@ -105,7 +107,18 @@ export default function SettingsModal({
 }: SettingsModalProps) {
   const [section, setSection] = useState<SectionId>('connection');
   const [testingLlm, setTestingLlm] = useState(false);
+  const [testingVision, setTestingVision] = useState(false);
   const [testingSys1, setTestingSys1] = useState(false);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !testing && !testingLlm && !testingVision && !testingSys1) {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose, testing, testingLlm, testingVision, testingSys1]);
 
   const val = (key: string, fallback = '') => settings[key] ?? defaults[key] ?? fallback;
   const setKey = (key: string, value: string) => setSettings((prev) => ({ ...prev, [key]: value }));
@@ -193,6 +206,27 @@ export default function SettingsModal({
 
             {section === 'connection' && (
               <div className="space-y-5">
+                <div className="flex items-center justify-between px-3.5 py-2.5 rounded-[5px] border border-[#e4e4e2] bg-[#fafaf9]">
+                  <span className="text-xs font-medium text-[#161616]">Demo</span>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={val('demo_mode', 'false') === 'true'}
+                    onClick={() =>
+                      setKey('demo_mode', val('demo_mode', 'false') === 'true' ? 'false' : 'true')
+                    }
+                    className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                      val('demo_mode', 'false') === 'true' ? 'bg-[#03aa5c]' : 'bg-[#d4d4d8]'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block size-3.5 transform rounded-full bg-white shadow transition-transform ${
+                        val('demo_mode', 'false') === 'true' ? 'translate-x-5' : 'translate-x-0.5'
+                      }`}
+                    />
+                  </button>
+                </div>
+
                 <div className="space-y-3">
                   <div className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
                     RAGFlow Server
@@ -285,7 +319,8 @@ export default function SettingsModal({
                       setTestingLlm(true);
                       setConnMsg({});
                       try {
-                        await api.saveSettings(settings);
+                        if (onSaveSilent) await onSaveSilent();
+                        else await api.saveSettings(settings);
                         const r = await api.testLlm();
                         setConnMsg({ ok: true, text: `Kết nối LLM thành công (${r.model})` });
                       } catch (e: any) {
@@ -359,39 +394,41 @@ export default function SettingsModal({
                   </FieldRow>
                   <button
                     type="button"
-                    disabled={testingLlm}
+                    disabled={testingVision}
                     onClick={async () => {
-                      setTestingLlm(true);
+                      setTestingVision(true);
                       setConnMsg({});
                       try {
-                        await api.saveSettings(settings);
+                        if (onSaveSilent) await onSaveSilent();
+                        else await api.saveSettings(settings);
                         const r = await api.testVision();
                         setConnMsg({ ok: true, text: `Kết nối Vision LLM thành công (${r.model})` });
                       } catch (e: any) {
                         setConnMsg({ ok: false, text: e.message });
                       } finally {
-                        setTestingLlm(false);
+                        setTestingVision(false);
                       }
                     }}
                     className="ts-btn-secondary text-xs"
                   >
                     <FlaskConical className="size-3.5 text-[#03aa5c]" />
-                    {testingLlm ? 'Đang kiểm tra...' : 'Kiểm tra kết nối Vision LLM'}
+                    {testingVision ? 'Đang kiểm tra...' : 'Kiểm tra kết nối Vision LLM'}
                   </button>
                 </div>
 
                 <div className="border-t border-[#ededeb] pt-4 space-y-3">
-                  <div className="flex items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
                     <div>
                       <span className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
                         Jev / Kev System One (Chấm Relevancy Bước 4)
                       </span>
                       <p className="text-[10px] text-[#71717a] mt-0.5">
-                        Hỗ trợ Jev (Vercel / TypeSafe) hoặc Kev open-source (Google Colab URL trycloudflare.com / localhost:8009).
+                        Hỗ trợ Jev (OpenRouter / Vercel / TypeSafe) hoặc Kev open-source (Google Colab URL trycloudflare.com / localhost:8009).
                       </p>
                     </div>
-                    <div className="flex items-center gap-1 text-[11px] shrink-0">
+                    <div className="flex flex-wrap items-center gap-1 text-[11px] shrink-0">
                       {[
+                        { label: 'OpenRouter · Jev', url: 'https://openrouter.ai/api/alpha/decisions', model: 'typesafe/jev-1.14' },
                         { label: 'Kev (Colab/Local)', url: 'http://localhost:8009', model: 'jaredpalmer/kev-4b' },
                         { label: 'Vercel · Jev', url: 'https://ai-gateway.vercel.sh/typesafe', model: 'typesafe-ai/jev' },
                         { label: 'TypeSafe Direct', url: 'https://api.typesafe.ai', model: 'jev-latest' },
@@ -419,7 +456,7 @@ export default function SettingsModal({
                         className="ts-input w-full font-mono text-xs"
                         value={val('systemone_base_url', 'https://ai-gateway.vercel.sh/typesafe')}
                         onChange={(e) => setKey('systemone_base_url', e.target.value)}
-                        placeholder="https://ai-gateway.vercel.sh/typesafe"
+                        placeholder="https://openrouter.ai/api/v1"
                       />
                     </FieldRow>
                     <FieldRow label="Model Jev">
@@ -427,17 +464,17 @@ export default function SettingsModal({
                         className="ts-input w-full font-mono text-xs"
                         value={val('systemone_model', 'typesafe-ai/jev')}
                         onChange={(e) => setKey('systemone_model', e.target.value)}
-                        placeholder="typesafe-ai/jev"
+                        placeholder="typesafe/jev-1.14"
                       />
                     </FieldRow>
                   </div>
-                  <FieldRow label="System One / Vercel AI Gateway Key (tùy chọn nếu dùng chung key LLM)">
+                  <FieldRow label="System One / OpenRouter / Vercel Key (tùy chọn nếu dùng chung key LLM)">
                     <input
                       type="password"
                       className="ts-input w-full font-mono text-xs"
                       value={val('systemone_api_key')}
                       onChange={(e) => setKey('systemone_api_key', e.target.value)}
-                      placeholder="vck_... (để trống nếu dùng chung key Vercel ở mục LLM)"
+                      placeholder="sk-or-v1-... / vck_... (để trống nếu dùng chung key OpenRouter/Vercel ở mục LLM)"
                     />
                   </FieldRow>
                   <button
@@ -447,7 +484,8 @@ export default function SettingsModal({
                       setTestingSys1(true);
                       setConnMsg({});
                       try {
-                        await api.saveSettings(settings);
+                        if (onSaveSilent) await onSaveSilent();
+                        else await api.saveSettings(settings);
                         const r = await api.testSystemOne();
                         const pTxt =
                           r.sample_noul !== undefined && r.sample_noul !== null
@@ -564,23 +602,26 @@ export default function SettingsModal({
                       >
                         <AlertCircle className="size-3" />
                       </span>
-                      <div className="pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity duration-150 absolute left-0 top-full mt-2 z-50 w-[340px] rounded-md border border-[#e4e4e2] bg-white p-3.5 shadow-lg text-[11px] text-[#3f3f46] leading-relaxed">
+                      <div className="pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity duration-150 absolute left-0 top-full mt-2 z-50 w-[360px] rounded-md border border-[#e4e4e2] bg-white p-3.5 shadow-lg text-[11px] text-[#3f3f46] leading-relaxed">
                         <div className="font-semibold text-[#18181b] mb-1.5">
-                          Cơ sở phương pháp phân bổ mẫu Chunking
+                          3 chế độ chọn mẫu &amp; cách tính điểm
                         </div>
                         <ul className="space-y-1.5 list-disc pl-3.5">
                           <li>
-                            <span className="font-semibold text-[#18181b]">Adaptive √n (Bankier, 1988):</span>{' '}
-                            <span className="font-mono text-[10px] bg-[#f4f4f2] px-1 py-0.5 rounded">
-                              k = clamp(round(c × √n), min, max)
-                            </span>{' '}
-                            — cân bằng độ tin cậy file ngắn (luôn giữ sàn) và độ phủ file dài (tăng theo √n).
+                            <span className="font-semibold text-[#18181b]">Adaptive √n (Bankier 1988):</span>{' '}
+                            File dài tự lấy nhiều mẫu hơn (từ sàn <span className="font-mono text-[10px]">min</span> đến trần <span className="font-mono text-[10px]">max</span> theo <span className="font-mono text-[10px]">c × √n</span>), cân bằng độ phủ và tốc độ.
                           </li>
                           <li>
-                            <span className="font-semibold text-[#18181b]">Rule-based 100%:</span> Quét lỗi cơ học trên toàn bộ chunks; LLM-as-a-Judge tập trung chấm ngữ nghĩa trên tập mẫu.
+                            <span className="font-semibold text-[#18181b]">Cố định:</span>{' '}
+                            Lấy đúng N chunk/file (file ít hơn N thì lấy hết).
                           </li>
                           <li>
-                            <span className="font-semibold text-[#18181b]">Weighted Score (Cochran, 1977):</span> Điểm tổng nhân trọng số theo số chunk thật <span className="font-mono text-[10px]">N_h</span> của từng tài liệu để tránh thiên lệch.
+                            <span className="font-semibold text-[#18181b]">Toàn bộ 100%:</span>{' '}
+                            Chấm tất cả chunk trong Run bằng cả Rule và LLM.
+                          </li>
+                          <li>
+                            <span className="font-semibold text-[#18181b]">Điểm tổng có trọng số (Cochran 1977):</span>{' '}
+                            File nhiều chunk chiếm tỷ trọng lớn hơn để file ngắn không làm lệch điểm chung.
                           </li>
                         </ul>
                       </div>
@@ -954,13 +995,14 @@ export default function SettingsModal({
           </button>
           <button
             type="button"
+            disabled={testing || testingLlm || testingVision || testingSys1}
             onClick={async () => {
-              await onSave();
-              onClose();
+              const ok = await onSave();
+              if (ok) onClose();
             }}
-            className="ts-btn-primary text-xs"
+            className="ts-btn-primary text-xs disabled:opacity-45"
           >
-            Lưu cài đặt
+            {testing ? 'Đang lưu...' : 'Lưu cài đặt'}
           </button>
         </div>
       </div>

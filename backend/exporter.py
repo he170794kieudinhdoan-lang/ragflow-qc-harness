@@ -3,7 +3,7 @@ import json
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.comments import Comment
-from database import get_db
+from database import get_current_account_key, get_db
 from metrics import compute_contextual_precision, compute_parsing_metrics
 
 
@@ -312,8 +312,13 @@ def export_run_workbook(run_id: int) -> bytes:
             cell = ws_chunk.cell(row=idx_row, column=4)
             cell.comment = Comment((ev["content"] or "")[:1800], "RAGFlow QC")
 
-        # 5. Golden Testcases (exact 6 spec columns)
-        tcs = conn.execute("SELECT * FROM golden_testcases ORDER BY tc_code").fetchall()
+        # 5. Golden Testcases (exact 6 spec columns, scoped to this dataset's Golden owner)
+        from database import resolve_golden_run_id
+        owner_id = resolve_golden_run_id(conn, run_id)
+        tcs = conn.execute(
+            "SELECT * FROM golden_testcases WHERE run_id = ? ORDER BY tc_code",
+            (owner_id,),
+        ).fetchall()
         ws_tc = wb.create_sheet("Golden_Testcases")
         _style_header(
             ws_tc,
@@ -376,17 +381,22 @@ def export_run_workbook(run_id: int) -> bytes:
             by_cls = {}
             all_cp, all_cc, all_full, all_pass = [], [], 0, 0
 
+            meta_map = {
+                m["testcase_id"]: m
+                for m in conn.execute(
+                    "SELECT * FROM testcase_eval_meta WHERE retrieval_run_id = ?",
+                    (rr["id"],),
+                ).fetchall()
+            }
+            rels_by_tc: dict = {}
+            for r in rrows:
+                if r["relevant"] is not None:
+                    rels_by_tc.setdefault(r["testcase_id"], []).append(r["relevant"])
+
             for tc in tcs:
-                rels = [
-                    r["relevant"]
-                    for r in rrows
-                    if r["testcase_id"] == tc["id"] and r["relevant"] is not None
-                ]
+                rels = rels_by_tc.get(tc["id"], [])
                 cp = compute_contextual_precision(rels)
-                meta = conn.execute(
-                    "SELECT * FROM testcase_eval_meta WHERE retrieval_run_id = ? AND testcase_id = ?",
-                    (rr["id"], tc["id"]),
-                ).fetchone()
+                meta = meta_map.get(tc["id"])
                 ac = meta["answer_containment"] if meta else "UNCHECKED"
                 cc = float(meta["context_coverage"] or 0.0) if meta else 0.0
                 passed = 1 if (cp >= 0.5 and any(v == 1 for v in rels)) else 0

@@ -2,6 +2,7 @@ import hashlib
 import sqlite3
 import json
 import os
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -12,6 +13,15 @@ DB_PATH = os.path.join(DATA_DIR, "ragflow_qc.db")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+_SETTINGS_LOCK = threading.Lock()
+_SETTINGS_CACHE: dict[str, str] | None = None
+
+
+def invalidate_settings_cache() -> None:
+    global _SETTINGS_CACHE
+    with _SETTINGS_LOCK:
+        _SETTINGS_CACHE = None
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -19,10 +29,11 @@ def utc_now() -> str:
 
 @contextmanager
 def get_db():
-    conn = sqlite3.connect(DB_PATH, timeout=10.0, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
-    conn.execute("PRAGMA busy_timeout = 5000;")
+    conn.execute("PRAGMA synchronous = NORMAL;")
+    conn.execute("PRAGMA busy_timeout = 15000;")
     try:
         yield conn
         conn.commit()
@@ -63,6 +74,7 @@ def repair_chunk_document_links(conn) -> int:
 
 def init_db():
     with get_db() as conn:
+        conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.executescript(
             """
@@ -231,6 +243,38 @@ def init_db():
                 root_cause_notes TEXT DEFAULT '',
                 PRIMARY KEY (retrieval_run_id, testcase_id)
             );
+
+            CREATE TABLE IF NOT EXISTS pipeline_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_run_id INTEGER NOT NULL,
+                target_run_id INTEGER,
+                target_dataset_id TEXT DEFAULT '',
+                name TEXT NOT NULL,
+                status TEXT DEFAULT 'queued', -- queued | running | completed | failed | cancelled
+                current_stage TEXT DEFAULT 'queued',
+                stage_progress_json TEXT DEFAULT '{}',
+                config_json TEXT DEFAULT '{}',
+                error_message TEXT DEFAULT '',
+                total_duration_ms INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ai_advisor_reports (
+                run_id INTEGER PRIMARY KEY,
+                retrieval_run_id INTEGER,
+                report_json TEXT NOT NULL,
+                model_used TEXT DEFAULT '',
+                duration_ms INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS auto_tune_reports (
+                run_id INTEGER PRIMARY KEY,
+                config_json TEXT DEFAULT '{}',
+                result_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
 
@@ -245,10 +289,12 @@ def init_db():
         # Self-heal snapshots produced by older versions (orphan chunks -> parsing/chunking empty).
         repair_chunk_document_links(conn)
 
-        # Ensure runs.account_key column exists so datasets are cleanly scoped per RAGFlow (base_url + api_key)
+        # Ensure runs.account_key and runs.golden_source_run_id columns exist
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
         if "account_key" not in cols:
             conn.execute("ALTER TABLE runs ADD COLUMN account_key TEXT DEFAULT ''")
+        if "golden_source_run_id" not in cols:
+            conn.execute("ALTER TABLE runs ADD COLUMN golden_source_run_id INTEGER DEFAULT 0")
 
         # Ensure parsing_units.judge_source and fidelity_error columns exist
         pu_cols = {r["name"] for r in conn.execute("PRAGMA table_info(parsing_units)").fetchall()}
@@ -267,23 +313,103 @@ def init_db():
             conn.execute("ALTER TABLE retrieval_runs ADD COLUMN judge_call_count INTEGER DEFAULT 0")
         if "judge_error_count" not in rr_cols:
             conn.execute("ALTER TABLE retrieval_runs ADD COLUMN judge_error_count INTEGER DEFAULT 0")
+        if "is_baseline_rr" not in rr_cols:
+            conn.execute("ALTER TABLE retrieval_runs ADD COLUMN is_baseline_rr INTEGER DEFAULT 0")
 
-        # Ensure golden_testcases.account_key exists so switching RAGFlow accounts/datasets never wipes other datasets
+        # Ensure golden_testcases.account_key and per-dataset run_id with UNIQUE(run_id, tc_code)
         gt_cols = {r["name"] for r in conn.execute("PRAGMA table_info(golden_testcases)").fetchall()}
         if "account_key" not in gt_cols:
             conn.execute("ALTER TABLE golden_testcases ADD COLUMN account_key TEXT DEFAULT ''")
+        if "run_id" not in gt_cols:
+            conn.execute("PRAGMA foreign_keys = OFF;")
+            conn.executescript(
+                """
+                CREATE TABLE golden_testcases_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER DEFAULT 0,
+                    tc_code TEXT NOT NULL,
+                    input_question TEXT NOT NULL,
+                    expected_outcome TEXT DEFAULT '',
+                    reference_context TEXT NOT NULL,
+                    source_file TEXT DEFAULT '',
+                    question_class TEXT DEFAULT 'Local',
+                    intent_type TEXT DEFAULT 'Factoid',
+                    notes TEXT DEFAULT '',
+                    account_key TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(run_id, tc_code)
+                );
+                INSERT INTO golden_testcases_new
+                    (id, run_id, tc_code, input_question, expected_outcome, reference_context, source_file, question_class, intent_type, notes, account_key, created_at)
+                SELECT id, 0, tc_code, input_question, expected_outcome, reference_context, source_file, question_class, intent_type, notes, account_key, created_at
+                FROM golden_testcases;
+                DROP TABLE golden_testcases;
+                ALTER TABLE golden_testcases_new RENAME TO golden_testcases;
+                """
+            )
+            conn.execute("PRAGMA foreign_keys = ON;")
+
+            # Backfill legacy global testcases (run_id = 0) to the baseline run so existing datasets keep them
+            base_run = conn.execute(
+                "SELECT id FROM runs ORDER BY is_baseline DESC, id ASC LIMIT 1"
+            ).fetchone()
+            if base_run:
+                bid = int(base_run["id"])
+                conn.execute("UPDATE golden_testcases SET run_id = ? WHERE run_id = 0", (bid,))
+                # Any other run that already had retrieval_runs sharing those testcases links via golden_source_run_id
+                conn.execute(
+                    """
+                    UPDATE runs SET golden_source_run_id = ?
+                    WHERE id != ? AND golden_source_run_id = 0
+                      AND EXISTS (SELECT 1 FROM retrieval_runs rr WHERE rr.run_id = runs.id)
+                    """,
+                    (bid, bid),
+                )
+
+        # Secondary indexes for hot QC queries & cascade deletes
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_chunks_run_doc_idx ON chunks(run_id, document_id, chunk_index);
+            CREATE INDEX IF NOT EXISTS idx_chunks_run_rfdoc ON chunks(run_id, ragflow_doc_id);
+            CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(document_id);
+            CREATE INDEX IF NOT EXISTS idx_parsing_units_run_doc ON parsing_units(run_id, document_id, unit_index);
+            CREATE INDEX IF NOT EXISTS idx_parsing_units_run_verdict ON parsing_units(run_id, verdict);
+            CREATE INDEX IF NOT EXISTS idx_chunk_evals_run_sampled ON chunk_evaluations(run_id, is_sampled);
+            CREATE INDEX IF NOT EXISTS idx_chunk_evals_chunk ON chunk_evaluations(chunk_id);
+            CREATE INDEX IF NOT EXISTS idx_run_docs_doc ON run_documents(document_id);
+            CREATE INDEX IF NOT EXISTS idx_retrieval_runs_run ON retrieval_runs(run_id, is_baseline_rr, id);
+            CREATE INDEX IF NOT EXISTS idx_retrieval_results_tc ON retrieval_results(testcase_id);
+            CREATE INDEX IF NOT EXISTS idx_testcase_eval_meta_tc ON testcase_eval_meta(testcase_id);
+            CREATE INDEX IF NOT EXISTS idx_pipeline_jobs_src ON pipeline_jobs(source_run_id, id DESC);
+            """
+        )
+    invalidate_settings_cache()
+
+
+def resolve_golden_run_id(conn, run_id: int) -> int:
+    """Returns the owning run_id for Golden testcases (cloned runs share their source run's Golden set)."""
+    if not run_id:
+        return 0
+    row = conn.execute("SELECT golden_source_run_id FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if row and row["golden_source_run_id"]:
+        return int(row["golden_source_run_id"])
+    return int(run_id)
 
 
 DEFAULT_SETTINGS: dict[str, str] = {
+    # Demo / Presentation Mode (100% read-only over saved runs)
+    "demo_mode": "false",
+    "demo_baseline_run_id": "21",
+    "demo_candidate_run_id": "22",
     # Connection
     "ragflow_base_url": "http://13.236.9.207",
     "ragflow_api_key": "",
     "llm_base_url": "https://api.openai.com/v1",
     "llm_api_key": "",
     "llm_model": "gpt-4o-mini",
-    "vision_base_url": "",
+    "vision_base_url": "local",
     "vision_api_key": "",
-    "vision_model": "",
+    "vision_model": "local-rapidocr",
     # System One / Jev (Retrieval & Chunking Judge via Colab Kev, Vercel AI Gateway, or TypeSafe)
     "retrieval_judge_provider": "llm",
     "systemone_base_url": "https://ai-gateway.vercel.sh/typesafe",
@@ -333,11 +459,26 @@ def get_current_account_key() -> str:
     return hashlib.sha256(f"{base_url}|{api_key}".encode("utf-8")).hexdigest()[:16]
 
 
-def get_setting(key: str, default: str | None = None) -> str:
-    fallback = DEFAULT_SETTINGS.get(key, "") if default is None else default
+def _load_settings_cached() -> dict[str, str]:
+    global _SETTINGS_CACHE
+    with _SETTINGS_LOCK:
+        if _SETTINGS_CACHE is not None:
+            return _SETTINGS_CACHE
+    merged = dict(DEFAULT_SETTINGS)
     with get_db() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-        return row["value"] if row else fallback
+        rows = conn.execute("SELECT key, value FROM settings").fetchall()
+        for r in rows:
+            merged[r["key"]] = r["value"]
+    with _SETTINGS_LOCK:
+        _SETTINGS_CACHE = merged
+        return _SETTINGS_CACHE
+
+
+def get_setting(key: str, default: str | None = None) -> str:
+    data = _load_settings_cached()
+    if key in data:
+        return data[key]
+    return DEFAULT_SETTINGS.get(key, "") if default is None else default
 
 
 def get_int_setting(key: str, default: int | None = None) -> int:
@@ -368,12 +509,7 @@ def get_bool_setting(key: str, default: bool | None = None) -> bool:
 
 
 def get_all_settings() -> dict:
-    merged = dict(DEFAULT_SETTINGS)
-    with get_db() as conn:
-        rows = conn.execute("SELECT key, value FROM settings").fetchall()
-        for r in rows:
-            merged[r["key"]] = r["value"]
-    return merged
+    return dict(_load_settings_cached())
 
 
 def set_setting(key: str, value: str):
@@ -385,3 +521,6 @@ def set_setting(key: str, value: str):
             """,
             (key, value, utc_now()),
         )
+    with _SETTINGS_LOCK:
+        if _SETTINGS_CACHE is not None:
+            _SETTINGS_CACHE[key] = value

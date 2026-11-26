@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import re
+import httpx
 from typing import Any, Dict, List, Tuple
 from ragflow_client import get_shared_http_client
 
@@ -40,6 +41,9 @@ async def call_llm_json(
     user_prompt: str,
     timeout: float = 45.0,
 ) -> Dict[str, Any]:
+    from database import get_bool_setting
+    if get_bool_setting("demo_mode", False):
+        raise LLMError("Demo mode đang bật — đã chặn gọi LLM API để không tốn chi phí.")
     url = f"{base_url.rstrip('/')}/chat/completions"
     headers = {"Content-Type": "application/json"}
     if api_key.strip():
@@ -56,17 +60,29 @@ async def call_llm_json(
 
     client = get_shared_http_client()
     last_resp = None
+    last_exc: Optional[Exception] = None
     for attempt in range(4):
-        r = await client.post(url, headers=headers, json=body, timeout=timeout)
-        last_resp = r
-        if r.status_code == 429 and attempt < 3:
-            await asyncio.sleep(1.5 * (2 ** attempt))
-            continue
-        break
-    assert last_resp is not None
+        try:
+            r = await client.post(url, headers=headers, json=body, timeout=timeout)
+            last_resp = r
+            if r.status_code in (429, 502, 503, 504) and attempt < 3:
+                await asyncio.sleep(1.5 * (2 ** attempt))
+                continue
+            break
+        except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            last_exc = exc
+            if attempt < 3:
+                await asyncio.sleep(1.5 * (2 ** attempt))
+                continue
+            raise LLMError(f"Lỗi kết nối LLM: {exc}")
+    if last_resp is None:
+        raise LLMError(f"Không kết nối được LLM: {last_exc}")
     if last_resp.status_code >= 400:
         raise LLMError(f"HTTP {last_resp.status_code}: {last_resp.text[:360]}")
-    payload = last_resp.json()
+    try:
+        payload = last_resp.json()
+    except Exception:
+        raise LLMError(f"LLM trả về dữ liệu không phải JSON: {last_resp.text[:240]}")
     choices = payload.get("choices") or []
     if not choices:
         raise LLMError("LLM trả về phản hồi rỗng.")
@@ -321,26 +337,36 @@ async def llm_judge_relevance(
 
 def _systemone_endpoint(base_url: str) -> str:
     b = (base_url or "").strip().rstrip("/")
-    if b.endswith("/systemone"):
+    if b.endswith("/systemone") or b.endswith("/decisions"):
         return b
+    if "openrouter.ai" in b.lower():
+        if b.endswith("/api/v1"):
+            return b[:-3] + "/alpha/decisions"
+        if b.endswith("/api"):
+            return f"{b}/alpha/decisions"
+        return f"{b}/api/alpha/decisions"
     if b.endswith("/v1"):
         return f"{b}/systemone"
     return f"{b}/v1/systemone"
 
 
 def systemone_requires_key(base_url: str) -> bool:
-    """Cloud hosted endpoints (TypeSafe / Vercel AI Gateway) require an API key; Colab/local Kev may omit it."""
+    """Cloud hosted endpoints (OpenRouter / TypeSafe / Vercel AI Gateway) require an API key; Colab/local Kev may omit it."""
     b = (base_url or "").strip().lower()
-    return "api.typesafe.ai" in b or "ai-gateway.vercel.sh" in b
+    return "openrouter.ai" in b or "api.typesafe.ai" in b or "ai-gateway.vercel.sh" in b
 
 
 def resolve_systemone_credentials(get_setting_fn) -> Tuple[str, str, str, float]:
-    """Resolve (base_url, api_key, model, threshold), sharing Vercel AI Gateway key when appropriate."""
+    """Resolve (base_url, api_key, model, threshold), sharing OpenRouter / Vercel AI Gateway key when appropriate."""
     base_url = (get_setting_fn("systemone_base_url", "https://ai-gateway.vercel.sh/typesafe") or "").strip()
     api_key = (get_setting_fn("systemone_api_key", "") or "").strip()
-    if not api_key and "ai-gateway.vercel.sh" in base_url.lower():
+    if not api_key:
         llm_base = (get_setting_fn("llm_base_url", "") or "").strip().lower()
-        if "ai-gateway.vercel.sh" in llm_base:
+        base_low = base_url.lower()
+        if (
+            ("ai-gateway.vercel.sh" in base_low and "ai-gateway.vercel.sh" in llm_base)
+            or ("openrouter.ai" in base_low and "openrouter.ai" in llm_base)
+        ):
             api_key = (get_setting_fn("llm_api_key", "") or "").strip()
     model = (get_setting_fn("systemone_model", "typesafe-ai/jev") or "typesafe-ai/jev").strip()
     try:
@@ -360,10 +386,15 @@ async def call_system_one(
     timeout: float = 60.0,
 ) -> Dict[str, Any]:
     """Call TypeSafe System One / Kev decision endpoint (/v1/systemone)."""
+    from database import get_bool_setting
+    if get_bool_setting("demo_mode", False):
+        raise LLMError("Demo mode đang bật — đã chặn gọi System One API để không tốn chi phí.")
     url = _systemone_endpoint(base_url)
     headers = {"Content-Type": "application/json"}
     if api_key.strip():
         headers["Authorization"] = f"Bearer {api_key.strip()}"
+    if "openrouter.ai" in url.lower():
+        headers["X-Title"] = "RAGFlow QC Harness"
 
     body: Dict[str, Any] = {
         "model": model.strip() or "typesafe-ai/jev",
@@ -607,6 +638,7 @@ async def llm_judge_chunk(
         "(nếu mở đầu mơ hồ, thiếu chủ thể ngầm như 'Uống 1 viên/ngày' mà không rõ thuốc gì, hoặc bảng số liệu nhiều năm nhưng thiếu nhãn năm → 0, mã CONTEXT).\n"
         "3. no_noise (1=Sạch, 0=Nhiễu): KHÔNG chứa rác cấu trúc/layout bị lẫn vào chunk như menu web, breadcrumb, quảng cáo, nút đặt lịch, header/footer lặp, số trang đơn lẻ, hoặc chuỗi rác vô nghĩa (nếu có → 0, mã NOISE).\n"
         "QUY TẮC TÁCH TẦNG (RẤT QUAN TRỌNG):\n"
+        "- `[Đuôi chunk trước]` và `[Đầu chunk sau]` CHỈ dùng để đối chiếu ranh giới cắt câu (`INTEGRITY`). TUYỆT ĐỐI KHÔNG chấm lỗi `NOISE` hay trích dẫn từ/cụm từ thuộc `[Đuôi chunk trước]` hoặc `[Đầu chunk sau]` vào `reason` của `[CHUNK HIỆN TẠI CẦN CHẤM]`.\n"
         "- KHÔNG đánh lỗi `NOISE` (hay `INTEGRITY`) chỉ vì lỗi OCR mất dấu tiếng Việt, sai chính tả hoặc hỏng font ký tự — đó là lỗi của tầng Parsing đã chấm riêng; tầng Chunking chỉ chấm chất lượng CẮT ĐOẠN và RÁC CẤU TRÚC.\n"
         "- Nếu chunk dài hoặc bảng rộng có nhãn `[BẢNG HTML NGUYÊN VẸN ...]` hoặc `[...đã rút gọn ...]`, TUYỆT ĐỐI KHÔNG đánh lỗi `INTEGRITY` hay `NOISE` chỉ vì phần rút gọn hiển thị; "
         "hãy đánh giá dựa trên cấu trúc thực tế và dữ liệu hàng `<td>` được cung cấp.\n"
@@ -817,15 +849,20 @@ async def llm_judge_parsing_unit(
     }
 
 
+import threading
+
 _RAPID_OCR_ENGINE = None
+_RAPID_OCR_LOCK = threading.Lock()
 
 
 def _run_rapidocr_sync(img_bytes: bytes) -> str:
     global _RAPID_OCR_ENGINE
-    if _RAPID_OCR_ENGINE is None:
-        from rapidocr_onnxruntime import RapidOCR
-        _RAPID_OCR_ENGINE = RapidOCR()
-    res, _ = _RAPID_OCR_ENGINE(img_bytes)
+    with _RAPID_OCR_LOCK:
+        if _RAPID_OCR_ENGINE is None:
+            from rapidocr_onnxruntime import RapidOCR
+            _RAPID_OCR_ENGINE = RapidOCR()
+        engine = _RAPID_OCR_ENGINE
+    res, _ = engine(img_bytes)
     if not res:
         return ""
     return "\n".join(str(item[1]).strip() for item in res if len(item) >= 2 and str(item[1]).strip())
@@ -842,7 +879,9 @@ async def local_ocr_with_vietnamese_restore(
     Runs local RapidOCR (0 API cost, 0 RECITATION filter, exact numbers) and then
     restores Vietnamese diacritics & word spacing using the configured text LLM (e.g. DeepSeek).
     """
-    import asyncio
+    from database import get_bool_setting
+    if get_bool_setting("demo_mode", False):
+        raise LLMError("Demo mode đang bật — đã chặn gọi OCR/LLM API.")
     raw_ocr = await asyncio.to_thread(_run_rapidocr_sync, img_bytes)
     if not raw_ocr.strip():
         raise LLMError("RapidOCR local không nhận diện được chữ trên ảnh.")
@@ -899,6 +938,9 @@ async def llm_ocr_image(
     timeout: float = 60.0,
 ) -> str:
     """Calls an OpenAI-compatible Vision LLM to transcribe a scanned PDF page into clean Vietnamese text."""
+    from database import get_bool_setting
+    if get_bool_setting("demo_mode", False):
+        raise LLMError("Demo mode đang bật — đã chặn gọi Vision LLM API.")
     b64 = base64.b64encode(img_bytes).decode("ascii")
     mime = _detect_image_mime(img_bytes)
     url = f"{base_url.rstrip('/')}/chat/completions"
@@ -931,17 +973,29 @@ async def llm_ocr_image(
 
     client = get_shared_http_client()
     last_resp = None
+    last_exc: Optional[Exception] = None
     for attempt in range(4):
-        r = await client.post(url, headers=headers, json=body, timeout=timeout)
-        last_resp = r
-        if r.status_code == 429 and attempt < 3:
-            await asyncio.sleep(1.5 * (2 ** attempt))
-            continue
-        break
-    assert last_resp is not None
+        try:
+            r = await client.post(url, headers=headers, json=body, timeout=timeout)
+            last_resp = r
+            if r.status_code in (429, 502, 503, 504) and attempt < 3:
+                await asyncio.sleep(1.5 * (2 ** attempt))
+                continue
+            break
+        except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            last_exc = exc
+            if attempt < 3:
+                await asyncio.sleep(1.5 * (2 ** attempt))
+                continue
+            raise LLMError(f"Lỗi kết nối LLM: {exc}")
+    if last_resp is None:
+        raise LLMError(f"Không kết nối được LLM: {last_exc}")
     if last_resp.status_code >= 400:
         raise LLMError(f"HTTP {last_resp.status_code}: {last_resp.text[:360]}")
-    payload = last_resp.json()
+    try:
+        payload = last_resp.json()
+    except Exception:
+        raise LLMError(f"LLM trả về dữ liệu không phải JSON: {last_resp.text[:240]}")
     choices = payload.get("choices") or []
     if not choices:
         raise LLMError("Vision LLM trả về phản hồi rỗng.")
@@ -968,6 +1022,9 @@ async def llm_ocr_images_batch(
     """
     if not pages:
         return {}
+    from database import get_bool_setting
+    if get_bool_setting("demo_mode", False):
+        raise LLMError("Demo mode đang bật — đã chặn gọi Vision LLM API.")
     if len(pages) == 1:
         uid, img_b = pages[0]
         return {uid: await llm_ocr_image(base_url, api_key, model, img_b, timeout=timeout)}
@@ -1012,17 +1069,29 @@ async def llm_ocr_images_batch(
 
     client = get_shared_http_client()
     last_resp = None
+    last_exc: Optional[Exception] = None
     for attempt in range(4):
-        r = await client.post(url, headers=headers, json=body, timeout=timeout)
-        last_resp = r
-        if r.status_code == 429 and attempt < 3:
-            await asyncio.sleep(1.5 * (2 ** attempt))
-            continue
-        break
-    assert last_resp is not None
+        try:
+            r = await client.post(url, headers=headers, json=body, timeout=timeout)
+            last_resp = r
+            if r.status_code in (429, 502, 503, 504) and attempt < 3:
+                await asyncio.sleep(1.5 * (2 ** attempt))
+                continue
+            break
+        except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            last_exc = exc
+            if attempt < 3:
+                await asyncio.sleep(1.5 * (2 ** attempt))
+                continue
+            raise LLMError(f"Lỗi kết nối LLM: {exc}")
+    if last_resp is None:
+        raise LLMError(f"Không kết nối được LLM: {last_exc}")
     if last_resp.status_code >= 400:
         raise LLMError(f"HTTP {last_resp.status_code}: {last_resp.text[:360]}")
-    payload = last_resp.json()
+    try:
+        payload = last_resp.json()
+    except Exception:
+        raise LLMError(f"LLM trả về dữ liệu không phải JSON: {last_resp.text[:240]}")
     choices = payload.get("choices") or []
     if not choices:
         raise LLMError("Vision LLM trả về phản hồi rỗng.")

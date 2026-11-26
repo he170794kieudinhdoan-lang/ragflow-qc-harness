@@ -264,15 +264,15 @@ export const GoldenTableView: React.FC<Props> = ({
                     <div>{tc.source_file || '—'}</div>
                     {tc.notes && <div className="text-[10px] text-[#a1a1aa] mt-0.5">{tc.notes}</div>}
                   </td>
-                  <td
-                    className={`${cellBorder} px-2 py-2 text-center align-top`}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onDeleteTestcase(tc);
-                    }}
-                  >
+                  <td className={`${cellBorder} px-2 py-2 text-center align-top`}>
                     <button
                       type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (window.confirm(`Xóa câu hỏi ${tc.tc_code}?`)) {
+                          onDeleteTestcase(tc);
+                        }
+                      }}
                       className="p-1 text-[#a1a1aa] hover:text-[#b91c1c] rounded hover:bg-[#fef2f2]"
                       title={`Xóa ${tc.tc_code}`}
                     >

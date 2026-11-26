@@ -8,17 +8,40 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from database import UPLOAD_DIR, get_db, get_setting, repair_chunk_document_links, utc_now
+from database import UPLOAD_DIR, get_bool_setting, get_db, get_setting, repair_chunk_document_links, utc_now
 from ragflow_client import RAGFlowClient, RAGFlowError
 from llm_client import LLMError, llm_judge_parsing_unit, llm_ocr_image, llm_ocr_images_batch, local_ocr_with_vietnamese_restore
 from metrics import align_unit_to_chunks, compute_parsing_metrics, extract_best_aligned_span, extract_best_aligned_span_with_stitching, nfc, normalize_text
 from extractor import extract_document_units
+from progress_tracker import progress_inc, progress_stage, progress_start
 from unit_sync import UNIT_SYNC_STATUS, get_unit_sync_status, realign_units, units_need_realign
 
 router = APIRouter(prefix="/api/parsing", tags=["parsing"])
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=512)
+def _cached_alignment_impl(
+    source_text: str,
+    chunk_content: str,
+    prev_chunk_content: str,
+    prev_chunk_index: Optional[int],
+    next_chunk_content: str,
+    next_chunk_index: Optional[int],
+    unit_type: str,
+    format_group: str,
+):
+    return extract_best_aligned_span_with_stitching(
+        source_text,
+        chunk_content,
+        prev_chunk_content=prev_chunk_content,
+        prev_chunk_index=prev_chunk_index,
+        next_chunk_content=next_chunk_content,
+        next_chunk_index=next_chunk_index,
+        unit_type=unit_type,
+        format_group=format_group,
+    )
+
+
 def _cached_alignment(
     source_text: str,
     chunk_content: str,
@@ -29,34 +52,51 @@ def _cached_alignment(
     unit_type: str,
     format_group: str,
 ):
-    # Cap huge source/chunk strings (e.g. 50k-char Excel sheets) so O(N*M)
-    # partial_ratio_alignment stays fast (<1s for 400+ units), while next_chunk_content
-    # carries a continuous multi-chunk window up to 6k chars.
-    return extract_best_aligned_span_with_stitching(
+    # Slice BEFORE entering lru_cache so huge 50k-char Excel/PDF strings are never retained as cache keys.
+    return _cached_alignment_impl(
         source_text[:4000],
         chunk_content[:6000],
-        prev_chunk_content=prev_chunk_content[:3000],
-        prev_chunk_index=prev_chunk_index,
-        next_chunk_content=next_chunk_content[:6000],
-        next_chunk_index=next_chunk_index,
-        unit_type=unit_type,
-        format_group=format_group,
+        prev_chunk_content[:3000],
+        prev_chunk_index,
+        next_chunk_content[:6000],
+        next_chunk_index,
+        unit_type,
+        format_group,
     )
 
 
-@lru_cache(maxsize=4096)
-def _cached_single_alignment(
+@lru_cache(maxsize=512)
+def _cached_single_alignment_impl(
     source_text: str,
     chunk_content: str,
     unit_type: str,
     format_group: str,
 ):
     return extract_best_aligned_span(
-        source_text[:4000],
-        chunk_content[:6000],
+        source_text,
+        chunk_content,
         unit_type=unit_type,
         format_group=format_group,
     )
+
+
+def _cached_single_alignment(
+    source_text: str,
+    chunk_content: str,
+    unit_type: str,
+    format_group: str,
+):
+    return _cached_single_alignment_impl(
+        source_text[:4000],
+        chunk_content[:6000],
+        unit_type,
+        format_group,
+    )
+
+
+def clear_alignment_cache() -> None:
+    _cached_alignment_impl.cache_clear()
+    _cached_single_alignment_impl.cache_clear()
 
 
 class ParsingUnitCreate(BaseModel):
@@ -91,9 +131,6 @@ def list_parsing_units(run_id: int, document_id: Optional[int] = None):
             params.append(document_id)
         q += " ORDER BY d.doc_code, pu.unit_index"
         rows = conn.execute(q, params).fetchall()
-
-        # Self-heal orphan chunk document_id links before building chunk_map
-        repair_chunk_document_links(conn)
 
         # Fetch chunks map for quick side-by-side display + neighbor lookup for cross-chunk stitching
         crows = conn.execute(
@@ -206,6 +243,20 @@ def create_parsing_unit(run_id: int, payload: ParsingUnitCreate):
 @router.post("/runs/{run_id}/re-extract")
 async def re_extract_run_units(run_id: int, max_units: int = 25):
     """Re-extracts parsing_units for all documents in `run_id` using natural section grouping."""
+    if get_bool_setting("demo_mode", False):
+        await asyncio.sleep(2.4)
+        from demo_cloner import ensure_demo_parsing
+        docs_cnt, tot, p_cnt, f_cnt = ensure_demo_parsing(run_id)
+        return {
+            "ok": True,
+            "documents": docs_cnt,
+            "extracted_units": tot,
+            "max_units": max_units,
+            "llm_judged": tot,
+            "llm_pass": p_cnt,
+            "llm_fail": f_cnt,
+            "demo": True,
+        }
     max_units = max(1, min(max_units, 500))
     with get_db() as conn:
         docs = conn.execute(
@@ -219,12 +270,15 @@ async def re_extract_run_units(run_id: int, max_units: int = 25):
             (run_id,),
         ).fetchall()
     total_extracted = 0
-    for d in docs:
+    progress_start(len(docs), "Đang tách đoạn từ tài liệu gốc", f"{len(docs)} tài liệu")
+    for idx, d in enumerate(docs, start=1):
         try:
             res = await auto_extract_units(run_id, d["id"], max_units=max_units)
             total_extracted += int(res.get("extracted_units", 0))
         except Exception:
             continue
+        finally:
+            progress_inc(1, detail=f"Đã tách {idx}/{len(docs)} tài liệu ({total_extracted} đoạn)")
     # Automatically OCR any pending scanned/image units first, then run LLM-as-a-Judge
     await run_batch_vision_ocr_for_run(run_id, update_sync_status=False)
     llm_res = await run_batch_llm_judge_parsing(run_id, only_unrated=True, update_sync_status=False)
@@ -286,9 +340,8 @@ async def auto_extract_units(run_id: int, document_id: int, max_units: int = 25)
         if fp.lower().endswith(".pdf"):
             try:
                 import fitz
-                pdf_tmp = fitz.open(fp)
-                page_count = len(pdf_tmp)
-                pdf_tmp.close()
+                with fitz.open(fp) as pdf_tmp:
+                    page_count = len(pdf_tmp)
             except Exception:
                 pass
 
@@ -299,7 +352,8 @@ async def auto_extract_units(run_id: int, document_id: int, max_units: int = 25)
             )
         downloaded = True
 
-    extracted = extract_document_units(fp, max_units=max_units)
+    extracted = await asyncio.to_thread(extract_document_units, fp, max_units=max_units)
+    clear_alignment_cache()
 
     with get_db() as conn:
         crows = conn.execute(
@@ -395,7 +449,7 @@ def bulk_approve_pass(run_id: int, payload: BulkApprovePayload):
         cur = conn.execute(
             f"""
             UPDATE parsing_units
-            SET verdict = 'PASS', error_codes = '[]', char_error = 0, severity = '', updated_at = ?
+            SET verdict = 'PASS', error_codes = '[]', char_error = 0, fidelity_error = 0, severity = '', judge_source = 'MANUAL', updated_at = ?
             WHERE run_id = ? AND id IN ({allow_ph})
             """,
             [now, run_id, *allowed_ids],
@@ -424,16 +478,19 @@ def bulk_approve_fail(run_id: int, payload: BulkFailPayload):
     with get_db() as conn:
         for item in payload.items:
             has_char_code = any(c in ("P4", "P5", "P6") for c in item.error_codes)
+            has_fid_code = any(c in ("P2", "P7") for c in item.error_codes)
             char_err_flag = 1 if (item.char_error or has_char_code) else 0
+            fid_err_flag = 1 if has_fid_code else 0
             cur = conn.execute(
                 """
                 UPDATE parsing_units
-                SET verdict = 'FAIL', error_codes = ?, char_error = ?, severity = ?, notes = ?, judge_source = 'MANUAL', updated_at = ?
+                SET verdict = 'FAIL', error_codes = ?, char_error = ?, fidelity_error = ?, severity = ?, notes = ?, judge_source = 'MANUAL', updated_at = ?
                 WHERE run_id = ? AND id = ?
                 """,
                 (
                     json.dumps(item.error_codes, ensure_ascii=False),
                     char_err_flag,
+                    fid_err_flag,
                     item.severity,
                     item.notes,
                     now,
@@ -510,17 +567,13 @@ def _render_unit_image_bytes(fp: str, page_num: int, bbox: Optional[tuple] = Non
 
 
 def _get_vision_config() -> tuple:
-    """Returns (base_url, api_key, model) for Vision OCR, preferring dedicated vision_* settings with fallback to llm_*."""
+    """Returns (base_url, api_key, model) for Vision OCR, defaulting to free local RapidOCR when unconfigured."""
     v_model = get_setting("vision_model", "").strip()
     if v_model:
-        v_base = get_setting("vision_base_url", "").strip() or get_setting("llm_base_url", "").strip()
+        v_base = get_setting("vision_base_url", "").strip() or ("local" if v_model.lower() in ("local-rapidocr", "rapidocr") else get_setting("llm_base_url", "").strip())
         v_key = get_setting("vision_api_key", "").strip() or get_setting("llm_api_key", "").strip()
         return v_base, v_key, v_model
-    return (
-        get_setting("llm_base_url", "").strip(),
-        get_setting("llm_api_key", "").strip(),
-        get_setting("llm_model", "").strip(),
-    )
+    return "local", "", "local-rapidocr"
 
 
 async def run_batch_vision_ocr_for_run(run_id: int, update_sync_status: bool = True) -> dict:
@@ -552,6 +605,7 @@ async def run_batch_vision_ocr_for_run(run_id: int, update_sync_status: bool = T
 
     if update_sync_status:
         UNIT_SYNC_STATUS[run_id] = {"running": True, "done": 0, "total": len(targets)}
+    progress_start(len(targets), "Đang chạy Vision OCR ảnh / trang scan", f"0/{len(targets)} đoạn")
 
     sem = asyncio.Semaphore(3)
     done_cnt = 0
@@ -601,13 +655,17 @@ async def run_batch_vision_ocr_for_run(run_id: int, update_sync_status: bool = T
             except Exception as e:
                 # For embedded image/diagram units inside digital PDFs, if RapidOCR finds 0 text boxes
                 # ("không đọc được chữ nào"), it is a purely decorative photo -> auto-drop cleanly.
-                if item.get("unit_type") in ("image", "diagram") and "không đọc được chữ" in str(e).lower():
+                err_low = str(e).lower()
+                if item.get("unit_type") in ("image", "diagram") and (
+                    "không nhận diện được chữ" in err_low or "không đọc được chữ" in err_low
+                ):
                     with get_db() as conn:
                         conn.execute("DELETE FROM parsing_units WHERE id = ?", (item["id"],))
                     dropped_decorative += 1
                 else:
                     fail_cnt += 1
             finally:
+                progress_inc(1)
                 if update_sync_status:
                     st = UNIT_SYNC_STATUS.get(run_id)
                     if st:
@@ -766,10 +824,13 @@ async def vision_ocr_document(run_id: int, document_id: int):
 
     await asyncio.gather(*(_ocr_batch(b) for b in batches))
 
-    # Automatically re-judge the freshly OCR'd units with LLM-as-a-Judge
-    # Automatically OCR any pending scanned/image units first, then run LLM-as-a-Judge
-    await run_batch_vision_ocr_for_run(run_id, update_sync_status=False)
-    llm_res = await run_batch_llm_judge_parsing(run_id, only_unrated=True, update_sync_status=False)
+    # Automatically re-judge ONLY this document's freshly OCR'd units with LLM-as-a-Judge
+    llm_res = await run_batch_llm_judge_parsing(
+        run_id,
+        only_unrated=True,
+        update_sync_status=False,
+        document_id=document_id,
+    )
     return {
         "ok": True,
         "total": len(units),
@@ -849,11 +910,12 @@ def render_pdf_page(document_id: int, page_num: int):
     if not doc["file_path"].lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Chỉ hỗ trợ render ảnh trang cho PDF")
     import fitz
-    pdf = fitz.open(doc["file_path"])
-    idx = max(0, min(page_num - 1, len(pdf) - 1))
-    pix = pdf[idx].get_pixmap(dpi=150)
-    png_bytes = pix.tobytes("png")
-    pdf.close()
+    with fitz.open(doc["file_path"]) as pdf:
+        if len(pdf) == 0:
+            raise HTTPException(status_code=400, detail="File PDF không có trang nào")
+        idx = max(0, min(page_num - 1, len(pdf) - 1))
+        pix = pdf[idx].get_pixmap(dpi=150)
+        png_bytes = pix.tobytes("png")
     return Response(content=png_bytes, media_type="image/png")
 
 
@@ -862,6 +924,7 @@ async def run_batch_llm_judge_parsing(
     only_unrated: bool = True,
     overwrite_manual: bool = False,
     update_sync_status: bool = False,
+    document_id: Optional[int] = None,
 ) -> dict:
     """
     Runs LLM-as-a-Judge across parsing units in `run_id` (concurrently with Semaphore(6)),
@@ -881,18 +944,26 @@ async def run_batch_llm_judge_parsing(
             JOIN documents d ON d.id = pu.document_id
             WHERE pu.run_id = ?
         """
+        q_params: list = [run_id]
+        if document_id is not None:
+            q += " AND pu.document_id = ?"
+            q_params.append(document_id)
         if only_unrated:
             q += " AND pu.verdict = 'UNRATED'"
         elif not overwrite_manual:
             q += " AND COALESCE(pu.judge_source, '') != 'MANUAL'"
         q += " ORDER BY pu.id"
-        units = [dict(r) for r in conn.execute(q, (run_id,)).fetchall()]
+        units = [dict(r) for r in conn.execute(q, q_params).fetchall()]
         chunk_rows = conn.execute(
-            "SELECT ragflow_chunk_id, document_id, chunk_index, content FROM chunks WHERE run_id = ? ORDER BY document_id, chunk_index",
+            "SELECT ragflow_chunk_id, document_id, chunk_index, page_num, content FROM chunks WHERE run_id = ? ORDER BY document_id, chunk_index",
             (run_id,),
         ).fetchall()
         chunk_map = {r["ragflow_chunk_id"]: dict(r) for r in chunk_rows}
         chunks_by_doc_pos = {(r["document_id"], r["chunk_index"]): r["content"] or "" for r in chunk_rows}
+        chunks_by_doc_page: dict = {}
+        for r in chunk_rows:
+            if r["page_num"] and r["content"]:
+                chunks_by_doc_page.setdefault((r["document_id"], r["page_num"]), []).append(r["content"])
 
     targets = [
         u for u in units
@@ -906,15 +977,15 @@ async def run_batch_llm_judge_parsing(
         st = UNIT_SYNC_STATUS.get(run_id)
         if st:
             st["total"] = int(st.get("total", 0)) + len(targets)
+    progress_start(len(targets), "Đang chấm Parsing bằng LLM", f"Model: {llm_model}")
 
-    sem = asyncio.Semaphore(6)
+    sem = asyncio.Semaphore(12)
     updates = []
     pass_cnt = 0
     fail_cnt = 0
     err_cnt = 0
 
-    async def _judge_one(u: dict):
-        nonlocal pass_cnt, fail_cnt, err_cnt
+    def _build_parsed_excerpt(u: dict) -> str:
         src_txt = u.get("source_text") or ""
         utype = u.get("unit_type") or "text"
         fmt_grp = u.get("format_group") or ""
@@ -923,8 +994,6 @@ async def run_batch_llm_judge_parsing(
         except Exception:
             mids = []
 
-        # Guaranteed multi-chunk stitching: if top chunk alone covers < 85% of source_text length
-        # (e.g. a section split across Chunk k and Chunk k+1), align over the full stitched window.
         parsed_txt = ""
         top_chunk = next((chunk_map[cid] for cid in mids if cid in chunk_map), None)
         if top_chunk:
@@ -951,33 +1020,26 @@ async def run_batch_llm_judge_parsing(
             if prev_c or next_c:
                 stitched_window = "\n".join(p for p in (prev_c, top_chunk["content"] or "", next_c) if p)
                 aln_full = _cached_single_alignment(src_txt, stitched_window[:10000], utype, fmt_grp)
-                s_idx = int(aln_full.get("start") or 0)
-                e_idx = int(aln_full.get("end") or 0)
-                if e_idx > s_idx:
-                    pad_start = max(0, s_idx - 250)
-                    pad_end = min(len(stitched_window), e_idx + 250)
-                    cand_full = stitched_window[pad_start:pad_end].strip()
-                    if len(cand_full) >= len(parsed_txt):
-                        parsed_txt = cand_full
+                cand_full = (aln_full.get("matched_excerpt") or "").strip()
+                if len(cand_full) >= len(parsed_txt):
+                    parsed_txt = cand_full
         if not parsed_txt and mids:
             parsed_txt = "\n---\n".join(chunk_map[cid]["content"] for cid in mids if cid in chunk_map)
 
-        # VLM support for image/diagram units: always include chunks on the same page_num
-        # so VLM natural-language descriptions (which may paraphrase OCR labels) are always visible to LLM Judge.
         if utype in ("image", "diagram") and u.get("page_num"):
-            doc_id_u = u["document_id"]
-            pnum_u = u["page_num"]
-            same_page_chunks = [
-                ch["content"]
-                for ch in chunk_map.values()
-                if ch["document_id"] == doc_id_u and ch.get("page_num") == pnum_u and ch.get("content")
-            ]
+            same_page_chunks = chunks_by_doc_page.get((u["document_id"], u["page_num"]), [])
             if same_page_chunks:
                 page_blob = "\n---\n".join(same_page_chunks[:4])
                 if page_blob and page_blob not in parsed_txt:
                     parsed_txt = f"{parsed_txt}\n---\n{page_blob}".strip() if parsed_txt else page_blob
+        return parsed_txt
 
+    async def _judge_one(u: dict):
+        nonlocal pass_cnt, fail_cnt, err_cnt
+        src_txt = u.get("source_text") or ""
+        utype = u.get("unit_type") or "text"
         async with sem:
+            parsed_txt = await asyncio.to_thread(_build_parsed_excerpt, u)
             try:
                 res = await llm_judge_parsing_unit(
                     llm_base,
@@ -1005,6 +1067,7 @@ async def run_batch_llm_judge_parsing(
             except Exception:
                 err_cnt += 1
             finally:
+                progress_inc(1)
                 if update_sync_status:
                     st = UNIT_SYNC_STATUS.get(run_id)
                     if st:
@@ -1035,6 +1098,12 @@ async def run_batch_llm_judge_parsing(
 
 @router.post("/runs/{run_id}/llm-judge")
 async def llm_judge_parsing_endpoint(run_id: int, only_unrated: bool = True, overwrite_manual: bool = False):
+    if get_bool_setting("demo_mode", False):
+        await asyncio.sleep(2.4)
+        from demo_cloner import ensure_demo_parsing
+        _, tot, p_cnt, f_cnt = ensure_demo_parsing(run_id)
+        return {"ok": True, "judged": tot, "pass_count": p_cnt, "fail_count": f_cnt, "failed": 0, "demo": True}
+
     # Ensure any pending scanned/image units are OCR'd first so LLM judges them too
     await run_batch_vision_ocr_for_run(run_id, update_sync_status=False)
     res = await run_batch_llm_judge_parsing(

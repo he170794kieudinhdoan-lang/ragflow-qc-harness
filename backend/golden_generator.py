@@ -195,10 +195,9 @@ def _extract_digital_file_sync(file_path: str) -> Dict[str, Any]:
     sections: List[Dict[str, Any]] = []
 
     if ext == ".pdf":
-        doc = pymupdf.open(file_path)
-        page_count = len(doc)
-        page_texts = [(_clean_text(p.get_text("text")), i + 1) for i, p in enumerate(doc)]
-        doc.close()
+        with pymupdf.open(file_path) as doc:
+            page_count = len(doc)
+            page_texts = [(_clean_text(p.get_text("text")), i + 1) for i, p in enumerate(doc)]
 
         total_chars = sum(len(t) for t, _ in page_texts)
         if total_chars < 150 and page_count > 0:

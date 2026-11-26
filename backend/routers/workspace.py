@@ -83,20 +83,41 @@ async def upload_document(
     run_id: int = Form(0),
 ):
     safe_name = os.path.basename(file.filename or f"{doc_code}.bin")
-    save_path = os.path.join(UPLOAD_DIR, f"{doc_code}_{safe_name}")
     content = await file.read()
-    with open(save_path, "wb") as f:
-        f.write(content)
 
-    page_count = 0
-    if safe_name.lower().endswith(".pdf"):
-        try:
-            import fitz
-            doc = fitz.open(save_path)
-            page_count = len(doc)
-            doc.close()
-        except Exception:
-            page_count = 0
+    with get_db() as conn:
+        effective_code = doc_code.strip()
+        existing_by_code = conn.execute(
+            "SELECT id, filename FROM documents WHERE doc_code = ?", (effective_code,)
+        ).fetchone()
+        if existing_by_code:
+            # Never overwrite an existing document belonging to another run; allocate next free DOCxx
+            belongs_other = conn.execute(
+                "SELECT 1 FROM run_documents WHERE document_id = ? AND (? = 0 OR run_id != ?) LIMIT 1",
+                (existing_by_code["id"], run_id, run_id),
+            ).fetchone()
+            if belongs_other or (existing_by_code["filename"] or "").lower() != safe_name.lower():
+                existing_codes = {r["doc_code"] for r in conn.execute("SELECT doc_code FROM documents").fetchall()}
+                idx = 1
+                while f"DOC{idx:02d}" in existing_codes:
+                    idx += 1
+                effective_code = f"DOC{idx:02d}"
+
+    save_path = os.path.join(UPLOAD_DIR, f"{effective_code}_{safe_name}")
+
+    def _write_and_count_pdf() -> int:
+        with open(save_path, "wb") as f:
+            f.write(content)
+        if safe_name.lower().endswith(".pdf"):
+            try:
+                import fitz
+                with fitz.open(save_path) as doc:
+                    return len(doc)
+            except Exception:
+                return 0
+        return 0
+
+    page_count = await asyncio.to_thread(_write_and_count_pdf)
 
     with get_db() as conn:
         conn.execute(
@@ -115,7 +136,7 @@ async def upload_document(
                 notes=excluded.notes
             """,
             (
-                doc_code.strip(),
+                effective_code,
                 safe_name,
                 format_group,
                 source_url,
@@ -128,7 +149,7 @@ async def upload_document(
                 utc_now(),
             ),
         )
-        row = conn.execute("SELECT * FROM documents WHERE doc_code = ?", (doc_code.strip(),)).fetchone()
+        row = conn.execute("SELECT * FROM documents WHERE doc_code = ?", (effective_code,)).fetchone()
         if run_id:
             conn.execute(
                 """
@@ -165,45 +186,54 @@ async def upload_documents_batch(
     if not files:
         raise HTTPException(status_code=400, detail="Chưa chọn file nào để tải lên.")
 
-    created = []
+    # 1. Allocate doc codes in a fast read transaction (never hold SQLite write lock across await file.read() / PDF parsing!)
     with get_db() as conn:
         existing_codes = {r["doc_code"] for r in conn.execute("SELECT doc_code FROM documents").fetchall()}
-        next_idx = 1
 
-        for file in files:
-            safe_name = os.path.basename(file.filename or f"file_{next_idx}.bin")
-            while f"DOC{next_idx:02d}" in existing_codes:
-                next_idx += 1
-            doc_code = f"DOC{next_idx:02d}"
-            existing_codes.add(doc_code)
+    staged = []
+    next_idx = 1
+    for file in files:
+        safe_name = os.path.basename(file.filename or f"file_{next_idx}.bin")
+        while f"DOC{next_idx:02d}" in existing_codes:
             next_idx += 1
+        doc_code = f"DOC{next_idx:02d}"
+        existing_codes.add(doc_code)
+        next_idx += 1
+        save_path = os.path.join(UPLOAD_DIR, f"{doc_code}_{safe_name}")
+        content = await file.read()
 
-            save_path = os.path.join(UPLOAD_DIR, f"{doc_code}_{safe_name}")
-            content = await file.read()
-            with open(save_path, "wb") as f:
-                f.write(content)
-
-            page_count = 0
-            is_scan = 0
-            if safe_name.lower().endswith(".pdf"):
+        def _save_and_inspect(p: str, raw: bytes, name: str):
+            with open(p, "wb") as f:
+                f.write(raw)
+            pg = 0
+            scan = 0
+            if name.lower().endswith(".pdf"):
                 try:
                     import fitz
-                    doc = fitz.open(save_path)
-                    page_count = len(doc)
-                    total_text_len = sum(len(p.get_text().strip()) for p in doc)
-                    if page_count > 0 and (total_text_len / page_count < 25 or "scan" in safe_name.lower()):
-                        is_scan = 1
-                    doc.close()
+                    with fitz.open(p) as doc:
+                        pg = len(doc)
+                        total_text_len = sum(len(page.get_text().strip()) for page in doc)
+                        if pg > 0 and (total_text_len / pg < 25 or "scan" in name.lower()):
+                            scan = 1
                 except Exception:
-                    page_count = 0
+                    pg = 0
+            return pg, scan
 
-            grp = ("PDF scan / ảnh" if is_scan else _guess_format_group(safe_name)) if (not format_group or format_group == "AUTO") else format_group
+        page_count, is_scan = await asyncio.to_thread(_save_and_inspect, save_path, content, safe_name)
+        grp = ("PDF scan / ảnh" if is_scan else _guess_format_group(safe_name)) if (not format_group or format_group == "AUTO") else format_group
+        staged.append((doc_code, safe_name, grp, save_path, page_count, is_scan))
+
+    # 2. Persist all metadata rows in a single fast SQLite transaction
+    created = []
+    now = utc_now()
+    with get_db() as conn:
+        for doc_code, safe_name, grp, save_path, page_count, is_scan in staged:
             conn.execute(
                 """
                 INSERT INTO documents (doc_code, filename, format_group, source_url, file_path, page_count, is_scan, created_at)
                 VALUES (?, ?, ?, '', ?, ?, ?, ?)
                 """,
-                (doc_code, safe_name, grp, save_path, page_count, is_scan, utc_now()),
+                (doc_code, safe_name, grp, save_path, page_count, is_scan, now),
             )
             row = conn.execute("SELECT * FROM documents WHERE doc_code = ?", (doc_code,)).fetchone()
             if run_id:
@@ -215,7 +245,7 @@ async def upload_documents_batch(
                     VALUES (?, ?, '', 'UNSTART', 0, 0, 0, 0, '[]', ?)
                     ON CONFLICT(run_id, document_id) DO NOTHING
                     """,
-                    (run_id, row["id"], utc_now()),
+                    (run_id, row["id"], now),
                 )
             created.append(dict(row))
 
@@ -252,6 +282,10 @@ def delete_document(doc_id: int, run_id: Optional[int] = None):
                 "DELETE FROM chunks WHERE run_id = ? AND document_id = ?",
                 (run_id, doc_id),
             )
+            conn.execute(
+                "DELETE FROM parsing_units WHERE run_id = ? AND document_id = ?",
+                (run_id, doc_id),
+            )
             still_linked = conn.execute(
                 "SELECT COUNT(*) FROM run_documents WHERE document_id = ?", (doc_id,)
             ).fetchone()[0]
@@ -261,7 +295,8 @@ def delete_document(doc_id: int, run_id: Optional[int] = None):
             if still_linked == 0 and still_chunked == 0:
                 conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
         else:
-            # Global removal: drop chunks first so they don't become orphans.
+            # Global removal: drop chunks & parsing_units first so they don't become orphans.
+            conn.execute("DELETE FROM parsing_units WHERE document_id = ?", (doc_id,))
             conn.execute("DELETE FROM chunks WHERE document_id = ?", (doc_id,))
             conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
     return {"ok": True}
@@ -273,6 +308,7 @@ def clear_documents(synced_only: bool = False, run_id: Optional[int] = None):
         if run_id is not None:
             conn.execute("DELETE FROM run_documents WHERE run_id = ?", (run_id,))
             conn.execute("DELETE FROM chunks WHERE run_id = ?", (run_id,))
+            conn.execute("DELETE FROM parsing_units WHERE run_id = ?", (run_id,))
             conn.execute(
                 """
                 DELETE FROM documents
@@ -306,15 +342,21 @@ def list_runs():
             ).fetchall()
         else:
             rows = conn.execute("SELECT * FROM runs ORDER BY is_baseline DESC, id DESC").fetchall()
+        chunk_counts = {
+            r["run_id"]: r["cnt"]
+            for r in conn.execute("SELECT run_id, COUNT(*) AS cnt FROM chunks GROUP BY run_id").fetchall()
+        }
+        doc_counts = {
+            r["run_id"]: r["cnt"]
+            for r in conn.execute("SELECT run_id, COUNT(*) AS cnt FROM run_documents GROUP BY run_id").fetchall()
+        }
         out = []
         for r in rows:
             d = dict(r)
             d["parser_config"] = json.loads(d["parser_config"] or "{}")
             d["retrieval_config"] = json.loads(d["retrieval_config"] or "{}")
-            chunk_cnt = conn.execute("SELECT COUNT(*) FROM chunks WHERE run_id = ?", (r["id"],)).fetchone()[0]
-            doc_cnt = conn.execute("SELECT COUNT(*) FROM run_documents WHERE run_id = ?", (r["id"],)).fetchone()[0]
-            d["chunk_count"] = chunk_cnt
-            d["doc_count"] = doc_cnt
+            d["chunk_count"] = chunk_counts.get(r["id"], 0)
+            d["doc_count"] = doc_counts.get(r["id"], 0)
             out.append(d)
         return out
 
@@ -478,6 +520,22 @@ async def update_run_parser_config(run_id: int, payload: RunParserConfigUpdate):
 @router.delete("/runs/{run_id}")
 def delete_run(run_id: int):
     with get_db() as conn:
+        # Preserve Golden testcases if surviving cloned runs still share this run as their golden_source_run_id
+        clones = conn.execute(
+            "SELECT id FROM runs WHERE golden_source_run_id = ? AND id != ? ORDER BY id ASC",
+            (run_id, run_id),
+        ).fetchall()
+        if clones:
+            new_owner = clones[0]["id"]
+            conn.execute("UPDATE golden_testcases SET run_id = ? WHERE run_id = ?", (new_owner, run_id))
+            conn.execute("UPDATE runs SET golden_source_run_id = NULL WHERE id = ?", (new_owner,))
+            conn.execute("UPDATE runs SET golden_source_run_id = ? WHERE golden_source_run_id = ?", (new_owner, run_id))
+        else:
+            conn.execute("DELETE FROM golden_testcases WHERE run_id = ?", (run_id,))
+
+        conn.execute("DELETE FROM ai_advisor_reports WHERE run_id = ?", (run_id,))
+        conn.execute("DELETE FROM auto_tune_reports WHERE run_id = ?", (run_id,))
+        conn.execute("DELETE FROM pipeline_jobs WHERE source_run_id = ? OR target_run_id = ?", (run_id, run_id))
         conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
         conn.execute(
             """
@@ -486,6 +544,16 @@ def delete_run(run_id: int):
               AND id NOT IN (SELECT DISTINCT document_id FROM run_documents)
             """
         )
+    try:
+        from unit_sync import UNIT_SYNC_STATUS
+        UNIT_SYNC_STATUS.pop(run_id, None)
+    except Exception:
+        pass
+    try:
+        from routers.parsing import clear_alignment_cache
+        clear_alignment_cache()
+    except Exception:
+        pass
     return {"ok": True}
 
 
@@ -724,13 +792,6 @@ async def _bg_ensure_units(
 
     try:
         await asyncio.gather(*(_run_one(item) for item in docs_for_units))
-        # Auto OCR any scanned/image units (RapidOCR local + LLM restore or Vision LLM), then judge all with LLM
-        try:
-            from routers.parsing import run_batch_llm_judge_parsing, run_batch_vision_ocr_for_run
-            await run_batch_vision_ocr_for_run(run_id, update_sync_status=False)
-            await run_batch_llm_judge_parsing(run_id, only_unrated=True, update_sync_status=True)
-        except Exception as e:
-            logger.warning("Auto OCR + LLM Parsing judge after sync failed for run %s: %s", run_id, e)
     finally:
         st = UNIT_SYNC_STATUS.get(run_id)
         if st:
@@ -755,6 +816,20 @@ async def sync_run_from_ragflow(
       where an old document deletion had set chunks.document_id = NULL.
     - Existing parsing units are re-aligned against the fresh chunks (verdicts are preserved).
     """
+    if get_bool_setting("demo_mode", False):
+        await asyncio.sleep(1.4)
+        from demo_cloner import ensure_demo_sync
+        doc_cnt, chunk_cnt = ensure_demo_sync(run_id)
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "synced_documents": doc_cnt,
+            "synced_chunks": chunk_cnt,
+            "documents_synced": doc_cnt,
+            "chunks_synced": chunk_cnt,
+            "demo": True,
+        }
+
     client = _get_client()
     with get_db() as conn:
         run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
