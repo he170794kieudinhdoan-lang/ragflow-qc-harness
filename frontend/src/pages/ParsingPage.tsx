@@ -3,6 +3,7 @@ import { diffChars, diffWordsWithSpace } from 'diff';
 import { AlertCircle, ArrowRight, BarChart3, CheckCheck, ChevronLeft, ChevronRight, FileText, GripHorizontal, Image as ImageIcon, Layers, LayoutGrid, List, ListOrdered, Loader2, Lock, Maximize2, Minimize2, Plus, Sparkles, Table2, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { api } from '../api/client';
+import { FloatingProgressOverlay, useProgressTask } from '../components/FloatingProgressOverlay';
 import { ParsingTableView } from '../components/ParsingTableView';
 import { DocumentItem, ErrorCodeDef, ParsingUnit, RunItem } from '../types';
 
@@ -51,12 +52,20 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
   const [batchOcrRunning, setBatchOcrRunning] = useState(false);
   const [samplePerDoc, setSamplePerDoc] = useState<number>(25);
   const [reExtracting, setReExtracting] = useState(false);
+  const { progress: taskProgress, runTracked } = useProgressTask();
 
   const handleReExtract = async () => {
     if (!activeRun || reExtracting) return;
     setReExtracting(true);
     try {
-      const res = await api.reExtractRunUnits(activeRun.id, samplePerDoc);
+      const res = await runTracked(
+        {
+          title: 'Đang tách lại đoạn đối chiếu',
+          subtitle: `Tối đa ${samplePerDoc} đoạn/file · Tự động đối chiếu & chấm LLM`,
+          estimatedMs: 18000,
+        },
+        () => api.reExtractRunUnits(activeRun.id, samplePerDoc)
+      );
       await load();
       toast.success(`Đã tách lại ${res.extracted_units} đoạn (${samplePerDoc} đoạn/file).`);
     } catch (e: any) {
@@ -70,7 +79,14 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
     if (!selectedUnit || ocrRunning) return;
     setOcrRunning(true);
     try {
-      await api.visionOcrUnit(selectedUnit.id);
+      await runTracked(
+        {
+          title: 'Đang chạy Vision OCR',
+          subtitle: `${selectedUnit.doc_code} · Trang ${selectedUnit.page_num}`,
+          estimatedMs: 8000,
+        },
+        () => api.visionOcrUnit(selectedUnit.id)
+      );
       await load();
       toast.success(`Đã OCR bản chuẩn cho ${selectedUnit.doc_code} trang ${selectedUnit.page_num}.`);
     } catch (e: any) {
@@ -88,7 +104,14 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
     if (!activeRun || batchOcrRunning || pendingOcrCount === 0) return;
     setBatchOcrRunning(true);
     try {
-      const res = await api.batchVisionOcr(activeRun.id);
+      const res = await runTracked(
+        {
+          title: 'Đang chạy Vision OCR hàng loạt',
+          subtitle: `${pendingOcrCount} trang scan / hình ảnh chưa có bản chuẩn`,
+          estimatedMs: 20000,
+        },
+        () => api.batchVisionOcr(activeRun.id)
+      );
       await load();
       toast.success(`Vision OCR hoàn tất: ${res.done}/${res.total} trang/ảnh${res.failed ? ` (${res.failed} lỗi)` : ''}.`);
     } catch (e: any) {
@@ -105,7 +128,14 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
     if (!activeRun || docOcrRunningId !== null) return;
     setDocOcrRunningId(documentId);
     try {
-      const res = await api.visionOcrDocument(activeRun.id, documentId);
+      const res = await runTracked(
+        {
+          title: `Đang Vision Enhancement (${docCode})`,
+          subtitle: 'Đọc ảnh trang gốc, đối chiếu lại chunk & chấm LLM',
+          estimatedMs: 18000,
+        },
+        () => api.visionOcrDocument(activeRun.id, documentId)
+      );
       await load();
       if (res.done > 0) {
         toast.success(
@@ -125,7 +155,14 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
     if (!activeRun || llmJudging) return;
     setLlmJudging(true);
     try {
-      const res = await api.llmJudgeParsing(activeRun.id, onlyUnrated);
+      const res = await runTracked(
+        {
+          title: 'Đang chấm Parsing bằng LLM',
+          subtitle: onlyUnrated ? 'Chấm các đoạn chưa đánh giá' : 'Chấm lại toàn bộ đoạn tự động',
+          estimatedMs: 16000,
+        },
+        () => api.llmJudgeParsing(activeRun.id, onlyUnrated)
+      );
       await load();
       toast.success(
         `LLM (${res.model || 'AI'}) đã chấm ${res.judged} đoạn Parsing: ${res.pass_count} Đạt · ${res.fail_count} Không đạt.`
@@ -253,15 +290,22 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
     setNotes(u.notes || '');
   };
 
+  const [addingUnit, setAddingUnit] = useState(false);
+  const loadSeqRef = useRef(0);
+  const bgSyncBusyRef = useRef(false);
+
   const load = async (advanceFromId?: number, silent = false) => {
     if (!activeRun) return;
+    const seq = ++loadSeqRef.current;
+    const targetRunId = activeRun.id;
     if (!silent) setLoading(true);
     try {
       const [dRes, uRes, mRes] = await Promise.all([
-        api.listDocuments(activeRun.id),
-        api.listParsingUnits(activeRun.id),
-        api.getParsingMetrics(activeRun.id),
+        api.listDocuments(targetRunId),
+        api.listParsingUnits(targetRunId),
+        api.getParsingMetrics(targetRunId),
       ]);
+      if (seq !== loadSeqRef.current) return;
       setDocs(dRes);
       setUnits(uRes);
       setMetrics(mRes);
@@ -281,9 +325,9 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
         setSelectedUnit(null);
       }
     } catch (e: any) {
-      if (!silent) toast.error(`Không tải được dữ liệu Parsing: ${e?.message || e}`);
+      if (!silent && seq === loadSeqRef.current) toast.error(`Không tải được dữ liệu Parsing: ${e?.message || e}`);
     } finally {
-      if (!silent) setLoading(false);
+      if (!silent && seq === loadSeqRef.current) setLoading(false);
     }
   };
 
@@ -292,20 +336,28 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
     setSelectedUnit(null);
     setHoveredUnit(null);
     load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeRun?.id]);
 
-  // Auto-poll every 2.5s while background unit extraction from Step 1 sync is still running
+  // Auto-poll every 2.5s while background unit extraction from Step 1 sync is still running (paused when hidden)
   const bgSyncing = Boolean(metrics?.unit_sync_status?.running);
   const bgSyncDone = Number(metrics?.unit_sync_status?.done || 0);
   const bgSyncTotal = Number(metrics?.unit_sync_status?.total || 0);
 
   useEffect(() => {
-    if (!activeRun?.id || !bgSyncing) return;
-    const timer = window.setInterval(() => {
-      load(undefined, true);
+    if (!activeRun?.id || !bgSyncing || !isActive) return;
+    const timer = window.setInterval(async () => {
+      if (bgSyncBusyRef.current || document.hidden) return;
+      bgSyncBusyRef.current = true;
+      try {
+        await load(undefined, true);
+      } finally {
+        bgSyncBusyRef.current = false;
+      }
     }, 2500);
     return () => window.clearInterval(timer);
-  }, [activeRun?.id, bgSyncing]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeRun?.id, bgSyncing, isActive]);
 
   const handleScore = async (verdict: 'PASS' | 'PARTIAL' | 'FAIL') => {
     if (!selectedUnit || scoring) return;
@@ -467,7 +519,7 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
   };
 
   useEffect(() => {
-    if (!isActive) return;
+    if (!isActive || showAdd) return;
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
@@ -493,7 +545,7 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [isActive, selectedUnit, filteredUnits, errCodes, charErr, notes, scoring, showErrPopover]);
+  }, [isActive, showAdd, selectedUnit, filteredUnits, errCodes, charErr, fidErr, notes, scoring, showErrPopover]);
 
   if (!activeRun) {
     return <div className="p-8 text-sm text-[#71717a]">Hãy chọn hoặc tạo một phiên kiểm thử trước.</div>;
@@ -502,7 +554,8 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
   const handleAddUnit = async (e: React.FormEvent) => {
     e.preventDefault();
     const docId = selectedDocId || docs[0]?.id;
-    if (!docId || !newText.trim()) return;
+    if (!docId || !newText.trim() || addingUnit) return;
+    setAddingUnit(true);
     try {
       await api.createParsingUnit(activeRun.id, {
         document_id: docId,
@@ -518,6 +571,8 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
       toast.success('Đã thêm đoạn đối chiếu.');
     } catch (err: any) {
       toast.error(err.message);
+    } finally {
+      setAddingUnit(false);
     }
   };
 
@@ -783,7 +838,7 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
   );
 
   return (
-    <div className="h-[calc(100dvh-48px)] flex flex-col bg-white">
+    <div className="h-full flex flex-col bg-white">
       {/* Sub-header Toolbar */}
       <div className="px-5 py-1.5 border-b border-[#e8e8e6] bg-[#fafaf9] flex flex-wrap items-center justify-between gap-2 shrink-0">
         <div className="flex flex-wrap items-center gap-1.5">
@@ -834,7 +889,6 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
             <Plus className="size-3.5" />
             Thêm đoạn
           </button>
-          {loading && <Loader2 className="size-3.5 animate-spin text-[#71717a]" />}
         </div>
 
         <div className="flex flex-wrap items-center gap-1.5 text-xs text-[#52525b]">
@@ -1358,7 +1412,8 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
                         {hotspots.map((d, idx) => {
                           const errCnt = d.fail + d.partial;
                           const errRate = Math.round((errCnt / Math.max(d.total, 1)) * 100);
-                          const cleanName = (d.filename || '').replace(new RegExp(`^${d.doc_code}[_\\-\\s]*`, 'i'), '');
+                          const escCode = (d.doc_code || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                          const cleanName = escCode ? (d.filename || '').replace(new RegExp(`^${escCode}[_\\-\\s]*`, 'i'), '') : d.filename || '';
                           return (
                             <button
                               key={d.doc_code}
@@ -1409,7 +1464,7 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
 
       {/* Fullscreen Scoring Mode — opened via "Chế độ chấm" button or clicking a square */}
       {selectedUnit && (
-        <div className="fixed inset-0 z-30 flex flex-col bg-[#fefefe]">
+        <div className="fixed inset-0 z-40 flex flex-col bg-[#fefefe]">
           <div className="px-5 py-2 border-b border-[#ededeb] bg-[#fafaf9] flex items-center justify-between text-xs shrink-0">
             <div className="flex items-center gap-2.5">
               <div className="inline-flex items-center border border-[#e4e4e2] bg-white">
@@ -1664,7 +1719,10 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
                     >
                       {groupsList.map((grp) => {
                         const doneCnt = grp.items.filter((u) => u.verdict !== 'UNRATED').length;
-                        const cleanName = (grp.filename || '').replace(new RegExp(`^${grp.doc_code}[_\\-\\s]*`, 'i'), '');
+                        const escGrpCode = (grp.doc_code || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                        const cleanName = escGrpCode
+                          ? (grp.filename || '').replace(new RegExp(`^${escGrpCode}[_\\-\\s]*`, 'i'), '')
+                          : grp.filename || '';
                         return (
                           <option key={grp.doc_code} value={grp.doc_code}>
                             {grp.doc_code} ({doneCnt}/{grp.items.length}) · {cleanName}
@@ -1912,6 +1970,22 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
           </form>
         </div>
       )}
+
+      <FloatingProgressOverlay
+        state={taskProgress}
+        fallback={
+          loading && units.length === 0
+            ? {
+                title: 'Đang tải Parsing',
+              }
+            : bulkApproving
+            ? {
+                title: 'Đang duyệt hàng loạt',
+              }
+            : null
+        }
+        moduleLabel="PARSING QC"
+      />
     </div>
   );
 };

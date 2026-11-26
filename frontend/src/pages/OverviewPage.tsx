@@ -11,7 +11,7 @@ import { api } from '../api/client';
 import { AnimatedNumber } from '../components/AnimatedNumber';
 import { RunItem } from '../types';
 
-export type WorkflowModeId = 'full_pipeline' | 'retrieval_only';
+export type WorkflowModeId = 'full_pipeline' | 'studio';
 
 export interface WorkflowModeDef {
   id: WorkflowModeId;
@@ -28,15 +28,15 @@ export const WORKFLOW_MODES: WorkflowModeDef[] = [
     tag: 'Khuyên dùng · 3 Tầng',
     title: 'Kiểm thử toàn luồng 3 tầng (A → Z)',
     desc: 'Quy trình chuẩn đầy đủ: chọn Dataset & đồng bộ chunks, chấm Parsing (10+ file đại diện), chấm Chunking (5 chunk/file), chạy Golden Dataset Retrieval và so sánh A/B đa cấu hình.',
-    stepsLabel: 'Dataset → Parsing → Chunking → Retrieval → A/B & Bug Report',
+    stepsLabel: 'Dataset → Parsing → Chunking → Retrieval & So sánh',
     primary: true,
   },
   {
-    id: 'retrieval_only',
-    tag: 'Chế độ nhanh',
-    title: 'Chấm nhanh Retrieval & So sánh A/B',
-    desc: 'Đi thẳng vào Golden Dataset (40 testcase), chạy batch /api/v1/retrieval top-10, chấm Relevancy và đối chiếu bảng đa cấu hình / Top 5 Bug Report.',
-    stepsLabel: 'Golden & Retrieval → So sánh đa Run & Bug Report',
+    id: 'studio',
+    tag: 'Studio · A ↔ B',
+    title: 'Experiment Studio · Tối ưu & Clone',
+    desc: 'Không gian trực quan 2 khối: xem AI đề xuất sửa cấu hình Baseline, nhân bản sang Dataset mới (Parse + Chunk + Retrieval), tự động chạy toàn luồng và đối chiếu 3 tầng.',
+    stepsLabel: 'Baseline [A] → AI Đề xuất → Clone Dataset [B] → Đối chiếu 3 tầng',
   },
 ];
 
@@ -53,6 +53,15 @@ export const OverviewPage: React.FC<Props> = ({ activeRun, onStartWorkflow }) =>
   const [overview, setOverview] = useState<any>(null);
   const pageRef = useRef<HTMLDivElement>(null);
   const exitingRef = useRef(false);
+  const exitTimerRef = useRef<number | null>(null);
+  const exitTweenRef = useRef<gsap.core.Tween | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (exitTimerRef.current !== null) window.clearTimeout(exitTimerRef.current);
+      exitTweenRef.current?.kill();
+    };
+  }, []);
 
   const handleSelectMode = (mode: WorkflowModeId) => {
     if (exitingRef.current) return;
@@ -62,7 +71,7 @@ export const OverviewPage: React.FC<Props> = ({ activeRun, onStartWorkflow }) =>
     }
     exitingRef.current = true;
     const targets = pageRef.current.querySelectorAll('.gsap-exit');
-    gsap.to(targets, {
+    exitTweenRef.current = gsap.to(targets, {
       x: 72,
       opacity: 0,
       duration: 0.36,
@@ -70,17 +79,26 @@ export const OverviewPage: React.FC<Props> = ({ activeRun, onStartWorkflow }) =>
       ease: 'power3.in',
     });
     // Start loading curtain slightly before exit finishes so there is zero white/empty gap
-    window.setTimeout(() => {
+    exitTimerRef.current = window.setTimeout(() => {
       onStartWorkflow(mode);
     }, 240);
   };
 
   useEffect(() => {
+    let cancelled = false;
     if (!activeRun) {
       setOverview(null);
       return;
     }
-    api.getOverview(activeRun.id).then(setOverview).catch(() => {});
+    api
+      .getOverview(activeRun.id)
+      .then((data) => {
+        if (!cancelled) setOverview(data);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, [activeRun?.id]);
 
   // Play staggered entrance ONLY on initial page load; skip when navigating back to Homepage
@@ -135,13 +153,20 @@ export const OverviewPage: React.FC<Props> = ({ activeRun, onStartWorkflow }) =>
       );
     }
     return (
-      <svg viewBox="0 0 96 64" className="w-[88px] h-[60px] shrink-0" fill="none" strokeWidth="1.25">
-        <rect x="6" y="10" width="52" height="11" rx="2" stroke="#027a42" fill="#03aa5c" fillOpacity="0.15" />
-        <rect x="6" y="26" width="42" height="11" rx="2" stroke="#141414" fill="#fefefe" />
-        <rect x="6" y="42" width="30" height="11" rx="2" stroke="#94a3b8" />
-        <circle cx="74" cy="24" r="10" stroke="#141414" fill="#fefefe" />
-        <circle cx="74" cy="24" r="4" stroke="#027a42" />
-        <line x1="81" y1="31" x2="89" y2="39" stroke="#141414" strokeWidth="1.6" />
+      <svg viewBox="0 0 112 64" className="w-[104px] h-[60px] shrink-0" fill="none" strokeWidth="1.25">
+        {/* Node A: Baseline */}
+        <rect x="6" y="14" width="34" height="36" rx="5" stroke="#141414" fill="#fefefe" />
+        <rect x="12" y="21" width="16" height="4" rx="1" fill="#141414" />
+        <rect x="12" y="29" width="22" height="3" rx="1" fill="#cbd5e1" />
+        <rect x="12" y="36" width="18" height="3" rx="1" fill="#03aa5c" />
+        {/* Connector pulse */}
+        <path d="M43 32 L69 32" stroke="#027a42" strokeDasharray="3 2.5" />
+        <circle cx="56" cy="32" r="2.6" fill="#03aa5c" />
+        <path d="M65 28.5 L69 32 L65 35.5" stroke="#027a42" strokeLinecap="round" strokeLinejoin="round" />
+        {/* Node B: Clone */}
+        <rect x="72" y="14" width="34" height="36" rx="5" stroke="#03aa5c" strokeDasharray="3 2" fill="#03aa5c" fillOpacity="0.08" />
+        <line x1="89" y1="26" x2="89" y2="38" stroke="#027a42" strokeWidth="1.6" strokeLinecap="round" />
+        <line x1="83" y1="32" x2="95" y2="32" stroke="#027a42" strokeWidth="1.6" strokeLinecap="round" />
       </svg>
     );
   };

@@ -11,8 +11,8 @@ def get_shared_http_client() -> httpx.AsyncClient:
         _SHARED_HTTP_CLIENT = httpx.AsyncClient(
             timeout=60.0,
             limits=httpx.Limits(
-                max_connections=20,
-                max_keepalive_connections=10,
+                max_connections=64,
+                max_keepalive_connections=20,
                 keepalive_expiry=30.0,
             ),
         )
@@ -53,7 +53,13 @@ class RAGFlowClient:
                 f"HTTP {resp.status_code}: {resp.text[:300]}",
                 status_code=resp.status_code,
             )
-        payload = resp.json()
+        try:
+            payload = resp.json()
+        except Exception:
+            raise RAGFlowError(
+                f"Phản hồi không phải JSON từ RAGFlow (HTTP {resp.status_code}): {resp.text[:240]}",
+                status_code=resp.status_code,
+            )
         code = payload.get("code", 0)
         if code != 0:
             raise RAGFlowError(
@@ -165,7 +171,7 @@ class RAGFlowClient:
         try:
             return self._unwrap(r)
         except RAGFlowError as e:
-            if "parser_id" in str(e) or "chunk_method" in str(e):
+            if "parser_id" in str(e) or "chunk_method" in str(e) or "parse_type" in str(e):
                 fallback: Dict[str, Any] = {}
                 if chunk_method:
                     fallback["chunk_method" if "parser_id" in str(e) else "parser_id"] = chunk_method
@@ -334,14 +340,25 @@ class RAGFlowClient:
 
     async def list_all_chunks(self, dataset_id: str, document_id: str) -> List[Dict[str, Any]]:
         all_chunks: List[Dict[str, Any]] = []
+        seen_ids: set = set()
         page = 1
         page_size = 100
-        while True:
+        while page <= 500:
             data = await self.list_chunks(dataset_id, document_id, page=page, page_size=page_size)
             batch = data.get("chunks", [])
             if not batch:
                 break
-            all_chunks.extend(batch)
+            added = 0
+            for ch in batch:
+                cid = str(ch.get("id") or ch.get("chunk_id") or "")
+                if cid and cid in seen_ids:
+                    continue
+                if cid:
+                    seen_ids.add(cid)
+                all_chunks.append(ch)
+                added += 1
+            if added == 0:
+                break
             total = data.get("total", len(all_chunks))
             if len(all_chunks) >= total or len(batch) < page_size:
                 break
@@ -365,7 +382,7 @@ class RAGFlowClient:
         body: Dict[str, Any] = {
             "question": question,
             "dataset_ids": dataset_ids,
-            "top_k": max(top_k, 1024) if rerank_id else top_k,
+            "top_k": top_k,
             "page": page,
             "page_size": page_size,
             "similarity_threshold": similarity_threshold,

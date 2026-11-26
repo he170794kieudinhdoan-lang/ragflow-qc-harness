@@ -1,15 +1,16 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { Suspense, lazy, useEffect, useRef, useState } from 'react';
 import gsap from 'gsap';
 import { Toaster, toast } from 'sonner';
 import {
   ArrowLeft,
+  BookOpen,
   Check,
   CheckCircle2,
   ChevronDown,
   Database,
   FileSearch,
   FlaskConical,
-  GitCompare,
+  Info,
   Layers,
   Lock,
   Search,
@@ -17,20 +18,31 @@ import {
   SlidersHorizontal,
   X,
 } from 'lucide-react';
-import { api } from './api/client';
+import { api, invalidateApiCache } from './api/client';
 import { ErrorCodeDef, RunItem } from './types';
 import { OverviewPage, WORKFLOW_MODES, WorkflowModeId } from './pages/OverviewPage';
-import { WorkspacePage } from './pages/WorkspacePage';
-import { ParsingPage } from './pages/ParsingPage';
-import { ChunkingPage } from './pages/ChunkingPage';
-import { RetrievalPage } from './pages/RetrievalPage';
 import { BrandWordmark } from './components/BrandWordmark';
-import { CompareLabPage } from './pages/CompareLabPage';
-import { OptimizationLabPage } from './pages/OptimizationLabPage';
-import SettingsModal from './components/SettingsModal';
 import { PageLoader } from './components/PageLoader';
+import { ErrorBoundary } from './components/ErrorBoundary';
+import { clearAllAutoTuneCache } from './components/RetrievalAutoTuneView';
 
-type StepId = 'workspace' | 'parsing' | 'chunking' | 'retrieval' | 'compare' | 'optimizer';
+const WorkspacePage = lazy(() => import('./pages/WorkspacePage').then((m) => ({ default: m.WorkspacePage })));
+const ParsingPage = lazy(() => import('./pages/ParsingPage').then((m) => ({ default: m.ParsingPage })));
+const ChunkingPage = lazy(() => import('./pages/ChunkingPage').then((m) => ({ default: m.ChunkingPage })));
+const RetrievalPage = lazy(() => import('./pages/RetrievalPage').then((m) => ({ default: m.RetrievalPage })));
+const OptimizationLabPage = lazy(() =>
+  import('./pages/OptimizationLabPage').then((m) => ({ default: m.OptimizationLabPage }))
+);
+const ExperimentStudioPage = lazy(() =>
+  import('./pages/ExperimentStudioPage').then((m) => ({ default: m.ExperimentStudioPage }))
+);
+const PlatformGuidePage = lazy(() =>
+  import('./pages/PlatformGuidePage').then((m) => ({ default: m.PlatformGuidePage }))
+);
+const SettingsModal = lazy(() => import('./components/SettingsModal'));
+const GlossaryModal = lazy(() => import('./components/GlossaryModal').then((m) => ({ default: m.GlossaryModal })));
+
+type StepId = 'workspace' | 'parsing' | 'chunking' | 'retrieval' | 'optimizer' | 'studio';
 
 interface WorkflowStepDef {
   id: StepId;
@@ -43,14 +55,11 @@ const WORKFLOW_STEPS: Record<WorkflowModeId, WorkflowStepDef[]> = {
     { id: 'workspace', num: '01', label: 'Dataset & Đồng bộ' },
     { id: 'parsing', num: '02', label: 'Parsing' },
     { id: 'chunking', num: '03', label: 'Chunking' },
-    { id: 'retrieval', num: '04', label: 'Golden & Retrieval' },
-    { id: 'compare', num: '05', label: 'So sánh A/B' },
-    { id: 'optimizer', num: '06', label: 'Tối ưu cấu hình' },
+    { id: 'retrieval', num: '04', label: 'Retrieval & So sánh' },
+    { id: 'optimizer', num: '05', label: 'Tối ưu cấu hình' },
   ],
-  retrieval_only: [
-    { id: 'retrieval', num: '01', label: 'Golden & Retrieval' },
-    { id: 'compare', num: '02', label: 'So sánh A/B' },
-    { id: 'optimizer', num: '03', label: 'Tối ưu cấu hình' },
+  studio: [
+    { id: 'studio', num: '01', label: 'Experiment Studio' },
   ],
 };
 
@@ -59,8 +68,8 @@ const MODULE_ICONS: Record<StepId, React.FC<{ className?: string }>> = {
   parsing: FileSearch,
   chunking: Layers,
   retrieval: Search,
-  compare: GitCompare,
   optimizer: SlidersHorizontal,
+  studio: FlaskConical,
 };
 
 export default function App() {
@@ -74,13 +83,16 @@ export default function App() {
   });
   const [tab, setTabState] = useState<string>(() => {
     try {
-      return localStorage.getItem('ragflow_qc_active_tab') || 'overview';
+      const saved = localStorage.getItem('ragflow_qc_active_tab') || 'overview';
+      return saved === 'compare' ? 'retrieval' : saved;
     } catch {
       return 'overview';
     }
   });
   const [parsingProgress, setParsingProgress] = useState<{ rated: number; total: number }>({ rated: 0, total: 0 });
+  const [showGuide, setShowGuide] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
+  const guideButtonRef = useRef<HTMLButtonElement>(null);
   const logoBeamRef = useRef<SVGRectElement>(null);
 
   useEffect(() => {
@@ -134,15 +146,34 @@ export default function App() {
   const startWorkflow = (mode: WorkflowModeId) => {
     const firstStep = WORKFLOW_STEPS[mode][0].id;
     pendingNavRef.current = () => {
+      setShowGuide(false);
       setWorkflowMode(mode);
-      setTab(firstStep);
+      setVisitedTabs([firstStep]);
+      setTabState(firstStep);
+      try {
+        localStorage.setItem('ragflow_qc_active_tab', firstStep);
+      } catch {
+        // ignore
+      }
     };
     setTransitionKey((k) => k + 1);
   };
 
   const goHome = () => {
+    setShowGuide(false);
     setWorkflowMode(null);
-    setTab('overview');
+    setVisitedTabs(['overview']);
+    setTabState('overview');
+    try {
+      localStorage.setItem('ragflow_qc_active_tab', 'overview');
+    } catch {
+      // ignore
+    }
+  };
+
+  const closeGuide = () => {
+    setShowGuide(false);
+    guideButtonRef.current?.focus();
   };
   const [runs, setRuns] = useState<RunItem[]>([]);
   const [activeRun, setActiveRunState] = useState<RunItem | null>(null);
@@ -174,6 +205,7 @@ export default function App() {
 
   // Settings Modal & Session Switcher
   const [showSettings, setShowSettings] = useState(false);
+  const [showGlossary, setShowGlossary] = useState(false);
   const [settingDefaults, setSettingDefaults] = useState<Record<string, string>>({});
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
   const sessionMenuRef = useRef<HTMLDivElement | null>(null);
@@ -209,12 +241,6 @@ export default function App() {
 
   const persistActiveRun = (run: RunItem | null) => {
     setActiveRun(run);
-    try {
-      if (run) localStorage.setItem(ACTIVE_RUN_STORAGE_KEY, String(run.id));
-      else localStorage.removeItem(ACTIVE_RUN_STORAGE_KEY);
-    } catch {
-      /* ignore */
-    }
   };
 
   useEffect(() => {
@@ -224,24 +250,35 @@ export default function App() {
 
   const hasVisited = (id: string) => tab === id || visitedTabs.includes(id);
 
-  const loadRuns = async (preferredRunId?: number) => {
-    const [rList, sRes] = await Promise.all([api.listRuns(), api.getSettings()]);
-    setRuns(rList);
-    setCatalogs(sRes.catalogs || { parsing_errors: [], chunking_errors: [] });
-    const cleanSettings: Record<string, string> = {};
-    for (const [k, v] of Object.entries(sRes.settings || {})) {
-      if (typeof v === 'string') cleanSettings[k] = v;
-    }
-    setSettings((prev) => ({ ...prev, ...cleanSettings }));
-    if (sRes.defaults) setSettingDefaults(sRes.defaults);
-    setHasKey(Boolean(sRes.settings?.has_ragflow_key));
-    const targetId = preferredRunId ?? activeRunIdRef.current ?? Number(localStorage.getItem(ACTIVE_RUN_STORAGE_KEY) || '');
-    if (rList.length > 0) {
-      const keep = targetId ? rList.find((r: RunItem) => r.id === targetId) : null;
-      const fallback = keep || rList.find((r: RunItem) => r.is_baseline) || rList[0];
-      setActiveRun(fallback);
-    } else {
-      setActiveRun(null);
+  const loadRunsSeqRef = useRef(0);
+  const loadRuns = async (preferredRunId?: number): Promise<RunItem[]> => {
+    const seq = ++loadRunsSeqRef.current;
+    try {
+      const [rList, sRes] = await Promise.all([api.listRuns(), api.getSettings()]);
+      if (seq !== loadRunsSeqRef.current) return rList;
+      setRuns(rList);
+      setCatalogs(sRes.catalogs || { parsing_errors: [], chunking_errors: [] });
+      const cleanSettings: Record<string, string> = {};
+      for (const [k, v] of Object.entries(sRes.settings || {})) {
+        if (typeof v === 'string') cleanSettings[k] = v;
+      }
+      setSettings((prev) => ({ ...prev, ...cleanSettings }));
+      if (sRes.defaults) setSettingDefaults(sRes.defaults);
+      setHasKey(Boolean(sRes.settings?.has_ragflow_key));
+      const targetId = preferredRunId ?? activeRunIdRef.current ?? Number(localStorage.getItem(ACTIVE_RUN_STORAGE_KEY) || '');
+      if (rList.length > 0) {
+        const keep = targetId ? rList.find((r: RunItem) => r.id === targetId) : null;
+        const fallback = keep || rList.find((r: RunItem) => r.is_baseline) || rList[0];
+        setActiveRun(fallback);
+      } else {
+        setActiveRun(null);
+      }
+      return rList;
+    } catch (e: any) {
+      if (seq === loadRunsSeqRef.current) {
+        toast.error(e?.message || 'Không tải được danh sách phiên làm việc.');
+      }
+      return [];
     }
   };
 
@@ -253,50 +290,91 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handleSaveAndTest = async (doTest: boolean) => {
+  const syncAfterSettingsSave = async (saveRes: {
+    account_changed?: boolean;
+    demo_changed?: boolean;
+    has_ragflow_key?: boolean;
+  }): Promise<RunItem[]> => {
+    if (typeof saveRes?.has_ragflow_key === 'boolean') {
+      setHasKey(saveRes.has_ragflow_key);
+    } else {
+      setHasKey(Boolean(settings.ragflow_api_key?.trim()));
+    }
+    if (saveRes?.account_changed || saveRes?.demo_changed) {
+      clearAllAutoTuneCache();
+      invalidateApiCache();
+      if (saveRes?.account_changed) {
+        persistActiveRun(null);
+      }
+      const freshRuns = await loadRuns();
+      if (settings.demo_mode === 'true') {
+        const demoBaseId = Number(settings.demo_baseline_run_id || 21);
+        const foundDemo = freshRuns.find((r) => r.id === demoBaseId);
+        if (foundDemo) persistActiveRun(foundDemo);
+      }
+      setRefreshKey((k) => k + 1);
+      return freshRuns;
+    }
+    return runs;
+  };
+
+  const handleSaveAndTest = async (doTest: boolean, silent = false): Promise<boolean> => {
     setTesting(true);
     setConnMsg({});
     try {
       const saveRes = await api.saveSettings(settings);
-      setHasKey(Boolean(settings.ragflow_api_key?.trim()));
-      if (saveRes?.account_changed) {
-        persistActiveRun(null);
-        await loadRuns();
-        setRefreshKey((k) => k + 1);
-      }
+      await syncAfterSettingsSave(saveRes || {});
       if (doTest) {
         const res = await api.testRagflow();
         const msg = `Kết nối thành công · Tìm thấy ${res.dataset_count} dataset`;
         setConnMsg({ ok: true, text: msg });
         toast.success(msg);
-      } else {
+      } else if (!silent) {
         setConnMsg({ ok: true, text: 'Đã lưu cấu hình kết nối.' });
         toast.success('Đã lưu cấu hình kết nối.');
       }
+      return true;
     } catch (e: any) {
       setConnMsg({ ok: false, text: e.message });
       toast.error(e.message);
+      return false;
     } finally {
       setTesting(false);
     }
   };
 
   useEffect(() => {
+    let cancelled = false;
     if (!activeRun) {
       setParsingProgress({ rated: 0, total: 0 });
       return;
     }
     api
       .getParsingMetrics(activeRun.id)
-      .then((m) => setParsingProgress({ rated: m?.rated_units || 0, total: m?.total_units || 0 }))
-      .catch(() => setParsingProgress({ rated: 0, total: 0 }));
+      .then((m) => {
+        if (!cancelled) setParsingProgress({ rated: m?.rated_units || 0, total: m?.total_units || 0 });
+      })
+      .catch(() => {
+        if (!cancelled) setParsingProgress({ rated: 0, total: 0 });
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [activeRun?.id]);
+
+  // Redirect away from locked steps when restored from localStorage or after switching to an unsynced run
+  useEffect(() => {
+    if ((tab === 'parsing' || tab === 'chunking') && activeRun && (activeRun.chunk_count ?? 0) === 0) {
+      setTab('workspace');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, activeRun?.id, activeRun?.chunk_count]);
 
   const hasSyncedChunks = (activeRun?.chunk_count ?? 0) > 0;
   const isParsingComplete = parsingProgress.total > 0 && parsingProgress.rated >= parsingProgress.total;
 
   const isStepLocked = (stepId: StepId): { locked: boolean; reason: string } => {
-    if (stepId === 'workspace' || stepId === 'retrieval' || stepId === 'compare' || stepId === 'optimizer') {
+    if (stepId === 'workspace' || stepId === 'retrieval' || stepId === 'optimizer' || stepId === 'studio') {
       return { locked: false, reason: '' };
     }
     if ((stepId === 'parsing' || stepId === 'chunking') && !hasSyncedChunks) {
@@ -309,6 +387,7 @@ export default function App() {
   const currentSteps = workflowMode ? WORKFLOW_STEPS[workflowMode] : [];
 
   return (
+    <ErrorBoundary>
     <div className="h-dvh w-screen flex flex-col bg-[#fefefe] text-[#161616] overflow-hidden">
       <PageLoader
         transitionKey={transitionKey}
@@ -325,7 +404,7 @@ export default function App() {
       />
 
       {/* TypeSafe AI Minimal 48px Top Bar (No Left Sidebar) */}
-      <header className="h-12 shrink-0 px-5 border-b border-[#dedede] bg-[#fefefe] flex items-center justify-between gap-4">
+      <header className="relative h-12 shrink-0 px-2 sm:px-5 border-b border-[#dedede] bg-[#fefefe] flex items-center justify-between gap-2 sm:gap-4">
         <div className="flex items-center gap-3 min-w-0">
           <button
             onClick={goHome}
@@ -344,15 +423,15 @@ export default function App() {
               <rect x="12.5" y="20.4" width="11.5" height="2.6" rx="0.6" fill="#141414" />
               <circle cx="9.3" cy="21.7" r="1.4" fill="#03aa5c" />
             </svg>
-            <BrandWordmark className="h-[19px] w-auto shrink-0" autoAnimate />
+            <BrandWordmark className="hidden min-[375px]:block h-[16px] sm:h-[19px] w-auto shrink-0" autoAnimate />
           </button>
 
           {activeWorkflowMeta && (
             <>
-              <span className="text-[#dedede]">/</span>
+              <span className="hidden sm:inline text-[#dedede]">/</span>
               <button
                 onClick={goHome}
-                className="inline-flex items-center gap-1 text-xs text-[#71717a] hover:text-[#161616] transition-colors"
+                className="hidden sm:inline-flex items-center gap-1 text-xs text-[#71717a] hover:text-[#161616] transition-colors"
               >
                 <ArrowLeft className="size-3.5" />
                 <span>Trang chủ</span>
@@ -361,9 +440,9 @@ export default function App() {
           )}
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1 sm:gap-2">
           {/* Refined TypeSafe-style Session Switcher */}
-          <div className="relative" ref={sessionMenuRef}>
+          <div className="sm:relative" ref={sessionMenuRef}>
             <button
               type="button"
               onClick={() => setSessionMenuOpen((v) => !v)}
@@ -376,11 +455,11 @@ export default function App() {
             >
               <span className={`size-1.5 rounded-full shrink-0 ${activeRun ? 'bg-[#03aa5c]' : 'bg-[#a1a1aa]'}`} />
               <div className="flex items-center gap-2 min-w-0">
-                <span className="text-xs font-medium text-[#161616] max-w-[150px] truncate">
+                <span className="text-xs font-medium text-[#161616] max-w-12 sm:max-w-[150px] truncate">
                   {activeRun ? activeRun.name : 'Chưa có phiên'}
                 </span>
                 {activeRun?.is_baseline ? (
-                  <span className="font-mono text-[9px] uppercase px-1 py-0.5 bg-[#03aa5c]/15 text-[#027a42] border border-[#03aa5c]/30 rounded-[2px]">
+                  <span className="hidden sm:inline font-mono text-[9px] uppercase px-1 py-0.5 bg-[#03aa5c]/15 text-[#027a42] border border-[#03aa5c]/30 rounded-[2px]">
                     Chuẩn
                   </span>
                 ) : null}
@@ -396,7 +475,7 @@ export default function App() {
             </button>
 
             {sessionMenuOpen && (
-              <div className="absolute right-0 mt-1.5 w-72 bg-[#fefefe] border border-[#dedede] rounded-[3px] shadow-md z-50 overflow-hidden">
+              <div className="absolute right-2 top-full sm:right-0 sm:top-auto mt-1.5 w-72 bg-[#fefefe] border border-[#dedede] rounded-[3px] shadow-md z-50 overflow-hidden">
                 <div className="px-3 py-2 border-b border-[#ededeb] bg-[#f7f7f6] flex items-center justify-between">
                   <span className="font-mono text-[10px] uppercase tracking-wider text-[#71717a]">
                     Chọn Datasets
@@ -447,19 +526,46 @@ export default function App() {
           </div>
 
           <button
+            ref={guideButtonRef}
+            type="button"
+            onClick={showGuide ? closeGuide : () => {
+              setSessionMenuOpen(false);
+              setShowGuide(true);
+            }}
+            aria-label="Hướng dẫn"
+            aria-current={showGuide ? 'page' : undefined}
+            title="Tổng quan và hướng dẫn"
+            className={`ts-btn-secondary h-8 py-0 px-2 sm:px-2.5 text-xs ${showGuide ? 'border-[#027a42] bg-[#f2fbf6] text-[#027a42]' : ''}`}
+          >
+            <Info className="size-3.5 text-[#027a42]" aria-hidden="true" />
+            <span className="hidden sm:inline">Hướng dẫn</span>
+          </button>
+
+          <button
+            onClick={() => setShowGlossary(true)}
+            aria-label="Ký hiệu"
+            className="ts-btn-secondary h-8 py-0 px-2 sm:px-2.5 text-xs"
+            title="Từ điển ký hiệu, mã lỗi (P1–P10, R1–R5, THRESHOLD, FULL/SPLIT...)"
+          >
+            <BookOpen className="size-3.5 text-[#027a42]" strokeWidth={1.6} aria-hidden="true" />
+            <span className="hidden sm:inline">Ký hiệu</span>
+          </button>
+
+          <button
             onClick={() => setShowSettings(true)}
-            className="ts-btn-secondary h-8 py-0 px-2.5 text-xs"
+            aria-label="Cài đặt"
+            className="ts-btn-secondary h-8 py-0 px-2 sm:px-2.5 text-xs"
             title="Cài đặt kết nối RAGFlow, LLM & Ngưỡng kiểm thử"
           >
-            <span className={`size-1.5 rounded-full ${hasKey ? 'bg-[#03aa5c]' : 'bg-amber-500'}`} />
-            <Settings className="size-3.5" strokeWidth={1.6} />
-            <span>Cài đặt</span>
+            <span className={`hidden sm:block size-1.5 rounded-full ${hasKey ? 'bg-[#03aa5c]' : 'bg-amber-500'}`} />
+            <Settings className="size-3.5" strokeWidth={1.6} aria-hidden="true" />
+            <span className="hidden sm:inline">Cài đặt</span>
           </button>
         </div>
       </header>
 
       {/* Independent Module Navigation Tabs (Monochrome + Sky Blue accent) */}
-      {workflowMode && currentSteps.length > 1 && (
+      {!showGuide && workflowMode && currentSteps.length > 1 && (
         <nav className="shrink-0 px-5 border-b border-[#e4e4e2] bg-[#fafaf9] flex items-center gap-1 overflow-x-auto">
           {currentSteps.map((step) => {
             const active = tab === step.id;
@@ -500,82 +606,117 @@ export default function App() {
         </nav>
       )}
 
-      <main ref={mainRef} className="flex-1 overflow-y-auto bg-[#fefefe]">
-        {tab === 'overview' && (
-          <OverviewPage activeRun={activeRun} onStartWorkflow={startWorkflow} />
-        )}
-        {hasVisited('workspace') && (
-          <div className={tab === 'workspace' ? '' : 'hidden'}>
-            <WorkspacePage
+      {showGuide && (
+        <main className="flex-1 overflow-y-auto bg-[#fefefe]">
+          <Suspense fallback={null}>
+            <PlatformGuidePage
+              onBack={closeGuide}
+              onOpenSettings={() => setShowSettings(true)}
+              onStartWorkflow={startWorkflow}
+            />
+          </Suspense>
+        </main>
+      )}
+
+      <main ref={mainRef} hidden={showGuide} className="flex-1 overflow-y-auto bg-[#fefefe]">
+        <Suspense fallback={null}>
+          {tab === 'overview' && (
+            <OverviewPage activeRun={activeRun} onStartWorkflow={startWorkflow} />
+          )}
+          {hasVisited('workspace') && (
+            <div className={tab === 'workspace' ? '' : 'hidden'}>
+              <WorkspacePage
+                activeRun={activeRun}
+                runs={runs}
+                refreshKey={refreshKey}
+                isActive={tab === 'workspace' && !showGuide}
+                onReloadRuns={loadRuns}
+                onSelectRun={persistActiveRun}
+                onOpenSettings={() => setShowSettings(true)}
+                onNextStep={() => setTab('parsing')}
+              />
+            </div>
+          )}
+          {hasVisited('parsing') && (
+            <div className={tab === 'parsing' ? 'h-full' : 'hidden'}>
+              <ParsingPage
+                activeRun={activeRun}
+                errorCatalog={catalogs.parsing_errors}
+                isActive={tab === 'parsing' && !showGuide && !showSettings && !showGlossary}
+                onProgressChange={(rated, total) => setParsingProgress({ rated, total })}
+                onNextStep={() => setTab('chunking')}
+              />
+            </div>
+          )}
+          {hasVisited('chunking') && (
+            <div className={tab === 'chunking' ? 'h-full' : 'hidden'}>
+              <ChunkingPage
+                activeRun={activeRun}
+                errorCatalog={catalogs.chunking_errors}
+                isActive={tab === 'chunking' && !showGuide && !showSettings && !showGlossary}
+                onNextStep={() => setTab('retrieval')}
+              />
+            </div>
+          )}
+          {hasVisited('retrieval') && (
+            <div className={tab === 'retrieval' ? 'h-full' : 'hidden'}>
+              <RetrievalPage activeRun={activeRun} isActive={tab === 'retrieval' && !showGuide && !showSettings && !showGlossary} />
+            </div>
+          )}
+          {tab === 'studio' && (
+            <ExperimentStudioPage
               activeRun={activeRun}
               runs={runs}
-              refreshKey={refreshKey}
-              onReloadRuns={loadRuns}
               onSelectRun={persistActiveRun}
-              onOpenSettings={() => setShowSettings(true)}
-              onNextStep={() => setTab('parsing')}
+              onRefreshRuns={async () => {
+                await loadRuns();
+              }}
+              onOpenFullAnalysis={(run) => {
+                if (run) persistActiveRun(run);
+                startWorkflow('full_pipeline');
+              }}
             />
-          </div>
-        )}
-        {hasVisited('parsing') && (
-          <div className={tab === 'parsing' ? 'h-full' : 'hidden'}>
-            <ParsingPage
-              activeRun={activeRun}
-              errorCatalog={catalogs.parsing_errors}
-              isActive={tab === 'parsing'}
-              onProgressChange={(rated, total) => setParsingProgress({ rated, total })}
-              onNextStep={() => setTab('chunking')}
-            />
-          </div>
-        )}
-        {hasVisited('chunking') && (
-          <div className={tab === 'chunking' ? 'h-full' : 'hidden'}>
-            <ChunkingPage
-              activeRun={activeRun}
-              errorCatalog={catalogs.chunking_errors}
-              isActive={tab === 'chunking'}
-              onNextStep={() => setTab('retrieval')}
-            />
-          </div>
-        )}
-        {hasVisited('retrieval') && (
-          <div className={tab === 'retrieval' ? 'h-full' : 'hidden'}>
-            <RetrievalPage activeRun={activeRun} />
-          </div>
-        )}
-        {hasVisited('compare') && (
-          <div className={tab === 'compare' ? '' : 'hidden'}>
-            <CompareLabPage activeRun={activeRun} />
-          </div>
-        )}
-        {hasVisited('optimizer') && (
-          <div className={tab === 'optimizer' ? '' : 'hidden'}>
-            <OptimizationLabPage
-              activeRun={activeRun}
-              isActive={tab === 'optimizer'}
-              onReloadRuns={loadRuns}
-              onSelectRun={persistActiveRun}
-              onOpenWorkspace={() => setTab('workspace')}
-              onOpenRetrieval={() => setTab('retrieval')}
-            />
-          </div>
-        )}
+          )}
+          {hasVisited('optimizer') && (
+            <div className={tab === 'optimizer' ? '' : 'hidden'}>
+              <OptimizationLabPage
+                activeRun={activeRun}
+                isActive={tab === 'optimizer' && !showGuide && !showSettings && !showGlossary}
+                onReloadRuns={loadRuns}
+                onSelectRun={persistActiveRun}
+                onOpenWorkspace={() => setTab('workspace')}
+                onOpenRetrieval={() => setTab('retrieval')}
+              />
+            </div>
+          )}
+        </Suspense>
       </main>
+
+      {/* System Glossary Modal */}
+      {showGlossary && (
+        <Suspense fallback={null}>
+          <GlossaryModal onClose={() => setShowGlossary(false)} />
+        </Suspense>
+      )}
 
       {/* Pipeline & System Settings Modal */}
       {showSettings && (
-        <SettingsModal
-          settings={settings}
-          defaults={settingDefaults}
-          setSettings={setSettings}
-          onClose={() => setShowSettings(false)}
-          onSave={() => handleSaveAndTest(false)}
-          onTestRagflow={() => handleSaveAndTest(true)}
-          testing={testing}
-          connMsg={connMsg}
-          setConnMsg={setConnMsg}
-        />
+        <Suspense fallback={null}>
+          <SettingsModal
+            settings={settings}
+            defaults={settingDefaults}
+            setSettings={setSettings}
+            onClose={() => setShowSettings(false)}
+            onSave={() => handleSaveAndTest(false)}
+            onSaveSilent={() => handleSaveAndTest(false, true)}
+            onTestRagflow={() => handleSaveAndTest(true)}
+            testing={testing}
+            connMsg={connMsg}
+            setConnMsg={setConnMsg}
+          />
+        </Suspense>
       )}
     </div>
+    </ErrorBoundary>
   );
 }

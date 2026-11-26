@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
-from database import get_bool_setting, get_db, get_float_setting, get_int_setting, get_setting, utc_now
+from database import get_bool_setting, get_current_account_key, get_db, get_float_setting, get_int_setting, get_setting, utc_now
 from llm_client import (
     jev_judge_chunk,
     llm_judge_chunk,
@@ -16,6 +16,7 @@ from llm_client import (
     systemone_requires_key,
 )
 from metrics import analyze_chunk_rules, compute_answer_containment, detect_duplicates_classified, nfc
+from progress_tracker import progress_inc, progress_stage, progress_start
 
 router = APIRouter(prefix="/api/chunking", tags=["chunking"])
 
@@ -71,6 +72,19 @@ async def auto_sample_chunks(
     Runs mechanical rule engine across 100% of chunks so rule_flags have full corpus coverage,
     and chains LLM-as-a-Judge only on newly sampled (unjudged) chunks to preserve prior scores.
     """
+    if get_bool_setting("demo_mode", False):
+        await asyncio.sleep(2.0)
+        from demo_cloner import ensure_demo_chunking
+        tot, samp = ensure_demo_chunking(run_id)
+        return {
+            "ok": True,
+            "mode": (mode or get_setting("chunk_sample_mode", "adaptive")).strip().lower(),
+            "total_chunks": tot,
+            "sampled_chunks": samp,
+            "llm_judged": samp,
+            "demo": True,
+        }
+
     eff_mode = (mode or get_setting("chunk_sample_mode", "adaptive")).strip().lower()
     if eff_mode not in ("adaptive", "fixed", "full"):
         eff_mode = "adaptive"
@@ -126,6 +140,7 @@ async def auto_sample_chunks(
 
         sampled_count = 0
         now = utc_now()
+        progress_start(len(by_doc), "Đang quét rule & lấy mẫu phân tầng", f"{len(all_chunks)} chunks / {len(by_doc)} tài liệu")
         for doc_id, clist in by_doc.items():
             n = len(clist)
             rep_lines = repeated_by_doc.get(doc_id, set())
@@ -205,7 +220,7 @@ async def auto_sample_chunks(
                         "UPDATE chunk_evaluations SET is_sampled = 1 WHERE run_id = ? AND chunk_id = ?",
                         (run_id, ch["id"]),
                     )
-                elif existing and existing["judge_source"] == "LLM":
+                elif existing and existing["judge_source"] in ("LLM", "JEV"):
                     try:
                         prev_codes = set(json.loads(existing["error_codes"] or "[]"))
                     except Exception:
@@ -306,6 +321,12 @@ async def llm_judge_sampled_chunks(
     merging semantic verdicts (C1-C4 + reason) with deterministic mechanical rules (C5-C8).
     When `only_unjudged=True`, skips chunks already judged by MANUAL, LLM, or JEV.
     """
+    if get_bool_setting("demo_mode", False):
+        await asyncio.sleep(2.2)
+        from demo_cloner import ensure_demo_chunking
+        _, samp = ensure_demo_chunking(run_id)
+        return {"ok": True, "judged_count": samp, "engine": "llm", "demo": True}
+
     cfg = _resolve_chunking_judge(judge_engine)
     engine = cfg["engine"]
     source_tag = "JEV" if engine == "jev" else "LLM"
@@ -348,6 +369,7 @@ async def llm_judge_sampled_chunks(
     sem = asyncio.Semaphore(4 if engine == "jev" else 6)
     updates = []
     errors = []
+    progress_start(len(targets), f"Đang chấm Chunking bằng {engine.upper()}", f"Model: {cfg['model']}")
 
     async def _judge_one(item: dict):
         prev_txt = pos_map.get((item["document_id"], item["chunk_index"] - 1), "")
@@ -403,6 +425,8 @@ async def llm_judge_sampled_chunks(
                 ))
             except Exception as e:
                 errors.append(str(e)[:160])
+            finally:
+                progress_inc(1)
 
     t0 = time.perf_counter()
     await asyncio.gather(*(_judge_one(t) for t in targets))
@@ -524,7 +548,12 @@ def get_chunking_metrics(run_id: int):
             "SELECT document_id, COUNT(*) AS cnt FROM chunks WHERE run_id = ? GROUP BY document_id",
             (run_id,),
         ).fetchall()
-        testcases = conn.execute("SELECT reference_context FROM golden_testcases").fetchall()
+        from database import resolve_golden_run_id
+        owner_id = resolve_golden_run_id(conn, run_id)
+        testcases = conn.execute(
+            "SELECT reference_context FROM golden_testcases WHERE run_id = ?",
+            (owner_id,),
+        ).fetchall()
         snap_chunks = (
             [dict(c) for c in conn.execute("SELECT ragflow_chunk_id, content FROM chunks WHERE run_id = ?", (run_id,)).fetchall()]
             if testcases

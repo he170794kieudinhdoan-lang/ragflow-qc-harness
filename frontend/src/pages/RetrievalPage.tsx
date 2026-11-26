@@ -1,18 +1,25 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import {
   AlertCircle,
   AlertTriangle,
   BookOpen,
   Check,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ChevronUp,
   Copy,
   FileImage,
+  FileSpreadsheet,
   FileText,
+  GitCompare,
   LayoutGrid,
   Loader2,
   Play,
   Plus,
   Search,
+  SlidersHorizontal,
   Sparkles,
   Table2,
   Trash2,
@@ -22,11 +29,16 @@ import {
 import { api } from '../api/client';
 import { ChunkContentView } from '../components/ChunkContentView';
 import { GoldenTableView } from '../components/GoldenTableView';
+import { ImportGoldenModal } from '../components/ImportGoldenModal';
+import { RetrievalCompareView } from '../components/RetrievalCompareView';
+import { AutoTuneTrial, RetrievalAutoTuneView } from '../components/RetrievalAutoTuneView';
 import { RetrievalTableView } from '../components/RetrievalTableView';
+import { FloatingProgressOverlay, useProgressTask } from '../components/FloatingProgressOverlay';
 import { GoldenTestcase, RetrievalResultGroup, RetrievalRun, RunItem } from '../types';
 
 interface Props {
   activeRun: RunItem | null;
+  isActive?: boolean;
 }
 
 const AC_LABELS: Record<string, string> = {
@@ -124,8 +136,8 @@ function buildEvidenceItems(raw: string, sourceFile?: string, notes?: string): E
   }));
 }
 
-export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
-  const [subTab, setSubTab] = useState<'golden' | 'results'>('golden');
+export const RetrievalPage: React.FC<Props> = ({ activeRun, isActive = true }) => {
+  const [subTab, setSubTab] = useState<'golden' | 'results' | 'compare' | 'autotune'>('golden');
   const [goldenViewMode, setGoldenViewMode] = useState<'split' | 'excel'>('split');
   const [resultsViewMode, setResultsViewMode] = useState<'split' | 'excel'>('split');
 
@@ -141,9 +153,16 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
   const [selectedRrId, setSelectedRrId] = useState<number | null>(null);
   const [groups, setGroups] = useState<RetrievalResultGroup[]>([]);
   const [selectedGroup, setSelectedGroup] = useState<RetrievalResultGroup | null>(null);
+  const [resFilter, setResFilter] = useState<'ALL' | 'FAIL' | 'PASS'>('ALL');
+  const [resSearch, setResSearch] = useState('');
+  const [showRejudgeMenu, setShowRejudgeMenu] = useState(false);
+  const [refCollapsed, setRefCollapsed] = useState(false);
+  const [onlyRelHits, setOnlyRelHits] = useState(false);
+  const [inspectHitId, setInspectHitId] = useState<number | null>(null);
 
   // Modals & Actions
   const [showAddTc, setShowAddTc] = useState(false);
+  const [showImportExcel, setShowImportExcel] = useState(false);
   const [showRunModal, setShowRunModal] = useState(false);
   const [busy, setBusy] = useState(false);
   const [rejudging, setRejudging] = useState<'' | 'jev' | 'llm'>('');
@@ -162,19 +181,37 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
 
   const [rrName, setRrName] = useState('Baseline Retrieval');
   const [topK, setTopK] = useState(10);
+  const [rerankCandidates, setRerankCandidates] = useState(64);
   const [threshold, setThreshold] = useState(0.2);
   const [vecWeight, setVecWeight] = useState(0.3);
-  const [rerankId, setRerankId] = useState('');
-  const [keywordEnabled, setKeywordEnabled] = useState(true);
+  const [useRerank, setUseRerank] = useState(false);
+  const [rerankModels, setRerankModels] = useState<{ id: string; name: string; label: string }[]>([]);
+  const [selectedRerankId, setSelectedRerankId] = useState('');
+  const [loadingReranks, setLoadingReranks] = useState(false);
 
   const [diagnosing, setDiagnosing] = useState(false);
   const [diagnosis, setDiagnosis] = useState<any>(null);
   const [openPdfChunkId, setOpenPdfChunkId] = useState<number | null>(null);
+  const { progress: taskProgress, runTracked } = useProgressTask();
+
+  const tcSeqRef = useRef(0);
+  const runsSeqRef = useRef(0);
+  const resultsSeqRef = useRef(0);
+  const coverageTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (coverageTimerRef.current !== null) window.clearTimeout(coverageTimerRef.current);
+    };
+  }, []);
 
   const loadTestcases = async () => {
+    const seq = ++tcSeqRef.current;
+    const runId = activeRun?.id;
     setLoadingTc(true);
     try {
-      const list = await api.listTestcases();
+      const list = await api.listTestcases(runId);
+      if (seq !== tcSeqRef.current) return;
       setTestcases(list || []);
       if (list && list.length > 0) {
         setSelectedTcId((prev) => (prev && list.some((t: GoldenTestcase) => t.id === prev) ? prev : list[0].id));
@@ -183,48 +220,79 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
         setSelectedTcId(null);
         setTcCode('TC01');
       }
+    } catch (e: any) {
+      if (seq === tcSeqRef.current) toast.error(e?.message || 'Không tải được bộ câu hỏi Golden.');
     } finally {
-      setLoadingTc(false);
+      if (seq === tcSeqRef.current) setLoadingTc(false);
     }
   };
 
-  const loadRuns = async () => {
+  const loadRuns = async (resetSelection = false) => {
     if (!activeRun) return;
-    const list = await api.listRetrievalRuns(activeRun.id);
-    setRrList(list);
-    if (list.length > 0) {
-      const targetId = selectedRrId && list.some((x: any) => x.id === selectedRrId) ? selectedRrId : list[0].id;
-      setSelectedRrId(targetId);
-    } else {
-      setSelectedRrId(null);
-      setGroups([]);
-      setSelectedGroup(null);
+    const seq = ++runsSeqRef.current;
+    const runId = activeRun.id;
+    try {
+      const list = await api.listRetrievalRuns(runId);
+      if (seq !== runsSeqRef.current) return;
+      setRrList(list);
+      if (list.length > 0) {
+        setSelectedRrId((prev) =>
+          !resetSelection && prev && list.some((x: any) => x.id === prev) ? prev : list[0].id
+        );
+      } else {
+        setSelectedRrId(null);
+        setGroups([]);
+        setSelectedGroup(null);
+      }
+    } catch (e: any) {
+      if (seq === runsSeqRef.current) toast.error(e?.message || 'Không tải được danh sách lần chạy Retrieval.');
     }
   };
 
   const loadResults = async (rrId: number) => {
-    const data = await api.getRetrievalResults(rrId);
-    setGroups(data);
-    if (data.length > 0) {
-      const keep = selectedGroup ? data.find((g: RetrievalResultGroup) => g.testcase.id === selectedGroup.testcase.id) : null;
-      setSelectedGroup(keep || data[0]);
-    } else {
-      setSelectedGroup(null);
+    const seq = ++resultsSeqRef.current;
+    try {
+      const data = await api.getRetrievalResults(rrId);
+      if (seq !== resultsSeqRef.current) return;
+      setGroups(data);
+      if (data.length > 0) {
+        setSelectedGroup((prev) => {
+          const keep = prev ? data.find((g: RetrievalResultGroup) => g.testcase.id === prev.testcase.id) : null;
+          return keep || data[0];
+        });
+      } else {
+        setSelectedGroup(null);
+      }
+    } catch (e: any) {
+      if (seq === resultsSeqRef.current) toast.error(e?.message || 'Không tải được kết quả Retrieval.');
     }
   };
 
   useEffect(() => {
+    // Clear previous run's state immediately so stale data from Run A never flashes inside Run B
+    setTestcases([]);
+    setSelectedTcId(null);
+    setRrList([]);
+    setSelectedRrId(null);
+    setGroups([]);
+    setSelectedGroup(null);
+    setDiagnosis(null);
+    setInspectHitId(null);
     loadTestcases();
-    loadRuns();
+    loadRuns(true);
     const rc = (activeRun?.retrieval_config || {}) as Record<string, any>;
     if (rc.top_k !== undefined) setTopK(Number(rc.top_k) || 10);
     if (rc.similarity_threshold !== undefined) setThreshold(Number(rc.similarity_threshold));
     if (rc.vector_similarity_weight !== undefined) setVecWeight(Number(rc.vector_similarity_weight));
-    if (rc.rerank_id !== undefined) setRerankId(String(rc.rerank_id || ''));
-    if (rc.keyword_enabled !== undefined) setKeywordEnabled(Boolean(rc.keyword_enabled));
+    if (rc.rerank_id !== undefined) {
+      const rid = String(rc.rerank_id || '');
+      setUseRerank(Boolean(rid));
+      if (rid) setSelectedRerankId(rid);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeRun?.id, activeRun?.retrieval_config]);
 
-  useEffect(() => {
+  const syncRetrievalSettings = () => {
     api
       .getSettings()
       .then((res) => {
@@ -234,6 +302,25 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
         }
       })
       .catch(() => {});
+    setLoadingReranks(true);
+    api
+      .listRagflowRerankModels()
+      .then((list) => {
+        const models = Array.isArray(list) ? list : [];
+        setRerankModels(models);
+        if (models.length > 0) {
+          setSelectedRerankId((prev) => (prev && models.some((m) => m.id === prev) ? prev : models[0].id));
+        } else {
+          setSelectedRerankId('');
+          setUseRerank(false);
+        }
+      })
+      .catch(() => setRerankModels([]))
+      .finally(() => setLoadingReranks(false));
+  };
+
+  useEffect(() => {
+    syncRetrievalSettings();
   }, []);
 
   useEffect(() => {
@@ -243,7 +330,32 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
   useEffect(() => {
     setDiagnosis(null);
     setOpenPdfChunkId(null);
+    setInspectHitId(null);
   }, [selectedGroup?.testcase.id, selectedRrId]);
+
+  useEffect(() => {
+    if (!isActive || !inspectHitId || !selectedGroup) return;
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (e.key === 'Escape') {
+        setInspectHitId(null);
+        return;
+      }
+      const hits = selectedGroup.hits;
+      const idx = hits.findIndex((h) => h.id === inspectHitId);
+      if (idx === -1) return;
+      if (e.key === 'ArrowLeft' && idx > 0) {
+        e.preventDefault();
+        setInspectHitId(hits[idx - 1].id);
+      } else if (e.key === 'ArrowRight' && idx < hits.length - 1) {
+        e.preventDefault();
+        setInspectHitId(hits[idx + 1].id);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isActive, inspectHitId, selectedGroup]);
 
   const classCounts = useMemo(() => {
     const acc = { ALL: testcases.length, Local: 0, Global: 0, 'Multi-hop': 0 };
@@ -306,6 +418,7 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
     e.preventDefault();
     try {
       const created = await api.createTestcase({
+        run_id: activeRun?.id || 0,
         tc_code: tcCode,
         input_question: tcQ,
         expected_outcome: tcExpected,
@@ -327,7 +440,6 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
   };
 
   const handleDeleteTc = async (tc: GoldenTestcase) => {
-    if (!window.confirm(`Xóa câu hỏi ${tc.tc_code}?`)) return;
     try {
       await api.deleteTestcase(tc.id);
       await loadTestcases();
@@ -341,7 +453,7 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
   const handleClearAll = async () => {
     if (!window.confirm(`Xóa toàn bộ ${testcases.length} câu hỏi Golden Dataset hiện tại?`)) return;
     try {
-      const res = await api.clearTestcases();
+      const res = await api.clearTestcases(activeRun?.id);
       toast.success(`Đã xóa ${res.deleted} câu hỏi Golden.`);
       setTestcases([]);
       setSelectedTcId(null);
@@ -363,7 +475,14 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
     }
     setGenerating(true);
     try {
-      const res = await api.autoGenerateTestcases(activeRun.id, genTotalCount, true, stylePrompt.trim());
+      const res = await runTracked(
+        {
+          title: 'Đang sinh bộ câu hỏi Golden từ file gốc',
+          subtitle: `Mục tiêu ${genTotalCount} câu hỏi (Local · Global · Multi-hop)`,
+          estimatedMs: 22000,
+        },
+        () => api.autoGenerateTestcases(activeRun.id, genTotalCount, true, stylePrompt.trim())
+      );
       const cc = res.class_counts || {};
       if (res.meta?.style_fallback && res.meta?.style_notice) {
         toast.warning(res.meta.style_notice, { duration: 4500 });
@@ -384,20 +503,29 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
   const handleExecuteBenchmark = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true);
+    setShowRunModal(false);
     try {
-      const res = await api.executeRetrieval({
-        run_id: activeRun.id,
-        name: rrName,
-        top_k: topK,
-        similarity_threshold: threshold,
-        vector_similarity_weight: vecWeight,
-        rerank_id: rerankId,
-        keyword_enabled: keywordEnabled,
-        use_llm: judgeEngine !== 'rule',
-        judge_engine: judgeEngine,
-        bypass_cache: bypassCache,
-      });
-      setShowRunModal(false);
+      const res = await runTracked(
+        {
+          title: `Đang chạy Retrieval Benchmark (${judgeEngine.toUpperCase()})`,
+          subtitle: `${rrName || 'Phiên đo mới'} · Top-${topK}`,
+          estimatedMs: 25000,
+        },
+        () =>
+          api.executeRetrieval({
+            run_id: activeRun.id,
+            name: rrName,
+            top_k: topK,
+            rerank_candidates: rerankCandidates,
+            similarity_threshold: threshold,
+            vector_similarity_weight: vecWeight,
+            rerank_id: useRerank ? selectedRerankId : '',
+            keyword_enabled: true,
+            use_llm: judgeEngine !== 'rule',
+            judge_engine: judgeEngine,
+            bypass_cache: bypassCache,
+          })
+      );
       await loadRuns();
       setSelectedRrId(res.retrieval_run_id);
       setSubTab('results');
@@ -418,7 +546,14 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
     if (!selectedRrId || rejudging) return;
     setRejudging(engine);
     try {
-      const res = await api.rejudgeRetrievalRun(selectedRrId, { judge_engine: engine });
+      const res = await runTracked(
+        {
+          title: `Đang chấm lại Retrieval bằng ${engine.toUpperCase()}`,
+          subtitle: 'Đánh giá lại độ liên quan Top-K hits trên cùng tập kết quả',
+          estimatedMs: 20000,
+        },
+        () => api.rejudgeRetrievalRun(selectedRrId, { judge_engine: engine })
+      );
       await loadRuns();
       setSelectedRrId(res.retrieval_run_id);
       const agreeTxt =
@@ -439,28 +574,149 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
     }
   };
 
+  const baselineRr =
+    rrList.find((r) => Number(r.is_baseline_rr) === 1) ||
+    (rrList.length > 0 ? rrList[rrList.length - 1] : null);
+
+  const handleDeleteRetrievalRun = async (rrId: number) => {
+    const target = rrList.find((r) => r.id === rrId);
+    const isBase = baselineRr && baselineRr.id === rrId;
+    if (isBase && rrList.length > 1) {
+      toast.warning('Đây là cấu hình gốc (Baseline) đang dùng làm mốc so sánh. Hãy xóa các thử nghiệm khác trước nếu muốn xóa Baseline.');
+      return;
+    }
+    if (!window.confirm(`Xóa lần chạy "${target?.name || `#${rrId}`}" và toàn bộ kết quả chấm của nó?`)) return;
+    try {
+      await api.deleteRetrievalRun(rrId);
+      toast.success(`Đã xóa lần chạy "${target?.name || `#${rrId}`}"`);
+      const nextList = await api.listRetrievalRuns(activeRun?.id);
+      setRrList(nextList);
+      if (nextList.length > 0) {
+        setSelectedRrId(nextList[0].id);
+      } else {
+        setSelectedRrId(null);
+        setGroups([]);
+        setSelectedGroup(null);
+      }
+    } catch (e: any) {
+      toast.error(e.message || 'Không xóa được lần chạy.');
+    }
+  };
+
+  const openNewExperimentModal = () => {
+    syncRetrievalSettings();
+    if (rrList.length === 0) {
+      setRrName('Baseline (Cấu hình gốc)');
+    } else {
+      setRrName(`Thử nghiệm #${rrList.length} (vec=${vecWeight})`);
+    }
+    setShowRunModal(true);
+  };
+
   const handleScoreHit = async (hitId: number, relevant: number, reason: string) => {
-    await api.scoreRetrievalResult(hitId, relevant, reason);
-    if (selectedRrId) await loadResults(selectedRrId);
+    // Optimistically update the single hit & recompute contextual precision without refetching all 500 chunks
+    const computeCp = (rels: number[]) => {
+      let relSoFar = 0;
+      let sum = 0;
+      let totalRel = 0;
+      rels.forEach((v, i) => {
+        if (v === 1) {
+          relSoFar += 1;
+          totalRel += 1;
+          sum += relSoFar / (i + 1);
+        }
+      });
+      return totalRel > 0 ? Number((sum / totalRel).toFixed(4)) : 0;
+    };
+    const patchGroup = (g: RetrievalResultGroup): RetrievalResultGroup => {
+      if (!g.hits.some((h) => h.id === hitId)) return g;
+      const nextHits = g.hits.map((h) =>
+        h.id === hitId ? { ...h, relevant, reason, relevancy_source: 'MANUAL' as const } : h
+      );
+      const rels = nextHits.filter((h) => h.relevant !== null && h.relevant !== undefined).map((h) => Number(h.relevant));
+      return {
+        ...g,
+        hits: nextHits,
+        relevant_count: rels.filter((v) => v === 1).length,
+        contextual_precision: computeCp(rels),
+      };
+    };
+    const prevGroups = groups;
+    const prevSel = selectedGroup;
+    setGroups((curr) => curr.map(patchGroup));
+    setSelectedGroup((curr) => (curr ? patchGroup(curr) : null));
+    try {
+      await api.scoreRetrievalResult(hitId, relevant, reason);
+    } catch (e: any) {
+      setGroups(prevGroups);
+      setSelectedGroup(prevSel);
+      toast.error(e?.message || 'Không lưu được điểm chunk.');
+    }
   };
 
-  const handleMetaUpdate = async (patch: any) => {
+  const handleMetaUpdate = async (patch: any, debounceMs = 0) => {
     if (!selectedRrId || !selectedGroup) return;
-    await api.updateTestcaseMeta(selectedRrId, selectedGroup.testcase.id, {
-      ...selectedGroup.meta,
-      ...patch,
-    });
-    await loadResults(selectedRrId);
+    const rrId = selectedRrId;
+    const tcId = selectedGroup.testcase.id;
+    const nextMeta = { ...selectedGroup.meta, ...patch };
+    setGroups((curr) =>
+      curr.map((g) => (g.testcase.id === tcId ? { ...g, meta: nextMeta } : g))
+    );
+    setSelectedGroup((curr) => (curr && curr.testcase.id === tcId ? { ...curr, meta: nextMeta } : curr));
+
+    const commit = async () => {
+      try {
+        await api.updateTestcaseMeta(rrId, tcId, nextMeta);
+      } catch (e: any) {
+        toast.error(e?.message || 'Không lưu được metadata câu hỏi.');
+      }
+    };
+    if (debounceMs > 0) {
+      if (coverageTimerRef.current !== null) window.clearTimeout(coverageTimerRef.current);
+      coverageTimerRef.current = window.setTimeout(commit, debounceMs);
+    } else {
+      await commit();
+    }
   };
 
-  const avgPrecision =
-    groups.length > 0 ? groups.reduce((s, g) => s + (g.contextual_precision || 0), 0) / groups.length : 0;
-  const avgCoverage =
-    groups.length > 0 ? groups.reduce((s, g) => s + (g.meta?.context_coverage || 0), 0) / groups.length : 0;
-  const fullAcCount = groups.filter((g) => g.meta?.answer_containment === 'FULL').length;
+  const { avgPrecision, avgCoverage, fullAcCount, passGroupCount, failGroupCount } = useMemo(() => {
+    const n = groups.length;
+    if (n === 0) return { avgPrecision: 0, avgCoverage: 0, fullAcCount: 0, passGroupCount: 0, failGroupCount: 0 };
+    let precSum = 0;
+    let covSum = 0;
+    let fullAc = 0;
+    let passCnt = 0;
+    for (const g of groups) {
+      precSum += g.contextual_precision || 0;
+      covSum += g.meta?.context_coverage || 0;
+      if (g.meta?.answer_containment === 'FULL') fullAc += 1;
+      if (g.contextual_precision >= 0.5 && g.relevant_count > 0) passCnt += 1;
+    }
+    return {
+      avgPrecision: precSum / n,
+      avgCoverage: covSum / n,
+      fullAcCount: fullAc,
+      passGroupCount: passCnt,
+      failGroupCount: n - passCnt,
+    };
+  }, [groups]);
+
+  const filteredGroups = useMemo(() => {
+    const q = resSearch.trim().toLowerCase();
+    return groups.filter((g) => {
+      const isPass = g.contextual_precision >= 0.5 && g.relevant_count > 0;
+      if (resFilter === 'PASS' && !isPass) return false;
+      if (resFilter === 'FAIL' && isPass) return false;
+      if (q) {
+        const hay = `${g.testcase.tc_code} ${g.testcase.input_question} ${g.testcase.source_file || ''}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [groups, resFilter, resSearch]);
 
   return (
-    <div className="h-[calc(100dvh-48px)] flex flex-col bg-white">
+    <div className="h-full flex flex-col bg-white">
       {/* Sub-navigation Tabs (matches Step 3 Chunking) */}
       <div className="px-5 border-b border-[#e8e8e6] bg-white flex items-center justify-between gap-3 shrink-0">
         <div className="flex items-center gap-1">
@@ -494,16 +750,40 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
               {rrList.length} lần chạy
             </span>
           </button>
+          <button
+            type="button"
+            onClick={() => setSubTab('compare')}
+            className={`inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium border-b-2 transition-colors ${
+              subTab === 'compare'
+                ? 'border-[#027a42] text-[#141414]'
+                : 'border-transparent text-[#71717a] hover:text-[#141414]'
+            }`}
+          >
+            <GitCompare className="size-3.5" />
+            So sánh A → B
+          </button>
+          <button
+            type="button"
+            onClick={() => setSubTab('autotune')}
+            className={`inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium border-b-2 transition-colors ${
+              subTab === 'autotune'
+                ? 'border-[#027a42] text-[#141414]'
+                : 'border-transparent text-[#71717a] hover:text-[#141414]'
+            }`}
+          >
+            <SlidersHorizontal className="size-3.5" />
+            Auto-Tune
+          </button>
         </div>
 
         <div className="flex items-center gap-2 py-1.5">
           {subTab === 'results' && groups.length > 0 && (
             <div className="hidden md:flex items-center gap-1.5 text-[11px] text-[#52525b]">
               <span className="px-2 py-0.5 rounded bg-[#fafaf9] border border-[#e4e4e2]">
-                Precision: <strong className="font-mono text-[#18181b]">{(avgPrecision * 100).toFixed(0)}%</strong>
+                Precision: <strong className="font-mono tabular-nums text-[#18181b]">{(avgPrecision * 100).toFixed(1)}%</strong>
               </span>
               <span className="px-2 py-0.5 rounded bg-[#fafaf9] border border-[#e4e4e2]">
-                Coverage: <strong className="font-mono text-[#18181b]">{(avgCoverage * 100).toFixed(0)}%</strong>
+                Coverage: <strong className="font-mono tabular-nums text-[#18181b]">{(avgCoverage * 100).toFixed(1)}%</strong>
               </span>
               <span className="px-2 py-0.5 rounded bg-[#f2fbf6] border border-[#bbf7d0] text-[#027a42]">
                 Trọn 1 chunk:{' '}
@@ -515,13 +795,13 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
           )}
           <button
             type="button"
-            onClick={() => setShowRunModal(true)}
+            onClick={openNewExperimentModal}
             disabled={busy || generating || testcases.length === 0}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-[#141414] hover:bg-[#27272a] text-white disabled:opacity-40 transition-colors"
-            title={testcases.length === 0 ? 'Hãy sinh hoặc thêm câu hỏi Golden trước' : 'Chạy benchmark tìm kiếm trên RAGFlow'}
+            title={testcases.length === 0 ? 'Hãy sinh hoặc thêm câu hỏi Golden trước' : 'Tạo lần chạy thử nghiệm cấu hình Retrieval mới (đổi vector weight, rerank, threshold...)'}
           >
             <Play className="size-3.5" />
-            Chạy test tìm kiếm
+            {rrList.length === 0 ? 'Chạy Baseline' : '+ Chạy thử nghiệm mới'}
           </button>
         </div>
       </div>
@@ -675,6 +955,15 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
 
               <button
                 type="button"
+                onClick={() => setShowImportExcel(true)}
+                className="inline-flex items-center gap-1 h-7 px-2.5 text-xs font-medium rounded-md bg-white border border-[#dcdcd8] hover:border-[#03aa5c] hover:text-[#027a42] text-[#141414] transition-colors"
+                title="Nhập bộ câu hỏi Golden từ file Excel (.xlsx) hoặc CSV bất kỳ"
+              >
+                <FileSpreadsheet className="size-3.5 text-[#027a42]" /> Nhập Excel
+              </button>
+
+              <button
+                type="button"
                 onClick={() => setShowAddTc(true)}
                 className="inline-flex items-center gap-1 h-7 px-2.5 text-xs font-medium rounded-md bg-white border border-[#dcdcd8] hover:bg-[#f4f4f2] text-[#141414] transition-colors"
               >
@@ -773,8 +1062,8 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
 
           {/* Golden 2-Column Workspace */}
           {loadingTc ? (
-            <div className="flex-1 flex items-center justify-center gap-2 text-xs text-[#71717a]">
-              <Loader2 className="size-4 animate-spin" /> Đang tải bộ câu hỏi Golden...
+            <div className="flex-1 flex items-center justify-center text-xs text-[#71717a]">
+              Đang chuẩn bị bộ câu hỏi Golden...
             </div>
           ) : testcases.length === 0 ? (
             <div
@@ -805,6 +1094,13 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
                   >
                     {generating ? <Loader2 className="size-3.5 animate-spin" /> : <Wand2 className="size-3.5" />}
                     {generating ? 'Đang sinh từ file gốc...' : `Sinh ${genTotalCount} câu Golden`}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowImportExcel(true)}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-md bg-white border border-[#03aa5c]/50 hover:bg-[#f2fbf6] text-[#027a42]"
+                  >
+                    <FileSpreadsheet className="size-3.5" /> Nhập từ Excel
                   </button>
                   <button
                     type="button"
@@ -847,11 +1143,18 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
                   {filteredTestcases.map((tc) => {
                     const isSel = selectedTc?.id === tc.id;
                     return (
-                      <button
+                      <div
                         key={tc.id}
-                        type="button"
+                        role="button"
+                        tabIndex={0}
                         onClick={() => setSelectedTcId(tc.id)}
-                        className={`w-full text-left px-4 py-3 transition-colors ${
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            setSelectedTcId(tc.id);
+                          }
+                        }}
+                        className={`group w-full text-left px-4 py-3 transition-colors cursor-pointer ${
                           isSel
                             ? 'bg-[#f8f7f4] border-l-2 border-l-[#027a42]'
                             : 'hover:bg-[#fafaf9]'
@@ -873,6 +1176,18 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
                               </span>
                             )}
                           </div>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleDeleteTc(tc);
+                            }}
+                            title={`Xóa ${tc.tc_code}`}
+                            aria-label={`Xóa ${tc.tc_code}`}
+                            className="shrink-0 p-1 rounded-md text-[#a1a1aa] opacity-60 group-hover:opacity-100 hover:text-[#dc2626] hover:bg-[#fef2f2] transition-colors"
+                          >
+                            <Trash2 className="size-3.5" />
+                          </button>
                         </div>
                         <div className="text-[13px] text-[#18181b] leading-snug line-clamp-2 font-medium">
                           {tc.input_question}
@@ -881,7 +1196,7 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
                           <FileText className="size-3 shrink-0 text-[#a1a1aa]" />
                           <span className="truncate">{tc.source_file || '—'}</span>
                         </div>
-                      </button>
+                      </div>
                     );
                   })}
                 </div>
@@ -1043,10 +1358,61 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
             </div>
           )}
         </>
+      ) : subTab === 'autotune' ? (
+        /* ==================== TAB 4: AUTO-TUNE GRID SEARCH ==================== */
+        <RetrievalAutoTuneView
+          activeRun={activeRun}
+          testcaseCount={testcases.length}
+          rerankModels={rerankModels}
+          runTracked={runTracked}
+          onSaveConfigAsRun={async (cfg: AutoTuneTrial) => {
+            const name = `[Auto-Tune #${cfg.rank}] vec=${cfg.vector_similarity_weight.toFixed(2)} · th=${cfg.similarity_threshold.toFixed(2)} · K=${cfg.top_k}`;
+            const res = await runTracked(
+              {
+                title: 'Lưu cấu hình Auto-Tune',
+                subtitle: name,
+                estimatedMs: 12000,
+              },
+              () =>
+                api.executeRetrieval({
+                  run_id: activeRun.id,
+                  name,
+                  top_k: cfg.top_k,
+                  rerank_candidates: rerankCandidates,
+                  similarity_threshold: cfg.similarity_threshold,
+                  vector_similarity_weight: cfg.vector_similarity_weight,
+                  rerank_id: cfg.rerank_id || '',
+                  keyword_enabled: true,
+                  use_llm: true,
+                  judge_engine: 'llm',
+                  bypass_cache: false,
+                })
+            );
+            await loadRuns();
+            setSelectedRrId(res.retrieval_run_id);
+            setSubTab('results');
+            toast.success(`Đã lưu cấu hình "${name}" vào Kết quả Retrieval.`);
+          }}
+        />
+      ) : subTab === 'compare' ? (
+        /* ==================== TAB 3: COMPARE A -> B ==================== */
+        <RetrievalCompareView
+          runId={activeRun.id}
+          rrList={rrList}
+          onReloadRuns={loadRuns}
+          onOpenNewExperiment={openNewExperimentModal}
+          onJumpToTestcase={(rrId, tcCode) => {
+            setSelectedRrId(rrId);
+            setSubTab('results');
+            setResultsViewMode('split');
+            setResFilter('ALL');
+            setResSearch(tcCode);
+          }}
+        />
       ) : (
         /* ==================== TAB 2: RETRIEVAL RESULTS ==================== */
         <>
-          <div className="px-5 py-2.5 border-b border-[#e8e8e6] bg-[#fafaf9] flex flex-wrap items-center justify-between gap-3 shrink-0">
+          <div className="px-5 py-2 border-b border-[#e8e8e6] bg-[#fafaf9] flex flex-wrap items-center justify-between gap-2.5 shrink-0">
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-xs text-[#71717a]">Lần chạy:</span>
               <select
@@ -1056,6 +1422,7 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
               >
                 {rrList.map((rr) => (
                   <option key={rr.id} value={rr.id}>
+                    {rr.id === baselineRr?.id ? '[GỐC · BASELINE] ' : ''}
                     {rr.name} (Top-{rr.top_k} · th={rr.similarity_threshold} · vec={rr.vector_similarity_weight})
                   </option>
                 ))}
@@ -1063,38 +1430,70 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
               </select>
               {selectedRrId && (
                 <>
+                  <div className="relative">
+                    <button
+                      type="button"
+                      onClick={() => setShowRejudgeMenu((v) => !v)}
+                      disabled={!!rejudging || busy || generating}
+                      className="inline-flex items-center gap-1.5 h-7 px-2.5 text-xs font-medium rounded-md border border-[#dcdcd8] bg-white hover:bg-[#f4f4f2] text-[#141414] transition-colors disabled:opacity-45"
+                    >
+                      {rejudging ? <Loader2 className="size-3.5 animate-spin text-[#027a42]" /> : <Wand2 className="size-3.5 text-[#52525b]" />}
+                      {rejudging === 'llm'
+                        ? 'LLM đang chấm...'
+                        : rejudging === 'jev'
+                          ? 'Jev đang chấm...'
+                          : 'Chấm lại'}
+                      <ChevronDown className="size-3 text-[#71717a]" />
+                    </button>
+                    {showRejudgeMenu && (
+                      <>
+                        <div className="fixed inset-0 z-20" onClick={() => setShowRejudgeMenu(false)} />
+                        <div className="absolute left-0 top-full mt-1.5 z-30 w-60 rounded-lg border border-[#e4e4e2] bg-white shadow-lg py-1 text-xs">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setShowRejudgeMenu(false);
+                              handleRejudge('llm');
+                            }}
+                            className="w-full text-left px-3 py-2 hover:bg-[#fafaf9] flex items-start gap-2"
+                          >
+                            <Wand2 className="size-3.5 text-[#141414] mt-0.5 shrink-0" />
+                            <div>
+                              <div className="font-medium text-[#141414]">Chấm lại bằng LLM (Khuyên dùng)</div>
+                              <div className="text-[10.5px] text-[#71717a]">Batched Top-K · chính xác tiếng Việt</div>
+                            </div>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setShowRejudgeMenu(false);
+                              handleRejudge('jev');
+                            }}
+                            className="w-full text-left px-3 py-2 hover:bg-[#fafaf9] flex items-start gap-2 border-t border-[#f0f0ee]"
+                          >
+                            <Sparkles className="size-3.5 text-[#027a42] mt-0.5 shrink-0" />
+                            <div>
+                              <div className="font-medium text-[#141414]">Chấm lại bằng Jev / Kev</div>
+                              <div className="text-[10.5px] text-[#71717a]">Tạo bản phụ để so A/B</div>
+                            </div>
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
                   <button
                     type="button"
-                    onClick={() => handleRejudge('jev')}
+                    onClick={() => handleDeleteRetrievalRun(selectedRrId)}
                     disabled={!!rejudging || busy || generating}
-                    className="inline-flex items-center gap-1.5 py-1 px-2.5 text-xs font-medium rounded-md border border-[#03aa5c]/40 bg-[#f2fbf6] text-[#027a42] hover:bg-[#03aa5c] hover:text-white transition-colors disabled:opacity-45"
-                    title="Chấm lại các Top-K hits hiện có bằng Jev / Kev System One để đo tốc độ & so A/B với LLM"
+                    className="inline-flex items-center justify-center size-7 rounded-md border border-[#dcdcd8] bg-white text-[#71717a] hover:text-[#b91c1c] hover:border-[#fecaca] hover:bg-[#fef2f2] transition-colors disabled:opacity-40"
+                    title="Xóa lần chạy Retrieval này"
                   >
-                    {rejudging === 'jev' ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5" />}
-                    {rejudging === 'jev' ? 'Jev/Kev đang chấm...' : 'Chấm lại bằng Jev / Kev'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleRejudge('llm')}
-                    disabled={!!rejudging || busy || generating}
-                    className="ts-btn-secondary py-1 px-2.5 text-xs rounded-md disabled:opacity-45"
-                    title="Chấm lại các Top-K hits hiện có bằng Chat LLM (đo thời gian để so sánh với Jev / Kev)"
-                  >
-                    {rejudging === 'llm' ? <Loader2 className="size-3.5 animate-spin" /> : <Wand2 className="size-3.5" />}
-                    {rejudging === 'llm' ? 'LLM đang chấm...' : 'Chấm lại bằng LLM'}
+                    <Trash2 className="size-3.5" />
                   </button>
                 </>
               )}
             </div>
             <div className="flex items-center gap-2 text-xs text-[#52525b]">
-              <span className="px-2.5 py-1 rounded-md bg-white border border-[#e4e4e2]">
-                Precision:{' '}
-                <strong className="font-mono tabular-nums text-[#141414]">{(avgPrecision * 100).toFixed(1)}%</strong>
-              </span>
-              <span className="px-2.5 py-1 rounded-md bg-white border border-[#e4e4e2]">
-                Coverage:{' '}
-                <strong className="font-mono tabular-nums text-[#141414]">{(avgCoverage * 100).toFixed(1)}%</strong>
-              </span>
               {rrList.length > 0 && (
                 <div className="inline-flex items-center h-7 p-0.5 rounded-md bg-[#ededeb] border border-[#e4e4e2]">
                   <button
@@ -1169,109 +1568,187 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
             />
           ) : (
             <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 min-h-0 overflow-hidden">
-              {/* Left: Testcases with Retrieval Scores */}
-              <div className="lg:col-span-4 border-r border-[#e8e8e6] overflow-y-auto bg-[#fafaf9]">
-                <div className="px-4 py-2 border-b border-[#ededeb] text-[11px] font-mono text-[#52525b] sticky top-0 bg-[#fafaf9] z-10">
-                  KẾT QUẢ THEO CÂU HỎI ({groups.length})
-                </div>
-                {groups.map((g) => (
-                  <button
-                    key={g.testcase.id}
-                    type="button"
-                    onClick={() => setSelectedGroup(g)}
-                    className={`w-full text-left px-4 py-3 border-b border-[#ededeb] transition-colors ${
-                      selectedGroup?.testcase.id === g.testcase.id
-                        ? 'bg-white border-l-2 border-l-[#027a42]'
-                        : 'hover:bg-white/70'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-1.5">
-                        <span
-                          className={`size-2 rounded-full shrink-0 ${
-                            g.relevant_count > 0
-                              ? 'bg-[#03aa5c]'
-                              : g.hits.length > 0
-                              ? 'bg-[#d6656c]'
-                              : 'bg-[#d4d4d8]'
-                          }`}
-                        />
-                        <span className="font-mono text-xs font-semibold text-[#141414]">{g.testcase.tc_code}</span>
-                        <span
-                          className={`text-[10px] px-1.5 py-0.5 rounded border ${
-                            CLASS_BADGE[g.testcase.question_class] || CLASS_BADGE.Local
+              {/* Left: Compact Filterable Testcase List */}
+              <div className="lg:col-span-4 border-r border-[#e8e8e6] flex flex-col min-h-0 bg-[#fafaf9]">
+                <div className="px-3 py-2 border-b border-[#e8e8e6] bg-[#fafaf9] space-y-2 shrink-0">
+                  <div className="flex items-center justify-between gap-1.5">
+                    <div className="inline-flex items-center p-0.5 rounded-md bg-[#ededeb] border border-[#e4e4e2] text-[11px]">
+                      {(
+                        [
+                          { id: 'ALL', label: `Tất cả (${groups.length})` },
+                          { id: 'FAIL', label: `Fail (${failGroupCount})` },
+                          { id: 'PASS', label: `Pass (${passGroupCount})` },
+                        ] as const
+                      ).map((f) => (
+                        <button
+                          key={f.id}
+                          type="button"
+                          onClick={() => setResFilter(f.id)}
+                          className={`px-2 py-0.5 rounded-[4px] transition-colors ${
+                            resFilter === f.id
+                              ? f.id === 'FAIL'
+                                ? 'bg-white text-[#b91c1c] font-semibold shadow-2xs'
+                                : f.id === 'PASS'
+                                  ? 'bg-white text-[#027a42] font-semibold shadow-2xs'
+                                  : 'bg-white text-[#141414] font-semibold shadow-2xs'
+                              : 'text-[#52525b] hover:text-[#141414]'
                           }`}
                         >
-                          {g.testcase.question_class}
-                        </span>
-                      </div>
-                      <span
-                        className={`font-mono text-xs font-semibold tabular-nums ${
-                          g.contextual_precision >= 0.5 ? 'text-[#027a42]' : 'text-[#b91c1c]'
+                          {f.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="inline-flex items-center w-full h-7 bg-white border border-[#dcdcd8] focus-within:border-[#141414] rounded-md px-2 gap-1.5 transition-colors">
+                    <Search className="size-3 text-[#a1a1aa] shrink-0" />
+                    <input
+                      type="text"
+                      value={resSearch}
+                      onChange={(e) => setResSearch(e.target.value)}
+                      placeholder="Tìm mã TC, câu hỏi, tên file..."
+                      className="w-full text-xs text-[#141414] placeholder:text-[#a1a1aa] bg-transparent focus:outline-none"
+                    />
+                    {resSearch && (
+                      <button
+                        type="button"
+                        onClick={() => setResSearch('')}
+                        className="text-[#a1a1aa] hover:text-[#141414]"
+                      >
+                        <X className="size-3" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex-1 overflow-y-auto">
+                  {filteredGroups.map((g) => {
+                    const isPass = g.contextual_precision >= 0.5 && g.relevant_count > 0;
+                    const isSel = selectedGroup?.testcase.id === g.testcase.id;
+                    return (
+                      <button
+                        key={g.testcase.id}
+                        type="button"
+                        onClick={() => {
+                          setSelectedGroup(g);
+                          setOnlyRelHits(false);
+                          setInspectHitId(null);
+                        }}
+                        className={`w-full text-left px-3.5 py-2.5 border-b border-[#ededeb] transition-colors ${
+                          isSel
+                            ? 'bg-white border-l-[3px] border-l-[#027a42]'
+                            : 'hover:bg-white/75'
                         }`}
                       >
-                        {(g.contextual_precision * 100).toFixed(0)}%
-                      </span>
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            <span
+                              className={`size-1.5 rounded-full shrink-0 ${
+                                isPass ? 'bg-[#03aa5c]' : 'bg-[#d6656c]'
+                              }`}
+                            />
+                            <span className="font-mono text-xs font-semibold text-[#141414]">{g.testcase.tc_code}</span>
+                            <span
+                              className={`text-[10px] px-1.5 py-0 rounded border ${
+                                CLASS_BADGE[g.testcase.question_class] || CLASS_BADGE.Local
+                              }`}
+                            >
+                              {g.testcase.question_class}
+                            </span>
+                            <span className="font-mono text-[10.5px] text-[#78716c]">
+                              {g.relevant_count}/{g.hits.length}
+                            </span>
+                          </div>
+                          <span
+                            className={`font-mono text-xs font-semibold tabular-nums ${
+                              isPass ? 'text-[#027a42]' : 'text-[#b91c1c]'
+                            }`}
+                          >
+                            {(g.contextual_precision * 100).toFixed(0)}%
+                          </span>
+                        </div>
+                        <div className="text-[12.5px] text-[#27272a] line-clamp-2 mt-1 leading-snug">
+                          {g.testcase.input_question}
+                        </div>
+                      </button>
+                    );
+                  })}
+                  {filteredGroups.length === 0 && (
+                    <div className="p-6 text-center text-xs text-[#71717a]">
+                      Không có câu hỏi nào khớp bộ lọc.
                     </div>
-                    <div className="text-[13px] text-[#27272a] line-clamp-2 mt-1.5">{g.testcase.input_question}</div>
-                    <div className="text-[11px] text-[#78716c] mt-1">
-                      Đúng {g.relevant_count}/{g.hits.length} đoạn trả về · {AC_LABELS[g.meta.answer_containment] || g.meta.answer_containment}
-                    </div>
-                  </button>
-                ))}
+                  )}
+                </div>
               </div>
 
-              {/* Right: Question & Top-K Hits */}
-              <div className="lg:col-span-8 overflow-y-auto p-6 space-y-5 bg-white">
+              {/* Right: Compact Question Header + Quick-Jump Top-K Hits */}
+              <div className="lg:col-span-8 overflow-y-auto px-6 py-4 space-y-4 bg-white">
                 {selectedGroup ? (
                   <>
-                    <div className="border border-[#e6e6e3] rounded-lg p-5 space-y-3.5 bg-[#fafaf9]">
+                    <div className="border border-[#e6e6e3] rounded-lg p-4 space-y-2.5 bg-[#fafaf9]">
                       <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div className="flex items-center gap-2">
-                          <span className="font-mono text-xs font-bold px-2 py-0.5 rounded bg-[#141414] text-white">
+                        <div className="flex flex-wrap items-center gap-2 min-w-0">
+                          <span className="font-mono text-xs font-bold px-2 py-0.5 rounded bg-[#141414] text-white shrink-0">
                             {selectedGroup.testcase.tc_code}
                           </span>
-                          <span className="text-xs text-[#71717a]">
-                            Nguồn: {selectedGroup.testcase.source_file || '—'} ·{' '}
+                          <span className="text-xs text-[#71717a] truncate">
+                            {selectedGroup.testcase.source_file || '—'} ·{' '}
                             {AC_LABELS[selectedGroup.meta.answer_containment] || selectedGroup.meta.answer_containment}
                           </span>
                         </div>
-                        <span className="font-mono text-xs font-semibold text-[#027a42]">
-                          Precision: {(selectedGroup.contextual_precision * 100).toFixed(0)}%
+                        <span
+                          className={`font-mono text-xs font-semibold px-2 py-0.5 rounded-full ${
+                            selectedGroup.contextual_precision >= 0.5 && selectedGroup.relevant_count > 0
+                              ? 'bg-[#f2fbf6] text-[#027a42] border border-[#bbf7d0]'
+                              : 'bg-[#fef2f2] text-[#b91c1c] border border-[#fecaca]'
+                          }`}
+                        >
+                          Precision {(selectedGroup.contextual_precision * 100).toFixed(0)}% · Đúng {selectedGroup.relevant_count}/{selectedGroup.hits.length}
                         </span>
                       </div>
 
-                      <h2 className="text-base font-semibold text-[#141414] text-balance">
+                      <h2 className="text-[15px] font-semibold text-[#141414] leading-snug">
                         {selectedGroup.testcase.input_question}
                       </h2>
 
-                      <div className="bg-white border border-[#e6e6e3] rounded-md p-3.5 space-y-1">
-                        <div className="text-[10.5px] font-semibold uppercase tracking-wider text-[#78716c]">
-                          Đoạn căn cứ chuẩn trong tài liệu gốc
+                      <div className="bg-white border border-[#e6e6e3] rounded-md px-3 py-2 space-y-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[10px] font-semibold uppercase tracking-wider text-[#78716c]">
+                            Đoạn căn cứ chuẩn trong tài liệu gốc
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setRefCollapsed((v) => !v)}
+                            className="inline-flex items-center gap-0.5 text-[11px] text-[#71717a] hover:text-[#141414]"
+                          >
+                            {refCollapsed ? <ChevronDown className="size-3" /> : <ChevronUp className="size-3" />}
+                            {refCollapsed ? 'Mở rộng' : 'Thu gọn'}
+                          </button>
                         </div>
-                        <div className="text-[13px] text-[#27272a] leading-relaxed text-pretty whitespace-pre-wrap">
-                          {selectedGroup.testcase.reference_context}
-                        </div>
+                        {!refCollapsed && (
+                          <div className="text-[12.5px] text-[#27272a] leading-relaxed whitespace-pre-wrap max-h-28 overflow-y-auto">
+                            {selectedGroup.testcase.reference_context}
+                          </div>
+                        )}
                       </div>
 
-                      <div className="pt-2 border-t border-[#e8e8e6] flex flex-wrap items-center gap-4 text-xs">
-                        <label className="flex items-center gap-2 text-[#3f3f46]">
-                          <span>Độ phủ (0–1):</span>
+                      <div className="pt-2 border-t border-[#e8e8e6] flex flex-wrap items-center gap-3 text-xs">
+                        <label className="flex items-center gap-1.5 text-[#52525b]">
+                          <span>Độ phủ:</span>
                           <input
                             type="number"
                             step="0.1"
                             min="0"
                             max="1"
-                            className="ts-input py-1 w-16 text-center font-mono text-xs"
+                            className="ts-input py-0.5 w-14 text-center font-mono text-xs bg-white"
                             value={selectedGroup.meta.context_coverage}
-                            onChange={(e) => handleMetaUpdate({ context_coverage: Number(e.target.value) })}
+                            onChange={(e) => handleMetaUpdate({ context_coverage: Number(e.target.value) }, 400)}
                           />
                         </label>
 
-                        <label className="flex items-center gap-2 text-[#3f3f46]">
-                          <span>Nguyên nhân gốc:</span>
+                        <label className="flex items-center gap-1.5 text-[#52525b]">
+                          <span>Nguyên nhân:</span>
                           <select
-                            className="ts-input py-1 text-xs"
+                            className="ts-input py-0.5 text-xs bg-white"
                             value={selectedGroup.meta.root_cause_layer || 'NONE'}
                             onChange={(e) => handleMetaUpdate({ root_cause_layer: e.target.value })}
                           >
@@ -1290,10 +1767,10 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
                           type="button"
                           onClick={handleDiagnose}
                           disabled={diagnosing}
-                          className="ml-auto inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-[#141414] text-white hover:bg-[#27272a] disabled:opacity-50 transition-colors"
+                          className="ml-auto inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md border border-[#d4d4d8] bg-white hover:bg-[#141414] hover:text-white hover:border-[#141414] text-[#141414] disabled:opacity-50 transition-colors"
                         >
                           {diagnosing ? <Loader2 className="size-3.5 animate-spin" /> : <Search className="size-3.5" />}
-                          {diagnosing ? 'Đang soi kho chunk...' : 'Soi nguyên nhân gốc'}
+                          {diagnosing ? 'Đang soi...' : 'Soi nguyên nhân gốc'}
                         </button>
                       </div>
                     </div>
@@ -1415,99 +1892,305 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
                       </div>
                     )}
 
-                    <div className="space-y-3">
-                      <div className="ts-eyebrow">TOP {selectedGroup.hits.length} ĐOẠN RAGFLOW TÌM ĐƯỢC</div>
-                      {selectedGroup.hits.map((hit) => (
+                    {/* Top-K Hits: Compact Clickable List (Click any row to open floating detail modal) */}
+                    <div className="space-y-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2 pb-1.5 border-b border-[#f0f0ee]">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="ts-eyebrow">TOP {selectedGroup.hits.length} ĐOẠN RAGFLOW TÌM ĐƯỢC</span>
+                          <span className="text-[11px] text-[#71717a]">(Nhấn vào từng đoạn để xem chi tiết)</span>
+                        </div>
+                        <div className="inline-flex items-center p-0.5 rounded-md bg-[#f4f4f2] border border-[#e4e4e2] text-[11px]">
+                          <button
+                            type="button"
+                            onClick={() => setOnlyRelHits(false)}
+                            className={`px-2 py-0.5 rounded-[4px] ${!onlyRelHits ? 'bg-white text-[#141414] font-medium shadow-2xs' : 'text-[#71717a]'}`}
+                          >
+                            Tất cả ({selectedGroup.hits.length})
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setOnlyRelHits(true)}
+                            className={`px-2 py-0.5 rounded-[4px] ${onlyRelHits ? 'bg-white text-[#027a42] font-medium shadow-2xs' : 'text-[#71717a]'}`}
+                          >
+                            Đoạn đúng ({selectedGroup.relevant_count})
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="border border-[#e6e6e3] rounded-lg overflow-hidden divide-y divide-[#ededeb] bg-white">
+                        {selectedGroup.hits
+                          .filter((hit) => !onlyRelHits || hit.relevant === 1)
+                          .map((hit) => {
+                            const isRel = hit.relevant === 1;
+                            return (
+                              <div
+                                id={`hit-card-${hit.id}`}
+                                key={hit.id}
+                                role="button"
+                                tabIndex={0}
+                                onClick={() => setInspectHitId(hit.id)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter' || e.key === ' ') {
+                                    e.preventDefault();
+                                    setInspectHitId(hit.id);
+                                  }
+                                }}
+                                className={`px-3.5 py-2.5 flex items-center justify-between gap-3 cursor-pointer transition-colors ${
+                                  isRel
+                                    ? 'bg-[#f2fbf6]/55 hover:bg-[#ecfdf3] border-l-[3px] border-l-[#03aa5c]'
+                                    : 'bg-white hover:bg-[#fafaf9] border-l-[3px] border-l-transparent'
+                                }`}
+                              >
+                                <div className="min-w-0 flex-1 space-y-1">
+                                  <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                                    <span
+                                      className={`font-mono text-[11px] font-bold px-1.5 py-0.5 rounded shrink-0 ${
+                                        isRel ? 'bg-[#027a42] text-white' : 'bg-[#52525b] text-white'
+                                      }`}
+                                    >
+                                      #{hit.rank}
+                                    </span>
+                                    {isRel ? (
+                                      <span className="text-[10.5px] font-semibold px-1.5 py-0.5 rounded bg-[#dcfce7] text-[#027a42] shrink-0">
+                                        Liên quan
+                                      </span>
+                                    ) : hit.relevant === 0 ? (
+                                      <span className="text-[10.5px] font-medium px-1.5 py-0.5 rounded bg-[#ededeb] text-[#71717a] shrink-0">
+                                        Không liên quan
+                                      </span>
+                                    ) : null}
+                                    <span className="font-medium text-[#141414] truncate">{hit.doc_name || 'Tài liệu'}</span>
+                                    {hit.relevancy_source === 'CACHED' && (
+                                      <span className="inline-flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded bg-[#f4f4f2] text-[#52525b] shrink-0">
+                                        <Sparkles className="size-2.5 text-[#027a42]" /> Cache
+                                      </span>
+                                    )}
+                                    {hit.relevancy_source === 'JEV_DRAFT' && (
+                                      <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-[#f2fbf6] border border-[#03aa5c]/40 text-[#027a42] font-semibold shrink-0">
+                                        JEV
+                                      </span>
+                                    )}
+                                    {hit.relevancy_source === 'LLM_DRAFT' && (
+                                      <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-[#fafaf9] border border-[#e4e4e2] text-[#52525b] shrink-0">
+                                        LLM
+                                      </span>
+                                    )}
+                                    {hit.relevancy_source === 'RULE' && (
+                                      <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-[#fffbeb] border border-[#fde68a] text-[#92400e] shrink-0">
+                                        RULE
+                                      </span>
+                                    )}
+                                    {hit.relevancy_source === 'MANUAL' && (
+                                      <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-[#141414] text-white shrink-0">
+                                        MANUAL
+                                      </span>
+                                    )}
+                                  </div>
+                                  {hit.reason && (
+                                    <div
+                                      className={`text-[11.5px] truncate ${
+                                        hit.reason.includes('Cần duyệt') || hit.reason.includes('Fallback')
+                                          ? 'text-[#92400e]'
+                                          : isRel
+                                            ? 'text-[#027a42]'
+                                            : 'text-[#71717a]'
+                                      }`}
+                                    >
+                                      {hit.reason}
+                                    </div>
+                                  )}
+                                </div>
+
+                                <div className="flex items-center gap-2 shrink-0" onClick={(e) => e.stopPropagation()}>
+                                  <span className="font-mono text-[11px] text-[#71717a] tabular-nums w-12 text-right">
+                                    {(hit.similarity * 100).toFixed(0)}%
+                                  </span>
+                                  <div className="flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => handleScoreHit(hit.id, 1, 'Chứa thông tin trả lời')}
+                                      title="Đánh dấu Đúng (Liên quan)"
+                                      className={`inline-flex items-center justify-center size-6 rounded border transition-colors ${
+                                        isRel
+                                          ? 'bg-[#027a42] text-white border-[#027a42]'
+                                          : 'bg-white text-[#71717a] border-[#e4e4e2] hover:border-[#027a42] hover:text-[#027a42]'
+                                      }`}
+                                    >
+                                      <Check className="size-3.5" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleScoreHit(hit.id, 0, 'Không liên quan')}
+                                      title="Đánh dấu Không liên quan"
+                                      className={`inline-flex items-center justify-center size-6 rounded border transition-colors ${
+                                        hit.relevant === 0
+                                          ? 'bg-[#b91c1c] text-white border-[#b91c1c]'
+                                          : 'bg-white text-[#71717a] border-[#e4e4e2] hover:border-[#b91c1c] hover:text-[#b91c1c]'
+                                      }`}
+                                    >
+                                      <X className="size-3.5" />
+                                    </button>
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })}
+                      </div>
+                      {onlyRelHits && selectedGroup.relevant_count === 0 && (
+                        <div className="p-6 text-center text-xs text-[#71717a] border border-dashed border-[#e4e4e2] rounded-lg">
+                          Không có đoạn nào được đánh dấu liên quan trong Top-{selectedGroup.hits.length}.
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Floating Modal: Chunk Hit Detail */}
+                    {(() => {
+                      const inspectHit = inspectHitId
+                        ? selectedGroup.hits.find((h) => h.id === inspectHitId) || null
+                        : null;
+                      if (!inspectHit) return null;
+                      const hitIdx = selectedGroup.hits.findIndex((h) => h.id === inspectHit.id);
+                      const isRel = inspectHit.relevant === 1;
+                      return (
                         <div
-                          key={hit.id}
-                          className={`border rounded-lg p-4 space-y-3 transition-colors ${
-                            hit.relevant === 1
-                              ? 'border-[#bbf7d0] bg-[#f2fbf6]/60'
-                              : hit.relevant === 0
-                              ? 'border-[#ededeb] bg-[#fafaf9] opacity-85'
-                              : 'border-[#e6e6e3] bg-white'
-                          }`}
+                          className="fixed inset-0 z-50 bg-black/35 flex items-center justify-center p-4"
+                          onClick={() => setInspectHitId(null)}
                         >
-                          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                            <div className="flex items-center gap-2">
-                              <span className="font-mono text-xs font-bold px-1.5 py-0.5 rounded bg-[#141414] text-white">
-                                #{hit.rank}
+                          <div
+                            className="bg-white border border-[#dedede] rounded-xl w-full max-w-4xl max-h-[88vh] flex flex-col overflow-hidden shadow-2xl"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            {/* Modal Header */}
+                            <div className="px-5 py-3 border-b border-[#e8e8e6] bg-[#fafaf9] flex flex-wrap items-center justify-between gap-3 shrink-0">
+                              <div className="flex flex-wrap items-center gap-2 min-w-0">
+                                <div className="inline-flex items-center rounded border border-[#dcdcd8] bg-white overflow-hidden">
+                                  <button
+                                    type="button"
+                                    disabled={hitIdx <= 0}
+                                    onClick={() => setInspectHitId(selectedGroup.hits[hitIdx - 1].id)}
+                                    className="p-1 text-[#52525b] hover:bg-[#f4f4f2] disabled:opacity-30"
+                                    title="Đoạn trước (←)"
+                                  >
+                                    <ChevronLeft className="size-3.5" />
+                                  </button>
+                                  <span className="px-2 font-mono text-[11px] font-semibold text-[#141414] border-x border-[#ededeb]">
+                                    #{inspectHit.rank}/{selectedGroup.hits.length}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    disabled={hitIdx < 0 || hitIdx >= selectedGroup.hits.length - 1}
+                                    onClick={() => setInspectHitId(selectedGroup.hits[hitIdx + 1].id)}
+                                    className="p-1 text-[#52525b] hover:bg-[#f4f4f2] disabled:opacity-30"
+                                    title="Đoạn sau (→)"
+                                  >
+                                    <ChevronRight className="size-3.5" />
+                                  </button>
+                                </div>
+                                <span
+                                  className={`text-[11px] font-semibold px-2 py-0.5 rounded ${
+                                    isRel ? 'bg-[#dcfce7] text-[#027a42]' : 'bg-[#ededeb] text-[#52525b]'
+                                  }`}
+                                >
+                                  {isRel ? 'Liên quan' : inspectHit.relevant === 0 ? 'Không liên quan' : 'Chưa chấm'}
+                                </span>
+                                <span className="text-xs font-semibold text-[#141414] truncate">
+                                  {inspectHit.doc_name || 'Tài liệu'}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-3 shrink-0">
+                                <span className="font-mono text-xs text-[#71717a] tabular-nums">
+                                  Khớp <strong className="text-[#141414]">{(inspectHit.similarity * 100).toFixed(0)}%</strong>
+                                </span>
+                                <span className="text-[11px] text-[#a1a1aa] hidden sm:inline">←/→ chuyển · Esc đóng</span>
+                                <button
+                                  type="button"
+                                  onClick={() => setInspectHitId(null)}
+                                  className="p-1 rounded hover:bg-[#ededeb] text-[#52525b] hover:text-[#141414]"
+                                  aria-label="Đóng"
+                                >
+                                  <X className="size-4" />
+                                </button>
+                              </div>
+                            </div>
+
+                            {/* Modal Body */}
+                            <div className="flex-1 overflow-y-auto p-5 space-y-4">
+                              {/* Reference Comparison Strip */}
+                              <div className="bg-[#fafaf9] border border-[#e6e6e3] rounded-lg p-3.5 space-y-1.5">
+                                <div className="flex items-center gap-2 text-xs">
+                                  <span className="font-mono font-bold px-1.5 py-0.5 rounded bg-[#141414] text-white text-[10.5px]">
+                                    {selectedGroup.testcase.tc_code}
+                                  </span>
+                                  <span className="font-semibold text-[#141414]">
+                                    {selectedGroup.testcase.input_question}
+                                  </span>
+                                </div>
+                                <div className="text-[12px] text-[#52525b] leading-relaxed whitespace-pre-wrap max-h-24 overflow-y-auto pl-1 border-l-2 border-[#d4d4d8]">
+                                  {selectedGroup.testcase.reference_context}
+                                </div>
+                              </div>
+
+                              {/* AI Reason Banner */}
+                              {inspectHit.reason && (
+                                <div
+                                  className={`text-xs px-3 py-2 rounded-md border ${
+                                    inspectHit.reason.includes('Cần duyệt') || inspectHit.reason.includes('Fallback')
+                                      ? 'bg-[#fffbeb] border-[#fde68a] text-[#92400e]'
+                                      : isRel
+                                        ? 'bg-[#f2fbf6] border-[#bbf7d0] text-[#027a42]'
+                                        : 'bg-[#fafaf9] border-[#e4e4e2] text-[#3f3f46]'
+                                  }`}
+                                >
+                                  <span className="font-mono text-[10px] uppercase font-semibold mr-2 px-1.5 py-0.5 rounded bg-white border border-black/10">
+                                    {inspectHit.relevancy_source}
+                                  </span>
+                                  {inspectHit.reason}
+                                </div>
+                              )}
+
+                              {/* Full Chunk Content */}
+                              <div className="space-y-1.5">
+                                <div className="text-[10.5px] font-semibold uppercase tracking-wider text-[#71717a]">
+                                  Nội dung đoạn #{inspectHit.rank} RAGFlow tìm được
+                                </div>
+                                <ChunkContentView content={inspectHit.content} />
+                              </div>
+                            </div>
+
+                            {/* Modal Footer: Manual Scoring */}
+                            <div className="px-5 py-3 border-t border-[#e8e8e6] bg-[#fafaf9] flex items-center justify-between gap-2 shrink-0">
+                              <span className="text-[11px] text-[#71717a]">
+                                Chấm lại thủ công sẽ lưu vào Smart Cache cho các lần chạy sau.
                               </span>
-                              <span className="font-medium text-[#141414]">{hit.doc_name || 'Tài liệu'}</span>
-                              {hit.relevancy_source === 'CACHED' && (
-                                <span className="inline-flex items-center gap-1 text-[10.5px] px-1.5 py-0.5 rounded bg-[#f4f4f2] text-[#52525b]">
-                                  <Sparkles className="size-3 text-[#027a42]" /> Kế thừa cache
-                                </span>
-                              )}
-                              {hit.relevancy_source === 'JEV_DRAFT' && (
-                                <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-[#f2fbf6] border border-[#03aa5c]/40 text-[#027a42] font-semibold">
-                                  JEV
-                                </span>
-                              )}
-                              {hit.relevancy_source === 'LLM_DRAFT' && (
-                                <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-[#f4f4f2] border border-[#e4e4e2] text-[#3f3f46]">
-                                  LLM
-                                </span>
-                              )}
-                              {hit.relevancy_source === 'RULE' && (
-                                <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-[#fffbeb] border border-[#fde68a] text-[#92400e]">
-                                  RULE
-                                </span>
-                              )}
-                              {hit.relevancy_source === 'MANUAL' && (
-                                <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-[#141414] text-white">
-                                  MANUAL
-                                </span>
-                              )}
-                            </div>
-                            <span className="font-mono text-[#71717a] tabular-nums">
-                              Khớp: <strong className="text-[#141414]">{(hit.similarity * 100).toFixed(0)}%</strong>
-                            </span>
-                          </div>
-
-                          {hit.reason && (
-                            <div
-                              className={`text-[11px] font-mono px-2.5 py-1 rounded border ${
-                                hit.reason.includes('Cần duyệt') || hit.reason.includes('Fallback')
-                                  ? 'bg-[#fffbeb] border-[#fde68a] text-[#92400e]'
-                                  : 'bg-[#fafaf9] border-[#ededeb] text-[#52525b]'
-                              }`}
-                            >
-                              {hit.reason}
-                            </div>
-                          )}
-
-                          <ChunkContentView content={hit.content} />
-
-                          <div className="flex items-center justify-end gap-2">
-                            <div className="flex items-center gap-2 shrink-0">
-                              <button
-                                type="button"
-                                onClick={() => handleScoreHit(hit.id, 1, 'Chứa thông tin trả lời')}
-                                className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-medium border ${
-                                  hit.relevant === 1
-                                    ? 'bg-[#027a42] text-white border-[#027a42]'
-                                    : 'bg-white text-[#3f3f46] border-[#e4e4e2] hover:border-[#027a42]'
-                                }`}
-                              >
-                                <Check className="size-3.5" /> Đúng
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => handleScoreHit(hit.id, 0, 'Không liên quan')}
-                                className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-medium border ${
-                                  hit.relevant === 0
-                                    ? 'bg-[#b91c1c] text-white border-[#b91c1c]'
-                                    : 'bg-white text-[#3f3f46] border-[#e4e4e2] hover:border-[#b91c1c]'
-                                }`}
-                              >
-                                <X className="size-3.5" /> Không liên quan
-                              </button>
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => handleScoreHit(inspectHit.id, 1, 'Chứa thông tin trả lời')}
+                                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border ${
+                                    isRel
+                                      ? 'bg-[#027a42] text-white border-[#027a42]'
+                                      : 'bg-white text-[#3f3f46] border-[#e4e4e2] hover:border-[#027a42]'
+                                  }`}
+                                >
+                                  <Check className="size-3.5" /> Đúng (Liên quan)
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleScoreHit(inspectHit.id, 0, 'Không liên quan')}
+                                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border ${
+                                    inspectHit.relevant === 0
+                                      ? 'bg-[#b91c1c] text-white border-[#b91c1c]'
+                                      : 'bg-white text-[#3f3f46] border-[#e4e4e2] hover:border-[#b91c1c]'
+                                  }`}
+                                >
+                                  <X className="size-3.5" /> Không liên quan
+                                </button>
+                              </div>
                             </div>
                           </div>
                         </div>
-                      ))}
-                    </div>
+                      );
+                    })()}
                   </>
                 ) : (
                   <div className="h-full flex items-center justify-center text-sm text-[#71717a]">
@@ -1525,11 +2208,20 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
         <div className="fixed inset-0 z-50 bg-black/25 flex items-center justify-center p-4">
           <form onSubmit={handleExecuteBenchmark} className="bg-white border border-[#e4e4e2] rounded-lg w-full max-w-md p-6 space-y-4 shadow-xl">
             <div className="flex items-center justify-between">
-              <h2 className="text-base font-semibold text-[#141414]">Chạy kiểm thử tìm kiếm mới</h2>
+              <h2 className="text-base font-semibold text-[#141414]">
+                {baselineRr ? 'Chạy thử nghiệm cấu hình mới' : 'Chạy cấu hình gốc (Baseline)'}
+              </h2>
               <button type="button" onClick={() => setShowRunModal(false)} aria-label="Đóng">
                 <X className="size-4 text-[#71717a]" />
               </button>
             </div>
+            {baselineRr && (
+              <div className="text-[11px] bg-[#fafaf9] border border-[#e8e8e6] rounded-md px-3 py-2 text-[#52525b] font-mono">
+                <span className="font-sans font-semibold text-[#141414] mr-1.5">Cấu hình gốc (Baseline):</span>
+                Top-{baselineRr.top_k} · th={baselineRr.similarity_threshold} · vec={baselineRr.vector_similarity_weight}{' '}
+                · {baselineRr.rerank_id ? `rerank=${baselineRr.rerank_id}` : 'no-rerank'}
+              </div>
+            )}
             <div className="space-y-3">
               <div>
                 <label className="block text-xs text-[#52525b] mb-1">Tên lần chạy</label>
@@ -1537,21 +2229,77 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
               </div>
               <div className="grid grid-cols-3 gap-2.5">
                 <div>
-                  <label className="block text-xs text-[#52525b] mb-1">Top-K</label>
-                  <input type="number" className="ts-input w-full font-mono" value={topK} onChange={(e) => setTopK(Number(e.target.value))} />
+                  <label className="block text-xs text-[#52525b] mb-1">Top N (trả về)</label>
+                  <input type="number" min={1} max={50} className="ts-input w-full font-mono" value={topK} onChange={(e) => setTopK(Number(e.target.value))} />
                 </div>
                 <div>
                   <label className="block text-xs text-[#52525b] mb-1">Ngưỡng lọc</label>
-                  <input type="number" step="0.05" className="ts-input w-full font-mono" value={threshold} onChange={(e) => setThreshold(Number(e.target.value))} />
+                  <input type="number" step="0.05" min={0} max={1} className="ts-input w-full font-mono" value={threshold} onChange={(e) => setThreshold(Number(e.target.value))} />
                 </div>
                 <div>
                   <label className="block text-xs text-[#52525b] mb-1">Tỷ trọng Vector</label>
-                  <input type="number" step="0.1" className="ts-input w-full font-mono" value={vecWeight} onChange={(e) => setVecWeight(Number(e.target.value))} />
+                  <input type="number" step="0.1" min={0} max={1} className="ts-input w-full font-mono" value={vecWeight} onChange={(e) => setVecWeight(Number(e.target.value))} />
                 </div>
               </div>
-              <div>
-                <label className="block text-xs text-[#52525b] mb-1">Model Rerank (để trống nếu tắt)</label>
-                <input className="ts-input w-full font-mono text-xs" placeholder="BAAI/bge-reranker-v2-m3" value={rerankId} onChange={(e) => setRerankId(e.target.value)} />
+              <div className="text-[11px] text-[#71717a] font-mono -mt-1.5">
+                Tỷ lệ tìm kiếm: Vector {Math.round(Math.max(0, Math.min(1, vecWeight)) * 100)}% · Keyword{' '}
+                {Math.round((1 - Math.max(0, Math.min(1, vecWeight))) * 100)}%
+              </div>
+              <div className="rounded-md border border-[#e8e8e6] bg-[#fafaf9] px-3 py-2.5 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <label
+                    className={`flex items-center gap-2 text-xs font-medium ${
+                      rerankModels.length > 0 ? 'text-[#141414] cursor-pointer' : 'text-[#a1a1aa] cursor-not-allowed'
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={useRerank && rerankModels.length > 0}
+                      disabled={rerankModels.length === 0}
+                      onChange={(e) => setUseRerank(e.target.checked)}
+                      className="rounded border-[#d4d4d8]"
+                    />
+                    <span>Dùng Rerank (từ RAGFlow)</span>
+                    {loadingReranks ? (
+                      <span className="text-[11px] font-normal text-[#71717a]">đang tải...</span>
+                    ) : rerankModels.length === 0 ? (
+                      <span className="text-[11px] font-normal text-[#a1a1aa]">(chưa có model Rerank trên RAGFlow)</span>
+                    ) : (
+                      <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-white border border-[#e4e4e2] text-[#52525b]">
+                        {rerankModels.length} model
+                      </span>
+                    )}
+                  </label>
+                  {useRerank && rerankModels.length > 0 && (
+                    <label
+                      className="flex items-center gap-1.5 text-[11px] text-[#52525b] shrink-0"
+                      title="Số ứng viên vòng sơ loại đưa vào Reranker"
+                    >
+                      <span>Cand.</span>
+                      <input
+                        type="number"
+                        min={10}
+                        max={1024}
+                        className="ts-input py-0.5 w-14 text-center font-mono text-xs bg-white"
+                        value={rerankCandidates}
+                        onChange={(e) => setRerankCandidates(Number(e.target.value) || 64)}
+                      />
+                    </label>
+                  )}
+                </div>
+                {useRerank && rerankModels.length > 0 && (
+                  <select
+                    className="ts-input w-full text-xs bg-white font-mono"
+                    value={selectedRerankId}
+                    onChange={(e) => setSelectedRerankId(e.target.value)}
+                  >
+                    {rerankModels.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.label}
+                      </option>
+                    ))}
+                  </select>
+                )}
               </div>
               <div>
                 <label className="block text-xs text-[#52525b] mb-1">Bộ chấm Relevancy ({testcases.length} câu · Top-{topK})</label>
@@ -1583,6 +2331,19 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
             </div>
           </form>
         </div>
+      )}
+
+      {/* Modal: Import Golden Testcases from Excel / CSV */}
+      {showImportExcel && activeRun && (
+        <ImportGoldenModal
+          runId={activeRun.id}
+          runName={activeRun.name}
+          onClose={() => setShowImportExcel(false)}
+          onImported={async () => {
+            await loadTestcases();
+            if (selectedRrId) await loadResults(selectedRrId);
+          }}
+        />
       )}
 
       {/* Modal: Add Golden Testcase */}
@@ -1632,6 +2393,24 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun }) => {
           </form>
         </div>
       )}
+
+      <FloatingProgressOverlay
+        state={taskProgress}
+        fallback={
+          loadingTc
+            ? {
+                title: 'Đang tải bộ câu hỏi Golden',
+                subtitle: 'Đang nạp danh sách testcase & ngữ cảnh chuẩn...',
+              }
+            : diagnosing
+            ? {
+                title: 'Đang chẩn đoán nguyên nhân lỗi Retrieval',
+                subtitle: 'Đối chiếu tầng Parsing, Chunking và Retrieval...',
+              }
+            : null
+        }
+        moduleLabel="RETRIEVAL QC"
+      />
     </div>
   );
 };

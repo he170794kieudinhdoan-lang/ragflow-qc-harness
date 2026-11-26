@@ -45,6 +45,7 @@ def read_settings():
 def update_settings(payload: SettingsPayload):
     old_api_key = get_setting("ragflow_api_key", "").strip()
     old_base_url = get_setting("ragflow_base_url", "").strip().rstrip("/")
+    old_demo = get_setting("demo_mode", "false").strip().lower()
 
     for k, v in payload.settings.items():
         if k in ("has_ragflow_key", "has_llm_key", "has_vision_key", "has_systemone_key"):
@@ -53,6 +54,11 @@ def update_settings(payload: SettingsPayload):
         if k == "ragflow_base_url":
             value = value.strip().rstrip("/")
         set_setting(k, value)
+
+    new_demo = str(payload.settings.get("demo_mode", old_demo)).strip().lower()
+    if new_demo != old_demo:
+        from routers.pipeline import _DEMO_JOBS
+        _DEMO_JOBS.clear()
 
     new_api_key = str(payload.settings.get("ragflow_api_key", old_api_key)).strip()
     new_base_url = str(payload.settings.get("ragflow_base_url", old_base_url)).strip().rstrip("/")
@@ -63,8 +69,22 @@ def update_settings(payload: SettingsPayload):
         (bool(old_api_key) and new_api_key != old_api_key)
         or (bool(old_base_url) and new_base_url != old_base_url)
     )
+    if account_changed or new_api_key != old_api_key or new_base_url != old_base_url:
+        try:
+            from routers.pipeline import _MODELS_CACHE
+            _MODELS_CACHE["ts"] = 0.0
+            _MODELS_CACHE["key"] = ""
+            _MODELS_CACHE["data"] = None
+        except Exception:
+            pass
 
-    return {"ok": True, "workspace_cleared": False, "account_changed": account_changed}
+    return {
+        "ok": True,
+        "workspace_cleared": False,
+        "account_changed": account_changed,
+        "demo_changed": new_demo != old_demo,
+        "has_ragflow_key": bool(new_api_key),
+    }
 
 
 @router.post("/test-ragflow")
@@ -119,7 +139,7 @@ async def test_systemone_endpoint():
     if not base_url or not model or (systemone_requires_key(base_url) and not api_key):
         raise HTTPException(
             status_code=400,
-            detail="Vui lòng cấu hình System One Base URL, Model (và API Key nếu dùng Vercel/TypeSafe Cloud).",
+            detail="Vui lòng cấu hình System One Base URL, Model (và API Key nếu dùng OpenRouter / Vercel / TypeSafe Cloud).",
         )
     try:
         return await test_system_one_connection(base_url, api_key, model)

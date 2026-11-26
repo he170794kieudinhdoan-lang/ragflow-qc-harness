@@ -146,10 +146,8 @@ async def ensure_units_for_document_async(
         if fp.lower().endswith(".pdf"):
             try:
                 import fitz
-
-                pdf_tmp = fitz.open(fp)
-                page_count = len(pdf_tmp)
-                pdf_tmp.close()
+                with fitz.open(fp) as pdf_tmp:
+                    page_count = len(pdf_tmp)
             except Exception:
                 pass
         with get_db() as conn:

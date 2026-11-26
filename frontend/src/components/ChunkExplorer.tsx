@@ -101,6 +101,15 @@ export const ChunkExplorer: React.FC<Props> = ({ runId, flagLabels }) => {
 
   const reqSeq = useRef(0);
 
+  // Reset per-run filters when switching Dataset/Run so Run A's docId doesn't yield 0 results in Run B
+  useEffect(() => {
+    setDocId('');
+    setFlagFilter('');
+    setPage(0);
+    setShowPdfPreview(false);
+    setSelected(null);
+  }, [runId]);
+
   useEffect(() => {
     const t = setTimeout(() => {
       setDebouncedQuery(queryInput);

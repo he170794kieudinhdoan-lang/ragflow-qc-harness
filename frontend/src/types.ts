@@ -149,6 +149,7 @@ export interface RetrievalRun {
   judge_duration_ms?: number;
   judge_call_count?: number;
   judge_error_count?: number;
+  is_baseline_rr?: number;
   created_at: string;
 }
 
@@ -328,6 +329,31 @@ export interface OptimizationStudy {
   updated_at: string;
 }
 
+export interface PipelineStageState {
+  label: string;
+  status: 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
+  detail: string;
+  progress: number;
+  duration_ms: number;
+}
+
+export interface PipelineJob {
+  id: number;
+  source_run_id: number;
+  target_run_id: number | null;
+  target_dataset_id: string;
+  name: string;
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  current_stage: string;
+  stage_progress: Record<string, PipelineStageState>;
+  stages_order: string[];
+  config: Record<string, any>;
+  error_message: string;
+  total_duration_ms: number;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface ForensicFinding {
   pattern: string;
   severity: 'high' | 'medium' | 'low';
@@ -398,4 +424,22 @@ export interface CanaryVariantDef {
   description: string;
   index_patch: Record<string, any>;
   is_baseline?: boolean;
+}
+
+export interface AiAdvisorChange {
+  layer: 'PARSING' | 'CHUNKING' | 'RETRIEVAL';
+  priority: 'high' | 'medium' | 'low';
+  param_label: string;
+  current_value: string;
+  recommended_value: string;
+  reason: string;
+  affected_tcs?: string[];
+}
+
+export interface AiAdvisorReport {
+  diagnosis: string;
+  bottleneck_layer: 'PARSING' | 'CHUNKING' | 'RETRIEVAL' | 'BALANCED';
+  expected_gain: string;
+  proposed_changes: AiAdvisorChange[];
+  patch_config: Record<string, any>;
 }
