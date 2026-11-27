@@ -368,6 +368,7 @@ export interface LayerDiagnosis {
   findings: ForensicFinding[];
   recommended_knobs: Record<string, any>;
   vision_used?: boolean;
+  model_used?: string;
 }
 
 export interface HypothesisPack {
@@ -404,6 +405,7 @@ export interface SwarmDiagnosisReport {
   cached: boolean;
   evidence_sig: string;
   model_used: string;
+  models_by_agent?: Record<string, string>;
   duration_ms: number;
   llm_calls: number;
   executive_summary: string;

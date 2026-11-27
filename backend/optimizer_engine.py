@@ -17,7 +17,7 @@ import math
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from database import get_current_account_key, get_db, get_setting, utc_now
+from database import get_current_account_key, get_db, get_setting, resolve_golden_run_id, utc_now
 from llm_client import (
     jev_judge_relevance,
     llm_judge_relevance,
@@ -510,12 +510,9 @@ async def run_retrieval_optimization_study(
         judge_cfg = _resolve_judge_cfg(judge_engine)
         client = RAGFlowClient(base_url, api_key)
 
-        acct = get_current_account_key()
         with get_db() as conn:
-            if acct:
-                tcs = [dict(r) for r in conn.execute("SELECT * FROM golden_testcases WHERE account_key = ? OR account_key = '' ORDER BY tc_code", (acct,)).fetchall()]
-            else:
-                tcs = [dict(r) for r in conn.execute("SELECT * FROM golden_testcases ORDER BY tc_code").fetchall()]
+            owner_id = resolve_golden_run_id(conn, run_id)
+            tcs = [dict(r) for r in conn.execute("SELECT * FROM golden_testcases WHERE run_id = ? ORDER BY tc_code", (owner_id,)).fetchall()]
             if not tcs:
                 raise ValueError("Golden Dataset đang trống.")
 

@@ -68,8 +68,17 @@ class TestDiagnosticSwarm(unittest.IsolatedAsyncioTestCase):
                 "VALUES (1, 2, 1, 0, 0, 1, 1, 1, '[\"INTEGRITY\", \"CONTEXT\"]', 'RULE', '2026-01-01T00:00:00Z')"
             )
             conn.execute(
-                "INSERT INTO golden_testcases (id, tc_code, input_question, expected_outcome, reference_context, source_file, question_class, intent_type, created_at) "
-                "VALUES (1, 'TC-01', 'Liều dùng PrEP TDF/FTC hàng ngày là bao nhiêu?', '1 viên mỗi ngày', 'Liều dùng TDF/FTC mỗi ngày 1 viên liên tục trong 28 ngày.', 'huong_dan.pdf', 'Local', 'Factoid', '2026-01-01T00:00:00Z')"
+                "INSERT INTO golden_testcases (id, run_id, tc_code, input_question, expected_outcome, reference_context, source_file, question_class, intent_type, created_at) "
+                "VALUES (1, 1, 'TC-01', 'Liều dùng PrEP TDF/FTC hàng ngày là bao nhiêu?', '1 viên mỗi ngày', 'Liều dùng TDF/FTC mỗi ngày 1 viên liên tục trong 28 ngày.', 'huong_dan.pdf', 'Local', 'Factoid', '2026-01-01T00:00:00Z')"
+            )
+            # Foreign run + foreign golden testcase to verify strict run_id isolation
+            conn.execute(
+                "INSERT INTO runs (id, name, ragflow_dataset_id, parser_config, retrieval_config, status, created_at) "
+                "VALUES (2, 'Other Run', 'ds_other', '{}', '{}', 'READY', '2026-01-01T00:00:00Z')"
+            )
+            conn.execute(
+                "INSERT INTO golden_testcases (id, run_id, tc_code, input_question, expected_outcome, reference_context, source_file, question_class, intent_type, created_at) "
+                "VALUES (2, 2, 'TC-FOREIGN', 'Câu hỏi của dataset khác?', 'Đáp án khác', 'Ngữ cảnh khác', 'other.pdf', 'Local', 'Factoid', '2026-01-01T00:00:00Z')"
             )
             conn.execute(
                 "INSERT INTO retrieval_runs (id, run_id, name, top_k, similarity_threshold, vector_similarity_weight, rerank_id, keyword_enabled, created_at) "
@@ -191,6 +200,16 @@ class TestDiagnosticSwarm(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(rep1["architecture_mode"], "supervisor_worker")
             self.assertFalse(rep1["drilldown_triggered"])
             self.assertEqual(rep1["llm_calls"], 4)
+            self.assertEqual(rep1["evidence_counts"]["golden_total"], 1)
+            self.assertEqual(
+                rep1["models_by_agent"],
+                {
+                    "parsing": "google/gemini-2.5-flash",
+                    "chunking": "openai/gpt-4.1",
+                    "retrieval": "openai/gpt-5-mini",
+                    "supervisor": "openai/gpt-5.2",
+                },
+            )
             self.assertEqual(len(rep1["layer_diagnoses"]), 3)
             self.assertEqual(len(rep1["improvement_plan"]), 2)
             # LLM mock returned 1 JOINT pack; backend complements distinct RETRIEVAL + INDEX packs from workers
@@ -216,6 +235,42 @@ class TestDiagnosticSwarm(unittest.IsolatedAsyncioTestCase):
                 )
             st_stale = diagnostic_swarm.get_latest_agent_diagnosis_status(run_id=1)
             self.assertTrue(st_stale["is_stale"])
+
+    async def test_per_agent_model_fallback_to_default(self):
+        async def flaky_chunk_llm(base_url, api_key, model, sys_prompt, user_prompt, timeout=45.0):
+            if "Chunking Worker" in sys_prompt and model == "openai/gpt-4.1":
+                raise RuntimeError("429 rate limit on gpt-4.1")
+            if "Parsing Worker" in sys_prompt:
+                return {"headline": "OK", "findings": [], "recommended_knobs": {}}
+            if "Chunking Worker" in sys_prompt:
+                return {
+                    "headline": "Fallback thành công về mock-model.",
+                    "findings": [{"pattern": "Đứt câu", "severity": "medium", "summary": "Fallback OK", "evidence_refs": ["DOC01#chunk-1"]}],
+                    "recommended_knobs": {"chunk_token_size": 768},
+                }
+            if "Retrieval Worker" in sys_prompt:
+                return {"headline": "OK", "findings": [], "per_case": [], "recommended_knobs": {}}
+            return {
+                "executive_summary": "Tổng hợp sau fallback.",
+                "improvement_plan": ["Bước 1: Tăng chunk size."],
+                "packs": [
+                    {
+                        "name": "Tăng chunk size",
+                        "scope": "INDEX",
+                        "hypothesis_statement": "Tăng lên 768.",
+                        "index_patch": {"chunk_token_size": 768},
+                        "retrieval_patch": {},
+                    }
+                ],
+            }
+
+        with patch("diagnostic_swarm.call_llm_json", side_effect=flaky_chunk_llm):
+            rep = await diagnostic_swarm.run_agent_diagnosis_swarm(run_id=1, force_refresh=True, include_vision=False)
+            self.assertEqual(rep["models_by_agent"]["chunking"], "mock-model")
+            self.assertEqual(rep["models_by_agent"]["supervisor"], "openai/gpt-5.2")
+            chunk_layer = next(d for d in rep["layer_diagnoses"] if d["layer"] == "CHUNKING")
+            self.assertEqual(chunk_layer["status"], "ISSUES_FOUND")
+            self.assertEqual(chunk_layer["model_used"], "mock-model")
 
     async def test_supervisor_bounded_drilldown_on_missing_text(self):
         # Remove failing parsing_unit so Parsing Worker initially returns SKIPPED_NO_DATA,
@@ -362,6 +417,7 @@ class TestDiagnosticSwarm(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res["ok"])
         self.assertTrue(res["forked"])
         self.assertTrue(res["remote_synced"])
+        self.assertEqual(res["run"]["golden_source_run_id"], 1)
         self.assertEqual(res["copied_docs"], 1)
         self.assertTrue(res["parse_triggered"])
         mock_client.create_dataset.assert_awaited_once()

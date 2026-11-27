@@ -9,8 +9,11 @@ import {
   GitBranch,
   Layers,
   Loader2,
+  Play,
   RefreshCw,
+  RotateCcw,
   Search,
+  Sliders,
   Sparkles,
 } from 'lucide-react';
 import { HypothesisPack, SwarmDiagnosisReport } from '../types';
@@ -22,6 +25,11 @@ interface Props {
   applyingPackId?: string;
   onRunDiagnosis: (forceRefresh: boolean) => void;
   onApplyPack?: (pack: HypothesisPack, forkNewRun: boolean) => void;
+  onOpenParserConfig?: (section: 'parser' | 'chunker') => void;
+  pendingReparse?: boolean;
+  reparsing?: boolean;
+  onReparseNow?: () => void;
+  onOpenWorkspace?: () => void;
 }
 
 const PARAM_LABELS: Record<string, string> = {
@@ -110,6 +118,37 @@ const SEVERITY_DOT: Record<string, { label: string; cls: string }> = {
   low: { label: 'Nhẹ', cls: 'text-zinc-600 bg-zinc-100' },
 };
 
+const ENUM_OPTIONS: Record<string, string[]> = {
+  chunk_method: ['general', 'naive', 'laws', 'table', 'paper', 'book', 'manual', 'qa', 'presentation', 'one'],
+  pdf_parse_method: ['DeepDOC', 'Plain Text', 'MinerU'],
+};
+
+const INT_RANGES: Record<string, { min: number; max: number; step: number }> = {
+  chunk_token_size: { min: 128, max: 2048, step: 64 },
+  overlapped_percent: { min: 0, max: 40, step: 2 },
+  table_context_size: { min: 0, max: 1024, step: 64 },
+  image_context_size: { min: 0, max: 1024, step: 64 },
+  keywords_top_n: { min: 0, max: 10, step: 1 },
+  questions_top_n: { min: 0, max: 5, step: 1 },
+  top_k: { min: 3, max: 30, step: 1 },
+};
+
+const FLOAT_RANGES: Record<string, { min: number; max: number; step: number }> = {
+  similarity_threshold: { min: 0, max: 0.9, step: 0.05 },
+  vector_similarity_weight: { min: 0, max: 1, step: 0.05 },
+  filename_embd_weight: { min: 0, max: 1, step: 0.05 },
+};
+
+const BOOL_KNOBS = new Set(['enable_vision_enhancement', 'use_parent_child', 'keyword_enabled', 'use_kg']);
+const RETRIEVAL_KNOB_KEYS = new Set([
+  'top_k',
+  'similarity_threshold',
+  'vector_similarity_weight',
+  'rerank_id',
+  'keyword_enabled',
+  'use_kg',
+]);
+
 export const AgentDiagnosisPanel: React.FC<Props> = ({
   report,
   isStale = false,
@@ -117,8 +156,15 @@ export const AgentDiagnosisPanel: React.FC<Props> = ({
   applyingPackId = '',
   onRunDiagnosis,
   onApplyPack,
+  onOpenParserConfig,
+  pendingReparse = false,
+  reparsing = false,
+  onReparseNow,
+  onOpenWorkspace,
 }) => {
   const [selectedPackIdx, setSelectedPackIdx] = useState(0);
+  const [editedIdx, setEditedIdx] = useState<Record<string, any>>({});
+  const [editedRet, setEditedRet] = useState<Record<string, any>>({});
 
   useEffect(() => {
     setSelectedPackIdx(0);
@@ -126,6 +172,47 @@ export const AgentDiagnosisPanel: React.FC<Props> = ({
 
   const packs = report?.hypothesis_packs || [];
   const activePack = packs[selectedPackIdx] || packs[0] || null;
+
+  useEffect(() => {
+    setEditedIdx({ ...(activePack?.index_patch || {}) });
+    setEditedRet({ ...(activePack?.retrieval_patch || {}) });
+  }, [activePack?.id, report?.evidence_sig, report?.created_at]);
+
+  const isPatchDirty =
+    Boolean(activePack) &&
+    (JSON.stringify(editedIdx) !== JSON.stringify(activePack?.index_patch || {}) ||
+      JSON.stringify(editedRet) !== JSON.stringify(activePack?.retrieval_patch || {}));
+
+  const getDraftValue = (rawParam: string, fallback: any) => {
+    const clean = rawParam.replace(/^(index|retrieval)\./, '');
+    const isIdx = rawParam.startsWith('index.') || (!rawParam.startsWith('retrieval.') && !RETRIEVAL_KNOB_KEYS.has(clean));
+    if (isIdx && clean in editedIdx) return editedIdx[clean];
+    if (!isIdx && clean in editedRet) return editedRet[clean];
+    return fallback;
+  };
+
+  const setDraftValue = (rawParam: string, nextVal: any) => {
+    const clean = rawParam.replace(/^(index|retrieval)\./, '');
+    const isIdx = rawParam.startsWith('index.') || (!rawParam.startsWith('retrieval.') && !RETRIEVAL_KNOB_KEYS.has(clean));
+    if (isIdx) {
+      setEditedIdx((prev) => ({ ...prev, [clean]: nextVal }));
+    } else {
+      setEditedRet((prev) => ({ ...prev, [clean]: nextVal }));
+    }
+  };
+
+  const buildEffectivePack = (): HypothesisPack | null => {
+    if (!activePack) return null;
+    const hasIdx = Object.keys(editedIdx).length > 0;
+    return {
+      ...activePack,
+      reparse_required: hasIdx || activePack.reparse_required,
+      index_patch: editedIdx,
+      retrieval_patch: editedRet,
+    };
+  };
+
+  const evCnt = report?.evidence_counts || {};
 
   const stepPlan =
     report?.improvement_plan && report.improvement_plan.length > 0
@@ -220,11 +307,19 @@ export const AgentDiagnosisPanel: React.FC<Props> = ({
           {/* SECTION 1: 3 Parallel Workers */}
           <section className="space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2 px-0.5">
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <span className="inline-flex items-center justify-center size-5 rounded-full bg-[#161616] text-white text-[11px] font-semibold">
                   1
                 </span>
                 <h3 className="text-sm font-semibold text-[#161616]">Đánh giá từ 3 chuyên viên (chấm song song)</h3>
+                <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-[#fafaf9] border border-[#e4e4e2] text-[#52525b]">
+                  Soi {evCnt.parsing_samples ?? 0} mẫu đọc · {evCnt.chunk_samples ?? 0} cụm đoạn ·{' '}
+                  {evCnt.retrieval_samples ?? 0}
+                  {typeof evCnt.golden_total === 'number' && evCnt.golden_total > 0
+                    ? `/${evCnt.golden_total}`
+                    : ''}{' '}
+                  test case của phiên
+                </span>
               </div>
               <span className="text-[11px] font-mono text-[#71717a]">
                 {report.model_used} · {(report.duration_ms / 1000).toFixed(1)}s
@@ -259,11 +354,18 @@ export const AgentDiagnosisPanel: React.FC<Props> = ({
                       </span>
                     </div>
 
-                    {ld.vision_used && (
-                      <div className="inline-flex items-center gap-1 text-[11px] text-[#027a42] font-medium">
-                        <Eye className="size-3.5" /> Đã xem ảnh trang PDF gốc
-                      </div>
-                    )}
+                    <div className="flex flex-wrap items-center gap-2">
+                      {(ld.model_used || report.models_by_agent?.[ld.layer.toLowerCase()]) && (
+                        <span className="inline-flex items-center px-2 py-0.5 rounded bg-[#f4f4f2] border border-[#e4e4e2] font-mono text-[10.5px] text-[#3d3d3d]">
+                          {ld.model_used || report.models_by_agent?.[ld.layer.toLowerCase()]}
+                        </span>
+                      )}
+                      {ld.vision_used && (
+                        <span className="inline-flex items-center gap-1 text-[11px] text-[#027a42] font-medium">
+                          <Eye className="size-3.5" /> Đã xem ảnh trang PDF gốc
+                        </span>
+                      )}
+                    </div>
 
                     <p className="text-xs font-medium text-[#161616] leading-relaxed">{ld.headline}</p>
 
@@ -306,6 +408,11 @@ export const AgentDiagnosisPanel: React.FC<Props> = ({
                 <h3 className="text-sm font-semibold text-[#161616]">
                   Tổng hợp &amp; Đề xuất cải tiến (Điều phối viên)
                 </h3>
+                {report.models_by_agent?.supervisor && (
+                  <span className="inline-flex items-center px-2 py-0.5 rounded bg-[#f4f4f2] border border-[#e4e4e2] font-mono text-[10.5px] text-[#3d3d3d]">
+                    {report.models_by_agent.supervisor}
+                  </span>
+                )}
               </div>
               {report.drilldown_triggered && (
                 <span className="text-[11px] font-medium px-2.5 py-0.5 rounded-full bg-amber-50 border border-amber-200 text-amber-800">
@@ -421,21 +528,42 @@ export const AgentDiagnosisPanel: React.FC<Props> = ({
                       )}
                     </div>
 
-                    {/* Right: Clean Diff Table + Apply Actions */}
+                    {/* Right: Clean Editable Diff Table + Apply Actions */}
                     <div className="lg:col-span-7 space-y-3">
                       {activePack.diff.length > 0 && (
                         <div className="border border-[#e4e4e2] rounded-lg overflow-hidden">
+                          <div className="px-3 py-1.5 bg-[#fafaf9] border-b border-[#e4e4e2] flex items-center justify-between text-[11px] text-[#71717a]">
+                            <span>Bạn có thể chỉnh trực tiếp giá trị ở cột Đề xuất trước khi áp dụng</span>
+                            {isPatchDirty && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setEditedIdx({ ...(activePack.index_patch || {}) });
+                                  setEditedRet({ ...(activePack.retrieval_patch || {}) });
+                                }}
+                                className="inline-flex items-center gap-1 text-[#027a42] hover:underline font-medium"
+                              >
+                                <RotateCcw className="size-3" />
+                                Khôi phục đề xuất AI
+                              </button>
+                            )}
+                          </div>
                           <table className="w-full text-xs text-left border-collapse">
                             <thead>
                               <tr className="bg-[#fafaf9] border-b border-[#e4e4e2] text-[11px] text-[#71717a]">
                                 <th className="py-2 px-3 font-medium">Thông số cấu hình</th>
                                 <th className="py-2 px-3 font-medium">Đang dùng</th>
-                                <th className="py-2 px-3 font-medium">Đề xuất</th>
+                                <th className="py-2 px-3 font-medium">Đề xuất (chỉnh tay)</th>
                               </tr>
                             </thead>
                             <tbody className="divide-y divide-[#f0f0ee]">
                               {activePack.diff.map((d, di) => {
                                 const { label, techKey } = getParamLabel(d.param);
+                                const clean = d.param.replace(/^(index|retrieval)\./, '');
+                                const val = getDraftValue(d.param, d.to);
+                                const enumOpts = ENUM_OPTIONS[clean];
+                                const intSpec = INT_RANGES[clean];
+                                const floatSpec = FLOAT_RANGES[clean];
                                 return (
                                   <tr key={di} className="hover:bg-[#fafaf9]/60">
                                     <td className="py-2.5 px-3">
@@ -444,10 +572,67 @@ export const AgentDiagnosisPanel: React.FC<Props> = ({
                                     </td>
                                     <td className="py-2.5 px-3 font-mono text-[#71717a]">{fmtVal(d.from)}</td>
                                     <td className="py-2.5 px-3 font-mono text-[#027a42] font-semibold">
-                                      <span className="inline-flex items-center gap-1.5">
+                                      <div className="inline-flex items-center gap-1.5">
                                         <ArrowRight className="size-3.5 shrink-0" />
-                                        {fmtVal(d.to)}
-                                      </span>
+                                        {BOOL_KNOBS.has(clean) ? (
+                                          <button
+                                            type="button"
+                                            onClick={() => setDraftValue(d.param, !Boolean(val))}
+                                            className={`px-2 py-0.5 rounded border text-xs font-mono transition-colors ${
+                                              val
+                                                ? 'bg-[#f2fbf6] border-[#03aa5c] text-[#027a42]'
+                                                : 'bg-[#fafaf9] border-[#d4d4d8] text-[#52525b]'
+                                            }`}
+                                          >
+                                            {val ? 'Bật' : 'Tắt'}
+                                          </button>
+                                        ) : enumOpts ? (
+                                          <select
+                                            value={String(val ?? '')}
+                                            onChange={(e) => setDraftValue(d.param, e.target.value)}
+                                            className="ts-input py-0.5 px-2 text-xs font-mono text-[#027a42] bg-white"
+                                          >
+                                            {enumOpts.map((opt) => (
+                                              <option key={opt} value={opt}>
+                                                {opt}
+                                              </option>
+                                            ))}
+                                          </select>
+                                        ) : intSpec ? (
+                                          <input
+                                            type="number"
+                                            min={intSpec.min}
+                                            max={intSpec.max}
+                                            step={intSpec.step}
+                                            value={Number(val ?? intSpec.min)}
+                                            onChange={(e) => {
+                                              const n = Number(e.target.value);
+                                              if (Number.isFinite(n)) setDraftValue(d.param, Math.round(n));
+                                            }}
+                                            className="ts-input w-24 py-0.5 px-2 text-xs font-mono text-[#027a42] bg-white"
+                                          />
+                                        ) : floatSpec ? (
+                                          <input
+                                            type="number"
+                                            min={floatSpec.min}
+                                            max={floatSpec.max}
+                                            step={floatSpec.step}
+                                            value={Number(val ?? 0)}
+                                            onChange={(e) => {
+                                              const n = Number(e.target.value);
+                                              if (Number.isFinite(n)) setDraftValue(d.param, Number(n.toFixed(2)));
+                                            }}
+                                            className="ts-input w-24 py-0.5 px-2 text-xs font-mono text-[#027a42] bg-white"
+                                          />
+                                        ) : (
+                                          <input
+                                            type="text"
+                                            value={String(val ?? '')}
+                                            onChange={(e) => setDraftValue(d.param, e.target.value)}
+                                            className="ts-input w-44 py-0.5 px-2 text-xs font-mono text-[#027a42] bg-white"
+                                          />
+                                        )}
+                                      </div>
                                     </td>
                                   </tr>
                                 );
@@ -459,12 +644,26 @@ export const AgentDiagnosisPanel: React.FC<Props> = ({
 
                       {onApplyPack && (
                         <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
+                          {activePack.reparse_required && onOpenParserConfig && (
+                            <button
+                              type="button"
+                              onClick={() => onOpenParserConfig('chunker')}
+                              className="ts-btn-secondary text-xs mr-auto"
+                              title="Mở bảng cấu hình chi tiết Parser & Chunker (chunk_token_size, overlap, Parent-Child...)"
+                            >
+                              <Sliders className="size-3.5 text-[#027a42]" />
+                              Chỉnh cấu hình Parse/Chunker
+                            </button>
+                          )}
                           {activePack.reparse_required ? (
                             <>
                               <button
                                 type="button"
                                 disabled={Boolean(applyingPackId)}
-                                onClick={() => onApplyPack(activePack, false)}
+                                onClick={() => {
+                                  const eff = buildEffectivePack();
+                                  if (eff) onApplyPack(eff, false);
+                                }}
                                 className="ts-btn-secondary text-xs"
                               >
                                 {applyingPackId === activePack.id ? 'Đang lưu...' : 'Lưu vào phiên hiện tại'}
@@ -472,7 +671,10 @@ export const AgentDiagnosisPanel: React.FC<Props> = ({
                               <button
                                 type="button"
                                 disabled={Boolean(applyingPackId)}
-                                onClick={() => onApplyPack(activePack, true)}
+                                onClick={() => {
+                                  const eff = buildEffectivePack();
+                                  if (eff) onApplyPack(eff, true);
+                                }}
                                 className="ts-btn-primary text-xs px-4 py-2"
                               >
                                 <GitBranch className="size-3.5 text-[#03aa5c]" />
@@ -483,13 +685,42 @@ export const AgentDiagnosisPanel: React.FC<Props> = ({
                             <button
                               type="button"
                               disabled={Boolean(applyingPackId)}
-                              onClick={() => onApplyPack(activePack, false)}
+                              onClick={() => {
+                                const eff = buildEffectivePack();
+                                if (eff) onApplyPack(eff, false);
+                              }}
                               className="ts-btn-primary text-xs px-4 py-2"
                             >
                               <CheckCircle2 className="size-3.5 text-[#03aa5c]" />
                               {applyingPackId === activePack.id ? 'Đang áp dụng...' : 'Áp dụng ngay'}
                             </button>
                           )}
+                        </div>
+                      )}
+
+                      {pendingReparse && activePack.reparse_required && (
+                        <div className="p-3 rounded-lg border border-amber-200 bg-amber-50 flex flex-wrap items-center justify-between gap-2 text-xs text-amber-900">
+                          <span>
+                            Đã cập nhật cấu hình mới lên RAGFlow. Để cắt lại đoạn theo kích thước mới, hãy chạy Parse lại tài liệu.
+                          </span>
+                          <div className="flex items-center gap-2 shrink-0">
+                            {onOpenWorkspace && (
+                              <button type="button" onClick={onOpenWorkspace} className="ts-btn-secondary text-xs py-1 px-2.5">
+                                Mở Bước 01
+                              </button>
+                            )}
+                            {onReparseNow && (
+                              <button
+                                type="button"
+                                disabled={reparsing}
+                                onClick={onReparseNow}
+                                className="ts-btn-primary text-xs py-1 px-3"
+                              >
+                                {reparsing ? <Loader2 className="size-3.5 animate-spin" /> : <Play className="size-3.5 text-[#03aa5c]" />}
+                                {reparsing ? 'Đang kích hoạt...' : 'Parse lại tài liệu ngay'}
+                              </button>
+                            )}
+                          </div>
                         </div>
                       )}
                     </div>

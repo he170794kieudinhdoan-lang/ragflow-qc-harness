@@ -132,6 +132,7 @@ export const api = {
   testLlm: () => req<any>('/api/settings/test-llm', { method: 'POST' }),
   testVision: () => req<any>('/api/settings/test-vision', { method: 'POST' }),
   testSystemOne: () => req<any>('/api/settings/test-systemone', { method: 'POST' }),
+  testSwarm: () => req<any>('/api/settings/test-swarm', { method: 'POST' }),
 
   // Workspace
   listDocuments: (runId?: number) =>

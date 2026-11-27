@@ -13,6 +13,11 @@ interface Props {
   loadingAgentReport?: boolean;
   onRunAgentDiagnosis?: (forceRefresh: boolean) => void;
   onApplyHypothesisPack?: (pack: HypothesisPack, forkNewRun: boolean) => void;
+  onOpenParserConfig?: (section: 'parser' | 'chunker') => void;
+  pendingReparse?: boolean;
+  reparsing?: boolean;
+  onReparseNow?: () => void;
+  onOpenWorkspace?: () => void;
 }
 
 export const ConfigAdvisorPanel: React.FC<Props> = ({
@@ -24,6 +29,11 @@ export const ConfigAdvisorPanel: React.FC<Props> = ({
   loadingAgentReport = false,
   onRunAgentDiagnosis,
   onApplyHypothesisPack,
+  onOpenParserConfig,
+  pendingReparse = false,
+  reparsing = false,
+  onReparseNow,
+  onOpenWorkspace,
 }) => {
   if (loading && !advisor && !agentReport) {
     return (
@@ -89,6 +99,11 @@ export const ConfigAdvisorPanel: React.FC<Props> = ({
           applyingPackId={applyingPackId}
           onRunDiagnosis={onRunAgentDiagnosis}
           onApplyPack={onApplyHypothesisPack}
+          onOpenParserConfig={onOpenParserConfig}
+          pendingReparse={pendingReparse}
+          reparsing={reparsing}
+          onReparseNow={onReparseNow}
+          onOpenWorkspace={onOpenWorkspace}
         />
       )}
     </div>

@@ -12,10 +12,11 @@ import {
   Trophy,
   Zap,
 } from 'lucide-react';
-import { api } from '../api/client';
+import { api, invalidateApiCache } from '../api/client';
 import { CanaryTunerPanel } from '../components/CanaryTunerPanel';
 import { ConfigAdvisorPanel } from '../components/ConfigAdvisorPanel';
 import { ParetoScatterChart } from '../components/ParetoScatterChart';
+import { RagflowParserConfigModal } from '../components/RagflowParserConfigModal';
 import {
   AdvisorResponse,
   CandidateConfigPack,
@@ -72,6 +73,9 @@ export const OptimizationLabPage: React.FC<Props> = ({
   const [isAgentReportStale, setIsAgentReportStale] = useState(false);
   const [loadingAgentReport, setLoadingAgentReport] = useState(false);
   const [injectedCanaryVariants, setInjectedCanaryVariants] = useState<CanaryVariantDef[]>([]);
+  const [parserModalSection, setParserModalSection] = useState<'parser' | 'chunker' | null>(null);
+  const [pendingReparse, setPendingReparse] = useState(false);
+  const [reparsing, setReparsing] = useState(false);
 
   // Sweep config state
   const [studyName, setStudyName] = useState('Retrieval Auto-Tuner');
@@ -149,6 +153,7 @@ export const OptimizationLabPage: React.FC<Props> = ({
       return;
     }
     setInjectedCanaryVariants([]);
+    setPendingReparse(false);
     loadAdvisor(activeRun.id);
     loadLatestAgentReport(activeRun.id);
     loadStudies(activeRun.id);
@@ -318,7 +323,9 @@ export const OptimizationLabPage: React.FC<Props> = ({
         copy_docs: true,
         auto_parse: true,
       });
+      invalidateApiCache('/parser-config');
       if (res.forked && res.run) {
+        setPendingReparse(false);
         onSelectRun(res.run);
         await onReloadRuns(res.run.id);
         if (res.remote_synced) {
@@ -339,16 +346,40 @@ export const OptimizationLabPage: React.FC<Props> = ({
       } else {
         await onReloadRuns(activeRun.id);
         await loadAdvisor(activeRun.id);
-        toast.success(
-          pack.reparse_required
-            ? 'Đã cập nhật cấu hình phiên (hãy vào Bước 01 để đọc lại tài liệu).'
-            : 'Đã áp dụng cấu hình tìm kiếm mới vào phiên.'
-        );
+        if (res.remote_warning) {
+          toast.warning(`Đã lưu cấu hình local nhưng đồng bộ RAGFlow báo lỗi: ${res.remote_warning}`);
+        } else if (pack.reparse_required) {
+          setPendingReparse(true);
+          const chunkSz = pack.index_patch?.chunk_token_size;
+          toast.success(
+            chunkSz
+              ? `Đã lưu chunk_token_size=${chunkSz} và đồng bộ lên RAGFlow. Nhấn "Parse lại tài liệu ngay" để áp dụng.`
+              : 'Đã lưu cấu hình mới lên RAGFlow. Nhấn "Parse lại tài liệu ngay" để áp dụng.'
+          );
+        } else {
+          toast.success('Đã áp dụng cấu hình tìm kiếm mới vào phiên.');
+        }
       }
     } catch (e: any) {
       toast.error(e.message || 'Không áp dụng được cấu hình');
     } finally {
       setApplyingPackId('');
+    }
+  };
+
+  const handleReparseNow = async () => {
+    if (!activeRun || reparsing) return;
+    setReparsing(true);
+    try {
+      await api.uploadAndParseRun(activeRun.id);
+      setPendingReparse(false);
+      await onReloadRuns(activeRun.id);
+      toast.success('Đã kích hoạt Parse lại tài liệu trên RAGFlow theo cấu hình mới.');
+      if (onOpenWorkspace) onOpenWorkspace();
+    } catch (e: any) {
+      toast.error(e.message || 'Không kích hoạt được Parse lại');
+    } finally {
+      setReparsing(false);
     }
   };
 
@@ -460,7 +491,26 @@ export const OptimizationLabPage: React.FC<Props> = ({
           loadingAgentReport={loadingAgentReport}
           onRunAgentDiagnosis={handleRunAgentDiagnosis}
           onApplyHypothesisPack={handleApplyHypothesisPack}
+          onOpenParserConfig={(sec) => setParserModalSection(sec)}
+          pendingReparse={pendingReparse}
+          reparsing={reparsing}
+          onReparseNow={handleReparseNow}
+          onOpenWorkspace={onOpenWorkspace}
         />
+
+        {parserModalSection && (
+          <RagflowParserConfigModal
+            run={activeRun}
+            initialSection={parserModalSection}
+            onClose={() => setParserModalSection(null)}
+            onSaved={async () => {
+              invalidateApiCache('/parser-config');
+              await onReloadRuns(activeRun.id);
+              await loadAdvisor(activeRun.id);
+              setPendingReparse(true);
+            }}
+          />
+        )}
 
         {activeRun && subTab === 'canary' && (
           <CanaryTunerPanel

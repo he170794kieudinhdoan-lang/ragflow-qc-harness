@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from rapidfuzz import fuzz
 
 from config_advisor import analyze_and_propose_configs
-from database import get_current_account_key, get_db, get_setting, utc_now
+from database import get_current_account_key, get_db, get_setting, resolve_golden_run_id, utc_now
 from llm_client import call_llm_json, call_llm_vision_json
 from metrics import compute_contextual_precision, nfc
 
@@ -75,6 +75,7 @@ class LayerDiagnosis(BaseModel):
     findings: List[ForensicFinding] = Field(default_factory=list)
     recommended_knobs: Dict[str, Any] = Field(default_factory=dict)
     vision_used: bool = False
+    model_used: str = ""
 
 
 class ConfigDiffRow(BaseModel):
@@ -107,6 +108,7 @@ class SwarmDiagnosisReport(BaseModel):
     cached: bool = False
     evidence_sig: str = ""
     model_used: str = ""
+    models_by_agent: Dict[str, str] = Field(default_factory=dict)
     duration_ms: int = 0
     llm_calls: int = 0
     executive_summary: str = ""
@@ -214,16 +216,69 @@ def _resolve_llm_creds() -> Tuple[str, str, str]:
     return base, key, model
 
 
+def _is_vision_capable_model(model_name: str) -> bool:
+    low = (model_name or "").strip().lower()
+    if not low or low in ("local-rapidocr", "rapidocr", "local"):
+        return False
+    return any(
+        tok in low
+        for tok in ("gemini", "gpt-4o", "gpt-4.1", "gpt-5", "claude", "vl", "qwen3.5", "qwen3.6", "qwen3.7", "llama-4", "mistral", "vision")
+    )
+
+
+def _resolve_swarm_models(fallback_model: str) -> Dict[str, str]:
+    """Resolves per-agent models, falling back to `fallback_model` when unset."""
+    fb = (fallback_model or "").strip()
+    return {
+        "parsing": get_setting("swarm_parsing_model", "").strip() or fb,
+        "chunking": get_setting("swarm_chunking_model", "").strip() or fb,
+        "retrieval": get_setting("swarm_retrieval_model", "").strip() or fb,
+        "supervisor": get_setting("swarm_supervisor_model", "").strip() or fb,
+    }
+
+
 def _resolve_explicit_vision_creds() -> Optional[Tuple[str, str, str]]:
-    """Only returns Vision credentials when an explicit `vision_model` is configured."""
+    """
+    Returns Vision credentials when an explicit cloud Vision model is configured,
+    ignoring local OCR placeholders (`local-rapidocr`), or falling back to a
+    multimodal `swarm_parsing_model` on `llm_base_url`.
+    """
     v_model = get_setting("vision_model", "").strip()
-    if not v_model:
-        return None
-    v_base = get_setting("vision_base_url", "").strip() or get_setting("llm_base_url", "").strip()
-    v_key = get_setting("vision_api_key", "").strip() or get_setting("llm_api_key", "").strip()
-    if not v_base or (not v_key and "localhost" not in v_base and "127.0.0.1" not in v_base):
-        return None
-    return v_base, v_key, v_model
+    if v_model and v_model.lower() not in ("local-rapidocr", "rapidocr", "local"):
+        v_base = get_setting("vision_base_url", "").strip()
+        if not v_base or v_base.lower() == "local":
+            v_base = get_setting("llm_base_url", "").strip()
+        v_key = get_setting("vision_api_key", "").strip() or get_setting("llm_api_key", "").strip()
+        if v_base and (v_key or "localhost" in v_base or "127.0.0.1" in v_base):
+            return v_base, v_key, v_model
+
+    parsing_model = get_setting("swarm_parsing_model", "").strip()
+    if _is_vision_capable_model(parsing_model):
+        llm_base = get_setting("llm_base_url", "").strip()
+        llm_key = get_setting("llm_api_key", "").strip()
+        if llm_base and (llm_key or "localhost" in llm_base or "127.0.0.1" in llm_base):
+            return llm_base, llm_key, parsing_model
+    return None
+
+
+async def _call_json_with_fallback(
+    base_url: str,
+    api_key: str,
+    primary_model: str,
+    fallback_model: str,
+    sys_prompt: str,
+    user_text: str,
+    timeout: float = 55.0,
+) -> Tuple[Dict[str, Any], str]:
+    """Calls `primary_model` and falls back once to `fallback_model` if distinct and errored."""
+    try:
+        data = await call_llm_json(base_url, api_key, primary_model, sys_prompt, user_text, timeout=timeout)
+        return data, primary_model
+    except Exception:
+        if fallback_model and fallback_model.strip() and fallback_model.strip() != primary_model.strip():
+            data = await call_llm_json(base_url, api_key, fallback_model, sys_prompt, user_text, timeout=timeout)
+            return data, fallback_model
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -408,14 +463,14 @@ def collect_run_evidence(run_id: int, include_vision: bool = True) -> Dict[str, 
         ).fetchone()
 
         retrieval_samples: List[Dict[str, Any]] = []
+        golden_total = 0
         if latest_rr:
-            if acct:
-                tcs = conn.execute(
-                    "SELECT * FROM golden_testcases WHERE account_key = ? OR account_key = '' ORDER BY tc_code",
-                    (acct,),
-                ).fetchall()
-            else:
-                tcs = conn.execute("SELECT * FROM golden_testcases ORDER BY tc_code").fetchall()
+            owner_id = resolve_golden_run_id(conn, run_id)
+            tcs = conn.execute(
+                "SELECT * FROM golden_testcases WHERE run_id = ? ORDER BY tc_code",
+                (owner_id,),
+            ).fetchall()
+            golden_total = len(tcs)
             hits = conn.execute(
                 "SELECT * FROM retrieval_results WHERE retrieval_run_id = ? ORDER BY testcase_id, rank",
                 (latest_rr["id"],),
@@ -431,31 +486,46 @@ def collect_run_evidence(run_id: int, include_vision: bool = True) -> Dict[str, 
             for h in hits:
                 hits_by_tc.setdefault(h["testcase_id"], []).append(dict(h))
 
-            failing_tcs: List[Tuple[float, Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]] = []
+            failing_tcs: List[Tuple[float, str, Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]] = []
+            suboptimal_tcs: List[Tuple[float, str, Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]] = []
             for tc in tcs:
                 tc_hits = hits_by_tc.get(tc["id"], [])
                 rels = [h["relevant"] for h in tc_hits if h["relevant"] is not None]
                 cp = compute_contextual_precision(rels)
+                meta = metas.get(tc["id"], {})
+                ac_val = meta.get("answer_containment") or "UNCHECKED"
                 passed = cp >= 0.5 and any(v == 1 for v in rels)
                 if not passed:
-                    failing_tcs.append((cp, dict(tc), tc_hits, metas.get(tc["id"], {})))
+                    failing_tcs.append((cp, "FAIL", dict(tc), tc_hits, meta))
+                else:
+                    rank1_miss = bool(rels) and rels[0] == 0
+                    is_suboptimal = cp < 0.90 or rank1_miss or ac_val == "SPLIT"
+                    if is_suboptimal:
+                        suboptimal_tcs.append((cp, "SUBOPTIMAL", dict(tc), tc_hits, meta))
 
-            # Balance across Local / Global / Multi-hop up to 8 testcases
-            failing_tcs.sort(key=lambda x: (x[0], x[1].get("tc_code", "")))
-            picked: List[Tuple[float, Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]] = []
+            # Balance FAIL cases across Local / Global / Multi-hop up to 8; backfill with SUBOPTIMAL cases if needed
+            failing_tcs.sort(key=lambda x: (x[0], x[2].get("tc_code", "")))
+            suboptimal_tcs.sort(key=lambda x: (x[0], x[2].get("tc_code", "")))
+            picked: List[Tuple[float, str, Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]] = []
             picked_ids = set()
             for cls in ("Local", "Global", "Multi-hop"):
-                cls_items = [it for it in failing_tcs if (it[1].get("question_class") or "Local") == cls]
+                cls_items = [it for it in failing_tcs if (it[2].get("question_class") or "Local") == cls]
                 for it in cls_items[:3]:
-                    if len(picked) < 8 and it[1]["id"] not in picked_ids:
+                    if len(picked) < 8 and it[2]["id"] not in picked_ids:
                         picked.append(it)
-                        picked_ids.add(it[1]["id"])
+                        picked_ids.add(it[2]["id"])
             for it in failing_tcs:
                 if len(picked) >= 8:
                     break
-                if it[1]["id"] not in picked_ids:
+                if it[2]["id"] not in picked_ids:
                     picked.append(it)
-                    picked_ids.add(it[1]["id"])
+                    picked_ids.add(it[2]["id"])
+            for it in suboptimal_tcs:
+                if len(picked) >= 8:
+                    break
+                if it[2]["id"] not in picked_ids:
+                    picked.append(it)
+                    picked_ids.add(it[2]["id"])
 
             pu_by_doc_page: Dict[Tuple[int, int], str] = {}
             pu_by_doc: Dict[int, str] = {}
@@ -468,7 +538,7 @@ def collect_run_evidence(run_id: int, include_vision: bool = True) -> Dict[str, 
                 if verd in ("FAIL", "PARTIAL") or did not in pu_by_doc:
                     pu_by_doc[did] = verd
 
-            for cp, tc, tc_hits, meta in picked:
+            for cp, sample_level, tc, tc_hits, meta in picked:
                 gold_chunk, gold_frags = _find_gold_fragments(
                     tc.get("reference_context") or "",
                     tc.get("input_question") or "",
@@ -478,6 +548,7 @@ def collect_run_evidence(run_id: int, include_vision: bool = True) -> Dict[str, 
                 )
                 retrieval_samples.append({
                     "tc_code": tc["tc_code"],
+                    "sample_level": sample_level,
                     "question": tc["input_question"][:280],
                     "expected_outcome": (tc.get("expected_outcome") or "")[:280],
                     "question_class": tc.get("question_class") or "Local",
@@ -579,6 +650,7 @@ def collect_run_evidence(run_id: int, include_vision: bool = True) -> Dict[str, 
                 if len(chunk_samples) >= 5:
                     break
 
+    swarm_models = _resolve_swarm_models(get_setting("llm_model", "").strip())
     sig_payload = {
         "current_config": advisor["current_config"],
         "doc_count": advisor["corpus_profile"].get("doc_count", 0),
@@ -586,6 +658,7 @@ def collect_run_evidence(run_id: int, include_vision: bool = True) -> Dict[str, 
         "parsing_refs": [x["ref"] for x in parsing_samples],
         "chunk_refs": [x["ref"] for x in chunk_samples],
         "retrieval_refs": [(x["tc_code"], x["cp"], [h["rank"] for h in x["top_hits"]]) for x in retrieval_samples],
+        "swarm_models": swarm_models,
     }
     evidence_sig = hashlib.sha256(json.dumps(sig_payload, sort_keys=True).encode("utf-8")).hexdigest()[:20]
 
@@ -600,6 +673,7 @@ def collect_run_evidence(run_id: int, include_vision: bool = True) -> Dict[str, 
         "parsing_images": parsing_images,
         "chunk_samples": chunk_samples,
         "retrieval_samples": retrieval_samples,
+        "golden_total": golden_total,
         "evidence_sig": evidence_sig,
         "_all_chunks": all_chunks,
         "_doc_rows": doc_rows,
@@ -621,7 +695,14 @@ def collect_compare_evidence(baseline_rr_id: int, candidate_rr_id: int) -> Dict[
             raise ValueError("Không tìm thấy Retrieval Run để giải phẫu.")
 
         run_id = int(c_rr["run_id"])
-        tcs = [dict(r) for r in conn.execute("SELECT * FROM golden_testcases ORDER BY tc_code").fetchall()]
+        owner_id = resolve_golden_run_id(conn, run_id)
+        tcs = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM golden_testcases WHERE run_id = ? ORDER BY tc_code",
+                (owner_id,),
+            ).fetchall()
+        ]
         b_hits_rows = [
             dict(r) for r in conn.execute(
                 "SELECT * FROM retrieval_results WHERE retrieval_run_id = ? ORDER BY testcase_id, rank",
@@ -757,6 +838,7 @@ async def _run_parsing_forensic_agent(
     drilldown_instruction: str = "",
     override_samples: Optional[List[Dict[str, Any]]] = None,
     override_images: Optional[List[Tuple[str, bytes]]] = None,
+    fallback_model: str = "",
 ) -> Tuple[LayerDiagnosis, int]:
     samples = override_samples if override_samples is not None else (evidence.get("parsing_samples") or [])
     if not samples:
@@ -764,6 +846,7 @@ async def _run_parsing_forensic_agent(
             layer="PARSING",
             status="SKIPPED_NO_DATA",
             headline="Không có đoạn nào bị lỗi đọc file trong phiên này.",
+            model_used=llm_model,
         ), 0
 
     focus_note = f"\nYÊU CẦU KIỂM TRA BỔ SUNG TỪ ĐIỀU PHỐI VIÊN: {drilldown_instruction}\n" if drilldown_instruction else ""
@@ -794,6 +877,7 @@ async def _run_parsing_forensic_agent(
     images = override_images if override_images is not None else (evidence.get("parsing_images") or [])
     vision_creds = _resolve_explicit_vision_creds() if images else None
     vision_used = False
+    used_model = llm_model
     calls = 0
 
     try:
@@ -803,12 +887,17 @@ async def _run_parsing_forensic_agent(
                 calls += 1
                 data = await call_llm_vision_json(v_base, v_key, v_model, sys_prompt, user_text, images, timeout=75.0)
                 vision_used = True
+                used_model = v_model
             except Exception:
                 calls += 1
-                data = await call_llm_json(llm_base, llm_key, llm_model, sys_prompt, user_text, timeout=55.0)
+                data, used_model = await _call_json_with_fallback(
+                    llm_base, llm_key, llm_model, fallback_model, sys_prompt, user_text, timeout=55.0
+                )
         else:
             calls += 1
-            data = await call_llm_json(llm_base, llm_key, llm_model, sys_prompt, user_text, timeout=55.0)
+            data, used_model = await _call_json_with_fallback(
+                llm_base, llm_key, llm_model, fallback_model, sys_prompt, user_text, timeout=55.0
+            )
 
         findings = [
             ForensicFinding(
@@ -828,12 +917,14 @@ async def _run_parsing_forensic_agent(
             findings=findings,
             recommended_knobs=knobs,
             vision_used=vision_used,
+            model_used=used_model,
         ), calls
     except Exception as e:
         return LayerDiagnosis(
             layer="PARSING",
             status="FALLBACK_ERROR",
             headline=f"Không kiểm tra được phần đọc tài liệu: {str(e)[:120]}",
+            model_used=used_model,
         ), calls
 
 
@@ -844,6 +935,7 @@ async def _run_chunk_topology_agent(
     llm_model: str,
     drilldown_instruction: str = "",
     override_samples: Optional[List[Dict[str, Any]]] = None,
+    fallback_model: str = "",
 ) -> Tuple[LayerDiagnosis, int]:
     samples = override_samples if override_samples is not None else (evidence.get("chunk_samples") or [])
     split_count = (evidence.get("baseline_metrics", {}).get("answer_containment") or {}).get("SPLIT", 0)
@@ -852,6 +944,7 @@ async def _run_chunk_topology_agent(
             layer="CHUNKING",
             status="SKIPPED_NO_DATA",
             headline="Không ghi nhận lỗi ranh giới cắt đoạn nào cần kiểm tra.",
+            model_used=llm_model,
         ), 0
 
     focus_note = f"\nYÊU CẦU KIỂM TRA BỔ SUNG TỪ ĐIỀU PHỐI VIÊN: {drilldown_instruction}\n" if drilldown_instruction else ""
@@ -876,7 +969,9 @@ async def _run_chunk_topology_agent(
         f"Các cụm đoạn mẫu:\n{json.dumps(samples, ensure_ascii=False)}"
     )
     try:
-        data = await call_llm_json(llm_base, llm_key, llm_model, sys_prompt, user_text, timeout=55.0)
+        data, used_model = await _call_json_with_fallback(
+            llm_base, llm_key, llm_model, fallback_model, sys_prompt, user_text, timeout=55.0
+        )
         findings = [
             ForensicFinding(
                 pattern=str(f.get("pattern") or "Lỗi ranh giới đoạn")[:60],
@@ -894,12 +989,14 @@ async def _run_chunk_topology_agent(
             headline=str(data.get("headline") or "Đã kiểm tra xong phần cắt đoạn.")[:220],
             findings=findings,
             recommended_knobs=knobs,
+            model_used=used_model,
         ), 1
     except Exception as e:
         return LayerDiagnosis(
             layer="CHUNKING",
             status="FALLBACK_ERROR",
             headline=f"Không kiểm tra được phần cắt đoạn: {str(e)[:120]}",
+            model_used=llm_model,
         ), 1
 
 
@@ -910,12 +1007,14 @@ async def _run_retrieval_contrastive_agent(
     llm_key: str,
     llm_model: str,
     compare_context: Optional[Dict[str, Any]] = None,
+    fallback_model: str = "",
 ) -> Tuple[LayerDiagnosis, int]:
     if not samples:
         return LayerDiagnosis(
             layer="RETRIEVAL",
             status="SKIPPED_NO_DATA",
             headline="Chưa có câu hỏi tìm kiếm bị trượt để đối chứng.",
+            model_used=llm_model,
         ), 0
 
     mode_note = (
@@ -934,6 +1033,8 @@ async def _run_retrieval_contrastive_agent(
         "- Rớt mã hiệu, tên thuốc, con số chính xác → cần giảm `vector_similarity_weight` để ưu tiên từ khóa BM25 / bật `keyword_enabled`.\n"
         "- Nhầm sang tài liệu khác cùng chủ đề → cần bật model xếp hạng lại `rerank_id`.\n"
         "- Câu hỏi tổng hợp/đa mảnh bị cắt rớt bớt mảnh → cần hạ `similarity_threshold`, tăng `top_k` hoặc bật `use_kg`.\n"
+        "- Nếu mẫu có `sample_level == 'SUBOPTIMAL'` (đã có chunk đúng nhưng vẫn lẫn đoạn nhiễu hoặc tụt khỏi Rank 1) → phân tích vì sao đoạn nhiễu chen lên trên và đề xuất cách đẩy đoạn đúng lên Rank 1.\n"
+        "CHỈ trích dẫn các mã `tc_code` thực sự xuất hiện trong danh sách mẫu dưới đây vào `evidence_refs`.\n"
         "Viết `pattern`, `headline`, `summary` bằng tiếng Việt tự nhiên, dễ hiểu (KHÔNG dùng mã tiếng Anh viết hoa).\n"
         "CHỈ đề xuất thông số trong tập: {top_k: 3..30, similarity_threshold: 0.0..0.9, vector_similarity_weight: 0.0..1.0, "
         "rerank_id: str, keyword_enabled: bool, use_kg: bool}.\n"
@@ -951,13 +1052,20 @@ async def _run_retrieval_contrastive_agent(
     user_text = f"{ctx_block}\nCác câu hỏi lỗi cần đối chứng:\n{json.dumps(samples, ensure_ascii=False)}"
 
     try:
-        data = await call_llm_json(llm_base, llm_key, llm_model, sys_prompt, user_text, timeout=60.0)
+        data, used_model = await _call_json_with_fallback(
+            llm_base, llm_key, llm_model, fallback_model, sys_prompt, user_text, timeout=60.0
+        )
+        allowed_tc_codes = {str(s.get("tc_code") or "").strip() for s in samples if s.get("tc_code")}
         findings = [
             ForensicFinding(
                 pattern=str(f.get("pattern") or "Lệch kết quả tìm kiếm")[:60],
                 severity=f.get("severity") if f.get("severity") in ("high", "medium", "low") else "medium",
                 summary=str(f.get("summary") or "")[:320],
-                evidence_refs=[str(x) for x in (f.get("evidence_refs") or [])[:5]],
+                evidence_refs=[
+                    str(x)
+                    for x in (f.get("evidence_refs") or [])[:5]
+                    if not allowed_tc_codes or not str(x).strip().upper().startswith("TC") or str(x).strip() in allowed_tc_codes
+                ],
             )
             for f in (data.get("findings") or [])[:5]
             if isinstance(f, dict)
@@ -969,6 +1077,7 @@ async def _run_retrieval_contrastive_agent(
             headline=str(data.get("headline") or "Đã phân tích đối chứng phần tìm kiếm.")[:220],
             findings=findings,
             recommended_knobs=knobs,
+            model_used=used_model,
         )
         diag_dict = {"diagnosis": diag, "per_case": data.get("per_case") or []}
         return diag_dict, 1  # type: ignore[return-value]
@@ -977,6 +1086,7 @@ async def _run_retrieval_contrastive_agent(
             layer="RETRIEVAL",
             status="FALLBACK_ERROR",
             headline=f"Không kiểm tra được phần tìm kiếm: {str(e)[:120]}",
+            model_used=llm_model,
         ), "per_case": []}, 1  # type: ignore[return-value]
 
 
@@ -1002,6 +1112,7 @@ def _merge_layer_diagnosis(base: LayerDiagnosis, extra: LayerDiagnosis) -> Layer
         findings=merged_findings,
         recommended_knobs=merged_knobs,
         vision_used=base.vision_used or extra.vision_used,
+        model_used=extra.model_used or base.model_used,
     )
 
 
@@ -1012,7 +1123,9 @@ async def _supervisor_drilldown_if_needed(
     r_diag: LayerDiagnosis,
     llm_base: str,
     llm_key: str,
-    llm_model: str,
+    parsing_model: str,
+    chunking_model: str,
+    fallback_model: str = "",
 ) -> Tuple[LayerDiagnosis, LayerDiagnosis, int, bool, List[str]]:
     """
     Bounded Supervisor cross-layer check (max 1 targeted worker drill-down):
@@ -1065,10 +1178,11 @@ async def _supervisor_drilldown_if_needed(
                 evidence,
                 llm_base,
                 llm_key,
-                llm_model,
+                parsing_model,
                 drilldown_instruction=instr,
                 override_samples=dd_samples,
                 override_images=dd_images,
+                fallback_model=fallback_model,
             )
             merged_p = _merge_layer_diagnosis(p_diag, extra_p)
             notes.append(
@@ -1114,9 +1228,10 @@ async def _supervisor_drilldown_if_needed(
                 evidence,
                 llm_base,
                 llm_key,
-                llm_model,
+                chunking_model,
                 drilldown_instruction=instr,
                 override_samples=dd_chunks,
+                fallback_model=fallback_model,
             )
             merged_c = _merge_layer_diagnosis(c_diag, extra_c)
             notes.append(
@@ -1139,7 +1254,8 @@ async def _run_hypothesis_synthesizer(
     is_autopsy: bool = False,
     capabilities: Optional[Dict[str, Any]] = None,
     supervisor_notes: Optional[List[str]] = None,
-) -> Tuple[str, List[str], List[HypothesisPack], int]:
+    fallback_model: str = "",
+) -> Tuple[str, List[str], List[HypothesisPack], int, str]:
     sys_prompt = (
         "Bạn là Điều phối viên Tổng hợp (Supervisor) cho hệ thống kiểm thử RAGFlow.\n"
         "Bạn nhận báo cáo từ 3 chuyên viên (Đọc tài liệu, Cắt đoạn, Tìm kiếm), cấu hình hiện tại và năng lực model đang cấu hình.\n"
@@ -1173,7 +1289,9 @@ async def _run_hypothesis_synthesizer(
         f"Báo cáo từ các chuyên viên:\n{json.dumps([d.model_dump() for d in layer_diags], ensure_ascii=False)}"
     )
 
-    data = await call_llm_json(llm_base, llm_key, llm_model, sys_prompt, user_text, timeout=60.0)
+    data, used_model = await _call_json_with_fallback(
+        llm_base, llm_key, llm_model, fallback_model, sys_prompt, user_text, timeout=60.0
+    )
     exec_sum = str(data.get("executive_summary") or "").strip()[:500]
     improvement_plan = [
         str(step).strip()[:240]
@@ -1268,7 +1386,7 @@ async def _run_hypothesis_synthesizer(
                 raw_ret={},
             )
 
-    return exec_sum, improvement_plan, packs[:3], 1
+    return exec_sum, improvement_plan, packs[:3], 1, used_model
 
 
 # ---------------------------------------------------------------------------
@@ -1368,16 +1486,22 @@ async def run_agent_diagnosis_swarm(
             return cached.model_dump()
 
     llm_base, llm_key, llm_model = _resolve_llm_creds()
+    swarm_models = _resolve_swarm_models(llm_model)
 
-    # Phase 1: Parallel Workers
-    p_task = _run_parsing_forensic_agent(evidence, llm_base, llm_key, llm_model)
-    c_task = _run_chunk_topology_agent(evidence, llm_base, llm_key, llm_model)
+    # Phase 1: Parallel Workers (each routed to its specialized model with safe fallback)
+    p_task = _run_parsing_forensic_agent(
+        evidence, llm_base, llm_key, swarm_models["parsing"], fallback_model=llm_model
+    )
+    c_task = _run_chunk_topology_agent(
+        evidence, llm_base, llm_key, swarm_models["chunking"], fallback_model=llm_model
+    )
     r_task = _run_retrieval_contrastive_agent(
         evidence["retrieval_samples"],
         evidence["current_config"]["retrieval"],
         llm_base,
         llm_key,
-        llm_model,
+        swarm_models["retrieval"],
+        fallback_model=llm_model,
     )
     (p_diag, p_calls), (c_diag, c_calls), (r_wrap, r_calls) = await asyncio.gather(p_task, c_task, r_task)
     r_diag = r_wrap["diagnosis"] if isinstance(r_wrap, dict) else r_wrap
@@ -1390,21 +1514,37 @@ async def run_agent_diagnosis_swarm(
         r_diag=r_diag,
         llm_base=llm_base,
         llm_key=llm_key,
-        llm_model=llm_model,
+        parsing_model=swarm_models["parsing"],
+        chunking_model=swarm_models["chunking"],
+        fallback_model=llm_model,
     )
     layer_diags = [p_diag, c_diag, r_diag]
 
     # Phase 3: Supervisor Synthesis & Capability-Aware Plan
-    exec_sum, imp_plan, packs, s_calls = await _run_hypothesis_synthesizer(
+    exec_sum, imp_plan, packs, s_calls, sup_used_model = await _run_hypothesis_synthesizer(
         current_config=evidence["current_config"],
         corpus_profile=evidence["corpus_profile"],
         layer_diags=layer_diags,
         llm_base=llm_base,
         llm_key=llm_key,
-        llm_model=llm_model,
+        llm_model=swarm_models["supervisor"],
         is_autopsy=False,
         capabilities=evidence.get("_capabilities"),
         supervisor_notes=supervisor_notes,
+        fallback_model=llm_model,
+    )
+
+    models_by_agent = {
+        "parsing": p_diag.model_used or swarm_models["parsing"],
+        "chunking": c_diag.model_used or swarm_models["chunking"],
+        "retrieval": r_diag.model_used or swarm_models["retrieval"],
+        "supervisor": sup_used_model or swarm_models["supervisor"],
+    }
+    distinct_models = list(dict.fromkeys(v for v in models_by_agent.values() if v))
+    summary_model_label = (
+        f"{len(distinct_models)} models · Sup: {models_by_agent['supervisor']}"
+        if len(distinct_models) > 1
+        else (distinct_models[0] if distinct_models else llm_model)
     )
 
     total_calls = p_calls + c_calls + r_calls + dd_calls + s_calls
@@ -1416,7 +1556,8 @@ async def run_agent_diagnosis_swarm(
         report_type="ADVISOR_SWARM",
         cached=False,
         evidence_sig=evidence["evidence_sig"],
-        model_used=llm_model,
+        model_used=summary_model_label,
+        models_by_agent=models_by_agent,
         duration_ms=duration_ms,
         llm_calls=total_calls,
         executive_summary=exec_sum or "Đã tổng hợp đánh giá từ 3 chuyên viên và đề xuất cấu hình cải tiến.",
@@ -1429,6 +1570,7 @@ async def run_agent_diagnosis_swarm(
             "parsing_images": len(evidence["parsing_images"]),
             "chunk_samples": len(evidence["chunk_samples"]),
             "retrieval_samples": len(evidence["retrieval_samples"]),
+            "golden_total": int(evidence.get("golden_total") or 0),
         },
         layer_diagnoses=layer_diags,
         hypothesis_packs=packs,
@@ -1471,13 +1613,15 @@ async def run_compare_regression_autopsy(
         return rep.model_dump()
 
     llm_base, llm_key, llm_model = _resolve_llm_creds()
+    swarm_models = _resolve_swarm_models(llm_model)
     r_wrap, r_calls = await _run_retrieval_contrastive_agent(
         ev["regressions"],
         ev["candidate_ret_cfg"],
         llm_base,
         llm_key,
-        llm_model,
+        swarm_models["retrieval"],
         compare_context={"b_cfg": ev["baseline_ret_cfg"], "c_cfg": ev["candidate_ret_cfg"]},
+        fallback_model=llm_model,
     )
     r_diag = r_wrap["diagnosis"] if isinstance(r_wrap, dict) else r_wrap
     per_case_raw = r_wrap.get("per_case", []) if isinstance(r_wrap, dict) else []
@@ -1496,16 +1640,21 @@ async def run_compare_regression_autopsy(
             "fix_hint": str(note.get("fix_hint") or "")[:180],
         })
 
-    exec_sum, imp_plan, packs, s_calls = await _run_hypothesis_synthesizer(
+    exec_sum, imp_plan, packs, s_calls, sup_used_model = await _run_hypothesis_synthesizer(
         current_config=ev["current_config"],
         corpus_profile=ev["corpus_profile"],
         layer_diags=[r_diag],
         llm_base=llm_base,
         llm_key=llm_key,
-        llm_model=llm_model,
+        llm_model=swarm_models["supervisor"],
         is_autopsy=True,
+        fallback_model=llm_model,
     )
 
+    models_by_agent = {
+        "retrieval": r_diag.model_used or swarm_models["retrieval"],
+        "supervisor": sup_used_model or swarm_models["supervisor"],
+    }
     duration_ms = int((time.perf_counter() - t0) * 1000)
     report = SwarmDiagnosisReport(
         ok=True,
@@ -1514,7 +1663,8 @@ async def run_compare_regression_autopsy(
         report_type="REGRESSION_AUTOPSY",
         cached=False,
         evidence_sig=ev["evidence_sig"],
-        model_used=llm_model,
+        model_used=sup_used_model,
+        models_by_agent=models_by_agent,
         duration_ms=duration_ms,
         llm_calls=r_calls + s_calls,
         executive_summary=exec_sum or r_diag.headline,

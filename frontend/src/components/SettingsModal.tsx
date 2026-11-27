@@ -28,7 +28,17 @@ interface SettingsModalProps {
 }
 
 const SECTION_KEYS: Record<SectionId, string[]> = {
-  connection: ['ragflow_base_url', 'llm_base_url', 'llm_model', 'systemone_base_url', 'systemone_model'],
+  connection: [
+    'ragflow_base_url',
+    'llm_base_url',
+    'llm_model',
+    'swarm_parsing_model',
+    'swarm_chunking_model',
+    'swarm_retrieval_model',
+    'swarm_supervisor_model',
+    'systemone_base_url',
+    'systemone_model',
+  ],
   step1: ['slow_parse_threshold_sec'],
   step2: [
     'parsing_table_cell_match_threshold',
@@ -109,6 +119,8 @@ export default function SettingsModal({
   const [testingLlm, setTestingLlm] = useState(false);
   const [testingVision, setTestingVision] = useState(false);
   const [testingSys1, setTestingSys1] = useState(false);
+  const [testingSwarm, setTestingSwarm] = useState(false);
+  const [swarmTestRoles, setSwarmTestRoles] = useState<Record<string, { model: string; ok: boolean; error: string }> | null>(null);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -414,6 +426,167 @@ export default function SettingsModal({
                     <FlaskConical className="size-3.5 text-[#03aa5c]" />
                     {testingVision ? 'Đang kiểm tra...' : 'Kiểm tra kết nối Vision LLM'}
                   </button>
+                </div>
+
+                <div className="border-t border-[#ededeb] pt-4 space-y-3">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <span className="text-[11px] font-semibold uppercase tracking-wider text-[#71717a]">
+                        Định tuyến 4 Model cho Multi-Agent (Bước 05 · Dùng chung Vercel URL &amp; Key)
+                      </span>
+                      <p className="text-[10px] text-[#71717a] mt-0.5">
+                        Mỗi agent dùng 1 model chuyên biệt (tự fallback về LLM Model chung nếu để trống hoặc gặp lỗi).
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1 text-[11px] shrink-0">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSettings((prev) => ({
+                            ...prev,
+                            swarm_parsing_model: 'google/gemini-2.5-flash',
+                            swarm_chunking_model: 'openai/gpt-4.1',
+                            swarm_retrieval_model: 'openai/gpt-5-mini',
+                            swarm_supervisor_model: 'openai/gpt-5.2',
+                          }))
+                        }
+                        className="px-2 py-0.5 bg-[#f2fbf6] text-[#027a42] border border-[#03aa5c]/40 hover:bg-[#03aa5c]/15 rounded-[2px] font-medium"
+                      >
+                        Gói B · Pro (Mặc định)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSettings((prev) => ({
+                            ...prev,
+                            swarm_parsing_model: 'google/gemini-2.5-flash-lite',
+                            swarm_chunking_model: 'openai/gpt-4.1-mini',
+                            swarm_retrieval_model: 'deepseek/deepseek-v3.1',
+                            swarm_supervisor_model: 'google/gemini-2.5-flash',
+                          }))
+                        }
+                        className="px-2 py-0.5 bg-[#f7f7f6] hover:bg-[#03aa5c]/15 hover:text-[#027a42] border border-[#dedede] text-[#3d3d3d] rounded-[2px]"
+                      >
+                        Gói A · Cân bằng
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSettings((prev) => ({
+                            ...prev,
+                            swarm_parsing_model: 'google/gemini-3-flash',
+                            swarm_chunking_model: 'openai/gpt-4.1',
+                            swarm_retrieval_model: 'openai/gpt-5-mini',
+                            swarm_supervisor_model: 'anthropic/claude-sonnet-4.5',
+                          }))
+                        }
+                        className="px-2 py-0.5 bg-[#f7f7f6] hover:bg-[#03aa5c]/15 hover:text-[#027a42] border border-[#dedede] text-[#3d3d3d] rounded-[2px]"
+                        title="Yêu cầu tài khoản Vercel AI Gateway đã nạp credit (Paid Tier)"
+                      >
+                        Paid · Claude + Gemini 3
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSettings((prev) => ({
+                            ...prev,
+                            swarm_parsing_model: '',
+                            swarm_chunking_model: '',
+                            swarm_retrieval_model: '',
+                            swarm_supervisor_model: '',
+                          }))
+                        }
+                        className="px-2 py-0.5 bg-[#f7f7f6] hover:bg-zinc-200 border border-[#dedede] text-[#52525b] rounded-[2px]"
+                      >
+                        Dùng chung 1 model
+                      </button>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <FieldRow label="1. Parsing Worker (Text + Vision PDF)" hint="Khuyên dùng Gemini 2.5 Flash có Vision đọc bảng/ảnh">
+                      <input
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('swarm_parsing_model')}
+                        onChange={(e) => setKey('swarm_parsing_model', e.target.value)}
+                        placeholder="google/gemini-2.5-flash"
+                      />
+                    </FieldRow>
+                    <FieldRow label="2. Chunking Worker (Ranh giới & Ngữ cảnh)" hint="Bám chặt JSON & phân tích ranh giới tiếng Việt">
+                      <input
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('swarm_chunking_model')}
+                        onChange={(e) => setKey('swarm_chunking_model', e.target.value)}
+                        placeholder="openai/gpt-4.1"
+                      />
+                    </FieldRow>
+                    <FieldRow label="3. Retrieval Worker (Đối chứng Vector/BM25)" hint="Suy luận đối chứng Top-hits vs Gold">
+                      <input
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('swarm_retrieval_model')}
+                        onChange={(e) => setKey('swarm_retrieval_model', e.target.value)}
+                        placeholder="openai/gpt-5-mini"
+                      />
+                    </FieldRow>
+                    <FieldRow label="4. Supervisor (Điều phối & Tổng hợp 3 gói)" hint="Chỉ 1 call cuối — nên dùng model reasoning mạnh">
+                      <input
+                        className="ts-input w-full font-mono text-xs"
+                        value={val('swarm_supervisor_model')}
+                        onChange={(e) => setKey('swarm_supervisor_model', e.target.value)}
+                        placeholder="openai/gpt-5.2"
+                      />
+                    </FieldRow>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={testingSwarm}
+                      onClick={async () => {
+                        setTestingSwarm(true);
+                        setSwarmTestRoles(null);
+                        setConnMsg({});
+                        try {
+                          if (onSaveSilent) await onSaveSilent();
+                          else await api.saveSettings(settings);
+                          const r = await api.testSwarm();
+                          setSwarmTestRoles(r.roles || null);
+                          setConnMsg({
+                            ok: Boolean(r.ok),
+                            text: r.ok
+                              ? `Cả ${r.ok_count}/${r.total} model Multi-Agent đều kết nối thành công.`
+                              : `Chỉ ${r.ok_count}/${r.total} model Multi-Agent kết nối thành công.`,
+                          });
+                        } catch (e: any) {
+                          setConnMsg({ ok: false, text: e.message });
+                        } finally {
+                          setTestingSwarm(false);
+                        }
+                      }}
+                      className="ts-btn-secondary text-xs"
+                    >
+                      <FlaskConical className="size-3.5 text-[#03aa5c]" />
+                      {testingSwarm ? 'Đang kiểm tra 4 model...' : 'Kiểm tra kết nối cả 4 model'}
+                    </button>
+                  </div>
+                  {swarmTestRoles && (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 text-[11px] font-mono">
+                      {Object.entries(swarmTestRoles).map(([role, st]) => (
+                        <div
+                          key={role}
+                          className={`px-2.5 py-1.5 rounded border flex items-center justify-between gap-2 ${
+                            st.ok
+                              ? 'bg-[#f2fbf6] border-[#03aa5c]/30 text-[#027a42]'
+                              : 'bg-rose-50 border-rose-200 text-rose-700'
+                          }`}
+                          title={st.error || st.model}
+                        >
+                          <span className="truncate">
+                            <strong>{role}</strong>: {st.model || '—'}
+                          </span>
+                          <span className="shrink-0 font-semibold">{st.ok ? 'OK' : 'LỖI'}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
 
                 <div className="border-t border-[#ededeb] pt-4 space-y-3">

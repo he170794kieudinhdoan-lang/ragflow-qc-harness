@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 from canary_tuner import run_canary_optimization_study, select_canary_candidates
 from config_advisor import analyze_and_propose_configs, merge_index_knobs_into_parser_config
-from database import UPLOAD_DIR, get_db, get_setting, utc_now
+from database import UPLOAD_DIR, get_db, get_setting, resolve_golden_run_id, utc_now
 from diagnostic_swarm import get_latest_agent_diagnosis_status, run_agent_diagnosis_swarm
 from optimizer_engine import build_candidate_configs, request_cancel_study, run_retrieval_optimization_study
 from ragflow_client import RAGFlowClient
@@ -225,9 +225,10 @@ async def start_retrieval_sweep(run_id: int, payload: SweepStartRequest, backgro
             "keyword_enabled": bool(latest_rr["keyword_enabled"]) if latest_rr else bool(rc.get("keyword_enabled", True)),
         }
 
-        tc_count = conn.execute("SELECT COUNT(*) FROM golden_testcases").fetchone()[0]
+        owner_id = resolve_golden_run_id(conn, run_id)
+        tc_count = conn.execute("SELECT COUNT(*) FROM golden_testcases WHERE run_id = ?", (owner_id,)).fetchone()[0]
         if tc_count == 0:
-            raise HTTPException(status_code=400, detail="Golden Dataset đang trống. Hãy tạo câu hỏi ở Bước 4 trước.")
+            raise HTTPException(status_code=400, detail="Golden Dataset của phiên này đang trống. Hãy tạo câu hỏi ở Bước 4 trước.")
 
         candidates = build_candidate_configs(
             payload.search_space,
@@ -310,6 +311,7 @@ async def apply_recommended_config(run_id: int, payload: ApplyConfigRequest):
     if payload.fork_new_run:
         fork_name = (payload.new_run_name or f"{run['name']} · Optimized").strip()
         with get_db() as conn:
+            golden_owner_id = resolve_golden_run_id(conn, run_id)
             existing_names = {r["name"] for r in conn.execute("SELECT name FROM runs").fetchall()}
             source_docs = [
                 dict(r)
@@ -333,7 +335,12 @@ async def apply_recommended_config(run_id: int, payload: ApplyConfigRequest):
         new_ds_id = ""
         new_ds_name = cand_name
         client: Optional[RAGFlowClient] = None
-        if payload.sync_remote and base_url and api_key:
+        if payload.sync_remote:
+            if not base_url or not api_key:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Chưa cấu hình RAGFlow URL/API Key trong Cài đặt để tạo Dataset mới trên RAGFlow.",
+                )
             try:
                 client = RAGFlowClient(base_url, api_key)
                 embedding_model = None
@@ -342,23 +349,25 @@ async def apply_recommended_config(run_id: int, payload: ApplyConfigRequest):
                     embedding_model = (base_ds or {}).get("embedding_model") or None
                 ds = await client.create_dataset(
                     name=cand_name,
-                    chunk_method=str(next_pc.get("chunk_method") or "general"),
+                    chunk_method=str(next_pc.get("chunk_method") or next_pc.get("parser_id") or "general"),
                     embedding_model=embedding_model,
                     parser_config=next_pc,
                     description=f"Forked & optimized from {run['name']}",
                 )
                 new_ds_id = ds.get("id", "")
                 new_ds_name = ds.get("name", cand_name)
+                if not new_ds_id:
+                    raise RuntimeError("RAGFlow không trả về Dataset ID")
                 remote_synced = True
             except Exception as e:
-                remote_warning = str(e)
+                raise HTTPException(status_code=400, detail=f"Không tạo được Dataset mới trên RAGFlow: {e}")
 
         now = utc_now()
         with get_db() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO runs (name, description, is_baseline, ragflow_dataset_id, ragflow_dataset_name, parser_config, retrieval_config, status, account_key, created_at)
-                VALUES (?, ?, 0, ?, ?, ?, ?, 'READY', ?, ?)
+                INSERT INTO runs (name, description, is_baseline, ragflow_dataset_id, ragflow_dataset_name, parser_config, retrieval_config, status, account_key, golden_source_run_id, created_at)
+                VALUES (?, ?, 0, ?, ?, ?, ?, 'READY', ?, ?, ?)
                 """,
                 (
                     cand_name,
@@ -368,6 +377,7 @@ async def apply_recommended_config(run_id: int, payload: ApplyConfigRequest):
                     json.dumps(next_pc, ensure_ascii=False),
                     json.dumps(next_rc, ensure_ascii=False),
                     run["account_key"] if "account_key" in run.keys() else "",
+                    golden_owner_id,
                     now,
                 ),
             )
@@ -468,7 +478,7 @@ async def apply_recommended_config(run_id: int, payload: ApplyConfigRequest):
             client = RAGFlowClient(base_url, api_key)
             await client.update_dataset(
                 dataset_id=run["ragflow_dataset_id"],
-                chunk_method=str(next_pc.get("chunk_method") or "general"),
+                chunk_method=str(next_pc.get("chunk_method") or next_pc.get("parser_id") or "general"),
                 parser_config=next_pc,
             )
             remote_synced = True

@@ -14,7 +14,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from config_advisor import analyze_and_propose_configs, merge_index_knobs_into_parser_config
-from database import UPLOAD_DIR, get_bool_setting, get_current_account_key, get_db, get_float_setting, get_int_setting, get_setting, utc_now
+from database import UPLOAD_DIR, get_bool_setting, get_current_account_key, get_db, get_float_setting, get_int_setting, get_setting, resolve_golden_run_id, utc_now
 from metrics import (
     align_unit_to_chunks,
     analyze_chunk_rules,
@@ -65,13 +65,11 @@ def select_canary_candidates(run_id: int, max_docs: int = 4) -> Dict[str, Any]:
             (run_id,),
         ).fetchall()
 
-        if acct:
-            tcs = conn.execute(
-                "SELECT id, tc_code, source_file FROM golden_testcases WHERE account_key = ? OR account_key = ''",
-                (acct,),
-            ).fetchall()
-        else:
-            tcs = conn.execute("SELECT id, tc_code, source_file FROM golden_testcases").fetchall()
+        owner_id = resolve_golden_run_id(conn, run_id)
+        tcs = conn.execute(
+            "SELECT id, tc_code, source_file FROM golden_testcases WHERE run_id = ? ORDER BY tc_code",
+            (owner_id,),
+        ).fetchall()
 
     pu_stats: Dict[int, Dict[str, int]] = {}
     for u in pu_rows:
@@ -452,16 +450,14 @@ async def run_canary_optimization_study(
                 ).fetchall()
             ]
 
-            if acct:
-                all_tcs = [
-                    dict(r)
-                    for r in conn.execute(
-                        "SELECT * FROM golden_testcases WHERE account_key = ? OR account_key = '' ORDER BY tc_code",
-                        (acct,),
-                    ).fetchall()
-                ]
-            else:
-                all_tcs = [dict(r) for r in conn.execute("SELECT * FROM golden_testcases ORDER BY tc_code").fetchall()]
+            owner_id = resolve_golden_run_id(conn, run_id)
+            all_tcs = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM golden_testcases WHERE run_id = ? ORDER BY tc_code",
+                    (owner_id,),
+                ).fetchall()
+            ]
 
             mem_id_cache = {
                 (r["testcase_id"], r["ragflow_chunk_id"]): (r["relevant"], r["reason"])

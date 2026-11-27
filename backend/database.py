@@ -481,6 +481,11 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "vision_base_url": "local",
     "vision_api_key": "",
     "vision_model": "local-rapidocr",
+    # Step 5: Multi-Agent Swarm 4-Model Routing (Vercel AI Gateway - Pack B Pro)
+    "swarm_parsing_model": "google/gemini-2.5-flash",
+    "swarm_chunking_model": "openai/gpt-4.1",
+    "swarm_retrieval_model": "openai/gpt-5-mini",
+    "swarm_supervisor_model": "openai/gpt-5.2",
     # System One / Jev (Retrieval & Chunking Judge via Colab Kev, Vercel AI Gateway, or TypeSafe)
     "retrieval_judge_provider": "llm",
     "systemone_base_url": "https://ai-gateway.vercel.sh/typesafe",

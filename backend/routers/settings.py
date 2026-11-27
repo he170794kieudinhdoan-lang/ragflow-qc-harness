@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Any, Dict
@@ -147,3 +148,45 @@ async def test_systemone_endpoint():
         raise HTTPException(status_code=400, detail=f"Lỗi kết nối Jev System One: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Không gọi được tới Jev System One: {e}")
+
+
+@router.post("/test-swarm")
+async def test_swarm_models():
+    base_url = get_setting("llm_base_url", "").strip()
+    api_key = get_setting("llm_api_key", "").strip()
+    fallback_model = get_setting("llm_model", "").strip()
+    if not base_url:
+        raise HTTPException(status_code=400, detail="Vui lòng nhập LLM Base URL trước.")
+
+    role_models = {
+        "parsing": get_setting("swarm_parsing_model", "").strip() or fallback_model,
+        "chunking": get_setting("swarm_chunking_model", "").strip() or fallback_model,
+        "retrieval": get_setting("swarm_retrieval_model", "").strip() or fallback_model,
+        "supervisor": get_setting("swarm_supervisor_model", "").strip() or fallback_model,
+    }
+    unique_models = sorted({m for m in role_models.values() if m})
+    if not unique_models:
+        raise HTTPException(status_code=400, detail="Chưa có model nào được cấu hình.")
+
+    async def _ping(model_name: str):
+        try:
+            await test_llm_connection(base_url, api_key, model_name)
+            return model_name, True, ""
+        except Exception as e:
+            return model_name, False, str(e)[:180]
+
+    ping_results = await asyncio.gather(*(_ping(m) for m in unique_models))
+    status_by_model = {m: (ok, err) for m, ok, err in ping_results}
+
+    roles_out = {}
+    ok_count = 0
+    for role, m in role_models.items():
+        if not m:
+            roles_out[role] = {"model": "", "ok": False, "error": "Chưa cấu hình"}
+        else:
+            ok, err = status_by_model.get(m, (False, "Không kiểm tra được"))
+            if ok:
+                ok_count += 1
+            roles_out[role] = {"model": m, "ok": ok, "error": err}
+
+    return {"ok": ok_count == len(role_models), "ok_count": ok_count, "total": len(role_models), "roles": roles_out}

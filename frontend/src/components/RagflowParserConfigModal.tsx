@@ -6,6 +6,7 @@ import { RunItem } from '../types';
 
 interface Props {
   run: RunItem;
+  initialSection?: SectionId;
   onClose: () => void;
   onSaved: () => void;
 }
@@ -28,8 +29,12 @@ function findNodeKey(pc: Record<string, any>, prefix: string): string | null {
   return Object.keys(pc).find((k) => k.startsWith(prefix)) || null;
 }
 
-export const RagflowParserConfigModal: React.FC<Props> = ({ run, onClose, onSaved }) => {
-  const [section, setSection] = useState<SectionId>('parser');
+export const RagflowParserConfigModal: React.FC<Props> = ({ run, initialSection = 'parser', onClose, onSaved }) => {
+  const [section, setSection] = useState<SectionId>(initialSection);
+
+  useEffect(() => {
+    setSection(initialSection);
+  }, [initialSection]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 

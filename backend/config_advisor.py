@@ -14,7 +14,7 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from database import get_db
+from database import get_db, resolve_golden_run_id
 from metrics import compute_contextual_precision, compute_parsing_metrics, compute_weighted_chunking_rates
 
 _LEGAL_RE = re.compile(r"(?:^|\n)\s*(?:Điều|Khoản|Chương|Mục)\s+\d+", re.IGNORECASE)
@@ -202,7 +202,8 @@ def analyze_and_propose_configs(run_id: int) -> Dict[str, Any]:
                 "SELECT * FROM testcase_eval_meta WHERE retrieval_run_id = ?",
                 (latest_rr["id"],),
             ).fetchall()
-            tcs = conn.execute("SELECT * FROM golden_testcases ORDER BY tc_code").fetchall()
+            owner_id = resolve_golden_run_id(conn, run_id)
+            tcs = conn.execute("SELECT * FROM golden_testcases WHERE run_id = ? ORDER BY tc_code", (owner_id,)).fetchall()
 
     try:
         parser_cfg = json.loads(run["parser_config"] or "{}")
