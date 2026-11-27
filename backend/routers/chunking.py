@@ -720,7 +720,13 @@ def list_all_chunks(
 
         txt = pos_map[(r["document_id"], r["chunk_index"])]
         if q_norm:
-            hay = f"{txt}\n{r['doc_code'] or ''}\n{r['filename'] or ''}\n{r['important_keywords'] or ''}".lower()
+            cid_str = str(r["ragflow_chunk_id"] or "")
+            cidx = r["chunk_index"]
+            dcode = r["doc_code"] or ""
+            hay = (
+                f"{txt}\n{dcode}\n{r['filename'] or ''}\n{r['important_keywords'] or ''}\n"
+                f"{cid_str}\n#{cidx}\n{dcode} #{cidx}\nchunk #{cidx}\nchunk {cidx}\nid:{cid_str}"
+            ).lower()
             if q_norm not in hay:
                 continue
 

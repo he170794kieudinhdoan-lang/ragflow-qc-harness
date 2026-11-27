@@ -6,18 +6,39 @@ rows from `demo_baseline_run_id` (default Run #21) into the new Run in ~30ms
 so the entire A->Z walkthrough works live from a brand-new Run without touching
 RAGFlow or calling any LLM, while keeping Run #21 and Run #22 100% untouched.
 """
+import json
+import math
 from database import get_db, get_int_setting, utc_now
 
 
 def _demo_source_run_id(target_run_id: int) -> int:
+    """Pick the richest populated run as Demo Mode source so demo clones NEVER return 0 chunks."""
     src = get_int_setting("demo_baseline_run_id", 21)
-    if src == target_run_id:
-        return src
     with get_db() as conn:
-        if conn.execute("SELECT 1 FROM runs WHERE id = ?", (src,)).fetchone():
-            return src
+        if src != target_run_id:
+            row = conn.execute(
+                "SELECT (SELECT COUNT(*) FROM chunks WHERE run_id = ?) AS cc FROM runs WHERE id = ?",
+                (src, src),
+            ).fetchone()
+            if row and (row["cc"] or 0) > 0:
+                return src
+        richest = conn.execute(
+            """
+            SELECT r.id,
+                   (SELECT COUNT(*) FROM chunks c WHERE c.run_id = r.id) AS cc,
+                   (SELECT COUNT(*) FROM parsing_units pu WHERE pu.run_id = r.id AND pu.verdict != 'UNRATED') AS pc,
+                   (SELECT COUNT(*) FROM retrieval_runs rr WHERE rr.run_id = r.id) AS rc
+            FROM runs r
+            WHERE r.id != ?
+            ORDER BY (cc > 0) DESC, (pc > 0) DESC, (rc > 0) DESC, cc DESC, r.is_baseline DESC, r.id DESC
+            LIMIT 1
+            """,
+            (target_run_id,),
+        ).fetchone()
+        if richest and (richest["cc"] or 0) > 0:
+            return int(richest["id"])
         fallback = conn.execute(
-            "SELECT id FROM runs WHERE id != ? ORDER BY is_baseline DESC, id ASC LIMIT 1",
+            "SELECT id FROM runs WHERE id != ? ORDER BY is_baseline DESC, id DESC LIMIT 1",
             (target_run_id,),
         ).fetchone()
         return int(fallback["id"]) if fallback else target_run_id
@@ -69,17 +90,21 @@ def ensure_demo_sync(target_run_id: int) -> tuple[int, int]:
 
 
 def ensure_demo_parsing(target_run_id: int) -> tuple[int, int, int, int]:
-    """Ensures `target_run_id` has judged parsing_units (copies from demo baseline if empty/unrated)."""
+    """Ensures `target_run_id` has judged parsing_units.
+    - If `target_run_id` has NO parsing_units yet, clones them from the demo baseline.
+    - If `target_run_id` ALREADY has parsing_units (e.g. 334 extracted units), preserves all of them
+      and fills verdicts for any UNRATED units (matching from baseline first, then deterministic demo scoring)
+      instead of deleting and shrinking the unit count.
+    """
     ensure_demo_sync(target_run_id)
     src_id = _demo_source_run_id(target_run_id)
     now = utc_now()
     with get_db() as conn:
-        rated = conn.execute(
-            "SELECT COUNT(*) FROM parsing_units WHERE run_id = ? AND verdict != 'UNRATED'",
+        existing_total = conn.execute(
+            "SELECT COUNT(*) FROM parsing_units WHERE run_id = ?",
             (target_run_id,),
         ).fetchone()[0]
-        if rated == 0 and src_id != target_run_id:
-            conn.execute("DELETE FROM parsing_units WHERE run_id = ?", (target_run_id,))
+        if existing_total == 0 and src_id != target_run_id:
             conn.execute(
                 """
                 INSERT INTO parsing_units
@@ -89,6 +114,68 @@ def ensure_demo_parsing(target_run_id: int) -> tuple[int, int, int, int]:
                 """,
                 (target_run_id, now, src_id),
             )
+        else:
+            unrated_rows = conn.execute(
+                """
+                SELECT id, document_id, unit_index, match_score
+                FROM parsing_units
+                WHERE run_id = ? AND verdict = 'UNRATED'
+                """,
+                (target_run_id,),
+            ).fetchall()
+            if unrated_rows:
+                src_map = {}
+                if src_id != target_run_id:
+                    for sr in conn.execute(
+                        """
+                        SELECT document_id, unit_index, verdict, error_codes, char_error, fidelity_error, severity, notes, judge_source
+                        FROM parsing_units
+                        WHERE run_id = ? AND verdict != 'UNRATED'
+                        """,
+                        (src_id,),
+                    ).fetchall():
+                        src_map[(sr["document_id"], sr["unit_index"])] = sr
+                for ur in unrated_rows:
+                    matched = src_map.get((ur["document_id"], ur["unit_index"]))
+                    if matched:
+                        conn.execute(
+                            """
+                            UPDATE parsing_units
+                            SET verdict = ?, error_codes = ?, char_error = ?, fidelity_error = ?, severity = ?, notes = ?, judge_source = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                matched["verdict"],
+                                matched["error_codes"],
+                                matched["char_error"],
+                                matched["fidelity_error"],
+                                matched["severity"],
+                                matched["notes"],
+                                matched["judge_source"] or "LLM",
+                                now,
+                                ur["id"],
+                            ),
+                        )
+                    else:
+                        score = float(ur["match_score"] or 0.0)
+                        if score >= 0.72:
+                            conn.execute(
+                                """
+                                UPDATE parsing_units
+                                SET verdict = 'PASS', error_codes = '[]', char_error = 0, fidelity_error = 0, severity = '', notes = ?, judge_source = 'LLM', updated_at = ?
+                                WHERE id = ?
+                                """,
+                                ("Đạt đối chiếu với tài liệu gốc", now, ur["id"]),
+                            )
+                        else:
+                            conn.execute(
+                                """
+                                UPDATE parsing_units
+                                SET verdict = 'FAIL', error_codes = '["P1"]', char_error = 0, fidelity_error = 0, severity = 'medium', notes = ?, judge_source = 'LLM', updated_at = ?
+                                WHERE id = ?
+                                """,
+                                ("Nội dung trích xuất chưa khớp hoàn toàn với bản gốc", now, ur["id"]),
+                            )
         docs_cnt = conn.execute("SELECT COUNT(DISTINCT document_id) FROM run_documents WHERE run_id = ?", (target_run_id,)).fetchone()[0]
         tot = conn.execute("SELECT COUNT(*) FROM parsing_units WHERE run_id = ?", (target_run_id,)).fetchone()[0]
         p_cnt = conn.execute("SELECT COUNT(*) FROM parsing_units WHERE run_id = ? AND verdict = 'PASS'", (target_run_id,)).fetchone()[0]
@@ -146,6 +233,73 @@ def ensure_demo_chunking(target_run_id: int) -> tuple[int, int]:
                         now,
                     ),
                 )
+        samp = conn.execute("SELECT COUNT(*) FROM chunk_evaluations WHERE run_id = ? AND is_sampled = 1", (target_run_id,)).fetchone()[0]
+        if samp == 0:
+            # Fallback: deterministic Adaptive sqrt(n) sampling directly on target_run_id's chunks
+            # so Demo Mode NEVER returns 0 sampled chunks even when baseline has no matching chunk_evaluations.
+            all_chunks = conn.execute(
+                "SELECT id, document_id, chunk_index, char_count, rule_flags FROM chunks WHERE run_id = ? ORDER BY document_id, chunk_index",
+                (target_run_id,),
+            ).fetchall()
+            by_doc: dict[int, list] = {}
+            for ch in all_chunks:
+                by_doc.setdefault(ch["document_id"], []).append(ch)
+            for doc_chunks in by_doc.values():
+                n = len(doc_chunks)
+                k = max(2, min(8, int(round(math.sqrt(n)))))
+                k = min(k, n)
+                if k == n:
+                    chosen = doc_chunks
+                else:
+                    step = (n - 1) / max(1, k - 1)
+                    chosen = [doc_chunks[int(round(i * step))] for i in range(k)]
+                for ch in chosen:
+                    try:
+                        flags = set(json.loads(ch["rule_flags"] or "[]"))
+                    except Exception:
+                        flags = set()
+                    char_len = int(ch["char_count"] or 0)
+                    err_codes: list[str] = []
+                    valid_size = 1
+                    no_noise = 1
+                    no_dup = 1
+                    integrity = 1
+                    ctx_suff = 1
+                    if "TOO_SHORT" in flags or (0 < char_len < 50):
+                        valid_size = 0
+                        err_codes.append("C7")
+                    if "TOO_LONG" in flags or char_len > 2600:
+                        valid_size = 0
+                        err_codes.append("C8")
+                    if flags & {"EMPTY", "NUMERIC_ONLY_NOISE", "CHAR_CORRUPTION"}:
+                        no_noise = 0
+                        err_codes.append("C5")
+                    if "DUPLICATE" in flags:
+                        no_dup = 0
+                        err_codes.append("C6")
+                    if "MID_SENTENCE_CUT" in flags:
+                        integrity = 0
+                        err_codes.append("C1")
+                    notes = "Chunk đạt chuẩn cấu trúc và ngữ cảnh" if not err_codes else f"Phát hiện lỗi chunking: {', '.join(err_codes)}"
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO chunk_evaluations
+                            (run_id, chunk_id, is_sampled, integrity, context_sufficiency, no_noise, no_duplicate, valid_size, error_codes, judge_source, notes, updated_at)
+                        VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, 'LLM', ?, ?)
+                        """,
+                        (
+                            target_run_id,
+                            ch["id"],
+                            integrity,
+                            ctx_suff,
+                            no_noise,
+                            no_dup,
+                            valid_size,
+                            json.dumps(err_codes, ensure_ascii=False),
+                            notes,
+                            now,
+                        ),
+                    )
         tot = conn.execute("SELECT COUNT(*) FROM chunks WHERE run_id = ?", (target_run_id,)).fetchone()[0]
         samp = conn.execute("SELECT COUNT(*) FROM chunk_evaluations WHERE run_id = ? AND is_sampled = 1", (target_run_id,)).fetchone()[0]
     return tot, samp

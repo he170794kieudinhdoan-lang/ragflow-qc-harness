@@ -146,10 +146,15 @@ export const api = {
     qs.set('delete_remote', String(deleteRemote));
     return req<any>(`/api/workspace/documents/${id}?${qs.toString()}`, { method: 'DELETE' });
   },
-  clearDocuments: (syncedOnly = false) =>
-    req<any>(`/api/workspace/documents?synced_only=${syncedOnly}`, { method: 'DELETE' }),
+  clearDocuments: (syncedOnly = false, runId?: number) => {
+    const qs = new URLSearchParams({ synced_only: String(syncedOnly) });
+    if (runId !== undefined) qs.set('run_id', String(runId));
+    return req<any>(`/api/workspace/documents?${qs.toString()}`, { method: 'DELETE' });
+  },
 
   listRuns: () => req<any[]>('/api/workspace/runs'),
+  syncDatasetsFromRagflow: () =>
+    req<any>('/api/workspace/runs/sync-datasets', { method: 'POST' }),
   createRun: (payload: any) =>
     req<any>('/api/workspace/runs', { method: 'POST', body: JSON.stringify(payload) }),
   getRunParserConfig: (runId: number) =>

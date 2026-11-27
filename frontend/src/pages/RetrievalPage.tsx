@@ -1084,7 +1084,7 @@ export const RetrievalPage: React.FC<Props> = ({ activeRun, isActive = true }) =
                     className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium rounded-md bg-[#141414] hover:bg-[#27272a] text-white disabled:opacity-45"
                   >
                     {generating ? <Loader2 className="size-3.5 animate-spin" /> : <Wand2 className="size-3.5" />}
-                    {generating ? 'Đang sinh từ file gốc...' : `Sinh ${genTotalCount} câu Golden`}
+                    {generating ? 'Đang sinh từ file gốc...' : 'Sinh Golden'}
                   </button>
                   <button
                     type="button"

@@ -1,0 +1,82 @@
+Create ONE high-resolution Vietnamese technical infographic, landscape 16:9 (aim for 3840 × 2160). This is a real software project's architecture and interaction flow for a QC audience. Exact, clean Vietnamese typography with full diacritics is essential. Use case: infographic-diagram. White / very pale slate background, dark navy type, teal for the QC application, blue for RAGFlow, violet for optional AI APIs, amber for local storage. Crisp flat vector-like diagram, rounded cards, fine borders, generous padding, small purposeful outline icons. No isometric rendering, no photorealism, no fake logos, no watermark. Make every label comfortably readable, with clear hierarchy. Do not add software products or databases not named below.
+
+TITLE, large:
+"RAGFlow QC — Luồng tương tác"
+SUBTITLE:
+"Tài liệu gốc → Kiểm thử Parsing / Chunking / Retrieval → So sánh A/B"
+
+Organize the infographic into TWO distinct horizontal zones. The upper 43% is an architecture diagram titled "CÁC THÀNH PHẦN & KẾT NỐI". The lower 57% is an ordered eight-step workflow titled "8 BƯỚC XỬ LÝ". Separate zones with whitespace, not a heavy divider. Keep architecture arrows completely separate from workflow arrows.
+
+UPPER ZONE — architecture:
+A pale teal boundary labeled "ỨNG DỤNG RAGFLOW QC" encloses UI, backend, local libraries and local storage. A small "Người QC" icon at far left connects bidirectionally to UI.
+Inside boundary:
+- UI card: "Giao diện web" / "React · TypeScript · Tailwind" / "QC thao tác, xem tiến độ và kết quả".
+- Large central backend card, dominant: "Backend điều phối" / "Python · FastAPI · Uvicorn" / "API · Tác vụ nền · Tính chỉ số QC".
+Connect UI ⇄ backend with label "HTTP /api/* · JSON / file".
+- Bottom-left card connected to backend: "Thư viện chạy trong backend" / "PyMuPDF + pdfplumber: PDF / bảng" / "python-docx · python-pptx: Word / slide" / "BeautifulSoup: HTML · openpyxl: Excel" / "RapidFuzz: so khớp văn bản".
+- Bottom-center local storage card connected bidirectionally to backend, titled "Lưu trữ cục bộ", with two clearly differentiated items:
+  "SQLite — ragflow_qc.db"
+  "Cấu hình, runs, snapshot chunks, golden,"
+  "nhãn chấm, cache, kết quả, báo cáo"
+  "Thư mục uploads/ — file tài liệu gốc".
+On the right, outside QC boundary, stack two external service cards:
+- Blue "RAGFlow API" / "Dataset · Tài liệu · Parse / Chunk" / "Retrieval · Kết quả xếp hạng".
+  A bidirectional SOLID arrow backend ⇄ RAGFlow labeled "httpx · /api/v1/*".
+  Inside RAGFlow card's base, a smaller cylinder area: "Kho tài liệu & chỉ mục tìm kiếm" / "Do RAGFlow quản lý".
+- Violet "Dịch vụ AI — tùy cấu hình" / "LLM / Vision: OCR, sinh câu hỏi, chấm" / "TypeSafe JEV: chấm Chunking / Retrieval".
+  A bidirectional DASHED violet arrow backend ⇄ AI card labeled "httpx · API AI".
+At bottom of architecture add concise note:
+"QC truy cập RAGFlow qua API; kho dữ liệu phía RAGFlow do RAGFlow quản lý."
+Small legend: "Nét liền: luồng chính     Nét đứt: AI tùy cấu hình".
+Do NOT invent PostgreSQL, MySQL, Redis, Elasticsearch, MinIO or a particular LLM vendor. The repository only confirms local SQLite and API-level access to RAGFlow.
+
+LOWER ZONE — eight numbered cards in a 4-column × 2-row reading grid.
+Read row 1 left to right: 01 → 02 → 03 → 04.
+Read row 2 left to right: 05 → 06 → 07 → 08.
+Use an explicit subtle connector from 04 around the margin to 05 if room; no zigzag ambiguity, no arrow through text. Each card should have a large number badge, a title, and three short explanatory lines exactly as given. These steps are a logical overview; local extraction and remote parsing can proceed separately.
+
+01 — "Cấu hình & chuẩn bị"
+"Nhập URL / API key RAGFlow."
+"Tạo hoặc chọn dataset, cấu hình run."
+"Chọn AI nếu cần; chuẩn bị file gốc."
+
+02 — "Nhận tài liệu gốc"
+"Lưu file vào uploads/, metadata vào SQLite."
+"Thư viện đọc file → nội dung đối chiếu."
+"PDF, Word, PPTX, Excel, HTML, TXT / MD."
+
+03 — "Gửi sang RAGFlow"
+"Upload file; gửi lệnh parse."
+"RAGFlow đọc, chia chunks, tạo chỉ mục."
+"Backend theo dõi trạng thái xử lý."
+
+04 — "Kéo snapshot về QC"
+"Lấy danh sách tài liệu và chunks qua API."
+"Lưu nội dung, ID, vị trí / trang vào SQLite."
+"Dùng snapshot cho Parsing và Chunking."
+
+05 — "Chấm Parsing"
+"So nội dung gốc với chunks RAGFlow."
+"RapidFuzz + quy tắc tìm thiếu / sai / lỗi bảng."
+"Vision / LLM hỗ trợ; QC kiểm tra nhãn."
+
+06 — "Chấm Chunking"
+"Lấy mẫu phân tầng đầu – giữa – cuối."
+"Kiểm tra độ dài, trùng lặp, đủ ngữ cảnh."
+"Quy tắc + QC; LLM hoặc JEV tùy cấu hình."
+
+07 — "Chạy Retrieval"
+"Golden: nhập tay / Excel / CSV / AI sinh."
+"Gửi câu hỏi → /api/v1/retrieval → top-k."
+"Cache nhãn; QC / quy tắc / LLM / JEV chấm."
+
+08 — "Tổng hợp & so sánh"
+"Lưu nhãn, điểm và kết quả vào SQLite."
+"Xem Precision, Coverage; so sánh A/B."
+"Xuất Excel; chỉnh cấu hình và chạy lại."
+
+A slim footer strip, readable:
+"Retrieval: top-k · threshold · trọng số vector / từ khóa · rerank  |  AI và kết nối phụ thuộc cấu hình đã chọn."
+Tiny final credit line: "Sơ đồ dựa trên mã nguồn dự án RAGFlow QC Harness".
+
+Quality constraints: perfect Vietnamese accents; no garbled or invented text; use the specified labels; keep arrows directional and attach them to card edges; libraries must be INSIDE the backend/application area, not drawn as separate network services; SQLite and uploads must be LOCAL to QC, not placed inside RAGFlow; the external AI card must be separate from RAGFlow; avoid excessive decorative icons. Prioritize legibility and accurate relationships over decoration.

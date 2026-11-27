@@ -89,6 +89,9 @@ def update_settings(payload: SettingsPayload):
 
 @router.post("/test-ragflow")
 async def test_ragflow_connection():
+    from database import get_bool_setting
+    if get_bool_setting("demo_mode", False):
+        return {"ok": True, "demo": True, "dataset_count": 5, "message": "Chế độ Demo — kết nối RAGFlow giả lập thành công."}
     base_url = get_setting("ragflow_base_url", "")
     api_key = get_setting("ragflow_api_key", "")
     if not base_url or not api_key:
@@ -105,6 +108,9 @@ async def test_ragflow_connection():
 
 @router.post("/test-llm")
 async def test_llm_endpoint():
+    from database import get_bool_setting
+    if get_bool_setting("demo_mode", False):
+        return {"ok": True, "demo": True, "message": "Chế độ Demo — kết nối LLM giả lập thành công."}
     base_url = get_setting("llm_base_url", "").strip()
     api_key = get_setting("llm_api_key", "").strip()
     model = get_setting("llm_model", "").strip()

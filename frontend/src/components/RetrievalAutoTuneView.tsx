@@ -981,15 +981,6 @@ export const RetrievalAutoTuneView: React.FC<Props> = ({
         ) : (
           <div ref={resultsContainerRef} className="p-6 max-w-5xl mx-auto space-y-6">
             {/* Overfit micro-notice */}
-            {result.stats.overfit_warning && (
-              <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-[#fafaf9] border border-[#e4e4e2] text-[11.5px] text-[#71717a]">
-                <AlertTriangle className="size-3.5 text-[#d97706] shrink-0" />
-                <span>
-                  Bộ Golden hiện có <strong className="font-mono text-[#141414]">{result.stats.total_testcases}</strong> câu (&lt;25). Nên ưu tiên chọn cấu hình nằm giữa vùng xanh ổn định trên Heatmap để tránh overfit.
-                </span>
-              </div>
-            )}
-
             {/* 1. BEST CONFIG HERO STRIP */}
             <section className="at-hero rounded-lg border border-[#e4e4e2] border-l-[3px] border-l-[#03aa5c] bg-white p-5">
               <div className="flex flex-wrap items-start justify-between gap-4 pb-4 border-b border-[#f0f0ee]">

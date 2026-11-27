@@ -566,9 +566,10 @@ export const WorkspacePage: React.FC<Props> = ({
                     description: 'Tất cả tài liệu hiện tại sẽ bị gỡ khỏi danh sách local (không ảnh hưởng đến file trên RAGFlow).',
                     confirmLabel: 'Xóa tất cả',
                     onConfirm: async () => {
-                      await api.clearDocuments(false);
+                      await api.clearDocuments(false, activeRun?.id);
                       await loadAll();
-                      toast.success('Đã xóa toàn bộ tài liệu cũ.');
+                      onReloadRuns();
+                      toast.success('Đã xóa danh sách tài liệu local của phiên này.');
                     },
                   })
                 }

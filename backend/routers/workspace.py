@@ -281,7 +281,7 @@ async def delete_document(
     dataset_id = ""
     ragflow_doc_id = ""
 
-    if delete_remote and run_id is not None:
+    if delete_remote and run_id is not None and not get_bool_setting("demo_mode", False):
         with get_db() as conn:
             run_row = conn.execute(
                 "SELECT ragflow_dataset_id FROM runs WHERE id = ?", (run_id,)
@@ -407,18 +407,22 @@ async def create_run(payload: RunCreate):
     dataset_name = payload.ragflow_dataset_name.strip() or run_name
 
     if payload.create_remote_dataset:
-        client = _get_client()
-        try:
-            ds = await client.create_dataset(
-                name=dataset_name,
-                chunk_method=payload.chunk_method,
-                parser_config=payload.parser_config or None,
-                description=payload.description,
-            )
-            dataset_id = ds.get("id", "")
-            dataset_name = ds.get("name", dataset_name)
-        except RAGFlowError as e:
-            raise HTTPException(status_code=400, detail=f"Tạo dataset trên RAGFlow thất bại: {e}")
+        if get_bool_setting("demo_mode", False):
+            import time as _time
+            dataset_id = f"demo_ds_{int(_time.time())}"
+        else:
+            client = _get_client()
+            try:
+                ds = await client.create_dataset(
+                    name=dataset_name,
+                    chunk_method=payload.chunk_method,
+                    parser_config=payload.parser_config or None,
+                    description=payload.description,
+                )
+                dataset_id = ds.get("id", "")
+                dataset_name = ds.get("name", dataset_name)
+            except RAGFlowError as e:
+                raise HTTPException(status_code=400, detail=f"Tạo dataset trên RAGFlow thất bại: {e}")
 
     acct = get_current_account_key()
     with get_db() as conn:
@@ -545,6 +549,119 @@ async def update_run_parser_config(run_id: int, payload: RunParserConfigUpdate):
         "run": out,
         "remote_synced": remote_synced,
         "remote_warning": remote_warning,
+    }
+
+
+@router.post("/runs/sync-datasets")
+async def sync_datasets_from_ragflow():
+    """
+    Reconcile local runs list against live RAGFlow Datasets:
+    - Prunes local runs whose ragflow_dataset_id no longer exists on RAGFlow.
+    - Adds any RAGFlow Dataset not yet tracked locally (with its live parser_config).
+    - Keeps local dataset names synced with RAGFlow.
+    """
+    if get_bool_setting("demo_mode", False):
+        await asyncio.sleep(0.4)
+        with get_db() as conn:
+            cnt = conn.execute("SELECT COUNT(*) FROM runs WHERE account_key = '__demo__'").fetchone()[0]
+        return {"ok": True, "total_remote": cnt, "added": 0, "removed": 0, "updated": 0, "demo": True}
+
+    client = _get_client()
+    remote_datasets = await client.list_datasets(page=1, page_size=100)
+    remote_by_id = {
+        str(ds.get("id")): ds
+        for ds in (remote_datasets or [])
+        if isinstance(ds, dict) and ds.get("id")
+    }
+    acct = get_current_account_key()
+    now = utc_now()
+
+    added = 0
+    removed = 0
+    updated = 0
+
+    with get_db() as conn:
+        local_runs = conn.execute(
+            "SELECT * FROM runs WHERE (account_key = ? OR account_key = '')",
+            (acct,),
+        ).fetchall()
+
+        existing_by_ds: Dict[str, Any] = {}
+        for r in local_runs:
+            ds_id = (r["ragflow_dataset_id"] or "").strip()
+            if not ds_id:
+                continue
+            if ds_id not in remote_by_id:
+                rid = r["id"]
+                conn.execute("DELETE FROM ai_advisor_reports WHERE run_id = ?", (rid,))
+                conn.execute("DELETE FROM auto_tune_reports WHERE run_id = ?", (rid,))
+                conn.execute("DELETE FROM baseline_advisor_reports WHERE run_id = ?", (rid,))
+                conn.execute("DELETE FROM pipeline_jobs WHERE source_run_id = ? OR target_run_id = ?", (rid, rid))
+                conn.execute("DELETE FROM run_documents WHERE run_id = ?", (rid,))
+                conn.execute("DELETE FROM chunks WHERE run_id = ?", (rid,))
+                conn.execute("DELETE FROM parsing_units WHERE run_id = ?", (rid,))
+                conn.execute("DELETE FROM runs WHERE id = ?", (rid,))
+                removed += 1
+            else:
+                existing_by_ds[ds_id] = r
+                remote_name = str(remote_by_id[ds_id].get("name") or r["name"])
+                if remote_name != (r["ragflow_dataset_name"] or ""):
+                    conn.execute(
+                        "UPDATE runs SET ragflow_dataset_name = ? WHERE id = ?",
+                        (remote_name, r["id"]),
+                    )
+                    updated += 1
+
+        # Clean up orphaned documents no longer linked to any run or chunk
+        if removed > 0:
+            conn.execute(
+                """
+                DELETE FROM documents
+                WHERE id NOT IN (SELECT DISTINCT document_id FROM run_documents)
+                  AND id NOT IN (SELECT DISTINCT document_id FROM chunks WHERE document_id IS NOT NULL)
+                """
+            )
+
+        existing_names = {
+            row["name"] for row in conn.execute("SELECT name FROM runs").fetchall()
+        }
+        for ds_id, ds in remote_by_id.items():
+            if ds_id in existing_by_ds:
+                continue
+            base_name = str(ds.get("name") or f"Dataset {ds_id[:8]}").strip()
+            run_name = base_name
+            suffix = 2
+            while run_name in existing_names:
+                run_name = f"{base_name} ({suffix})"
+                suffix += 1
+            existing_names.add(run_name)
+
+            pc = ds.get("parser_config") if isinstance(ds.get("parser_config"), dict) else {}
+            pc_store = dict(pc)
+            if ds.get("parser_id") or ds.get("chunk_method"):
+                pc_store["chunk_method"] = ds.get("parser_id") or ds.get("chunk_method")
+            conn.execute(
+                """
+                INSERT INTO runs (name, description, is_baseline, ragflow_dataset_id, ragflow_dataset_name, parser_config, retrieval_config, status, account_key, created_at)
+                VALUES (?, '', 0, ?, ?, ?, '{}', 'READY', ?, ?)
+                """,
+                (
+                    run_name,
+                    ds_id,
+                    base_name,
+                    json.dumps(pc_store, ensure_ascii=False),
+                    acct,
+                    now,
+                ),
+            )
+            added += 1
+
+    return {
+        "ok": True,
+        "total_remote": len(remote_by_id),
+        "added": added,
+        "removed": removed,
+        "updated": updated,
     }
 
 
@@ -1613,11 +1730,12 @@ async def apply_baseline_advisor(run_id: int, payload: ApplyBaselinePayload):
         dataset_id = run["ragflow_dataset_id"] or ""
         local_pc = json.loads(run["parser_config"] or "{}")
 
+    is_demo = get_bool_setting("demo_mode", False)
     remote_ds = None
     remote_synced = False
     remote_warning = ""
     client = None
-    if dataset_id:
+    if dataset_id and not is_demo:
         try:
             client = _get_client()
             remote_ds = await client.get_dataset(dataset_id)
@@ -1634,7 +1752,17 @@ async def apply_baseline_advisor(run_id: int, payload: ApplyBaselinePayload):
     merged_pc = _merge_baseline_into_parser_config(base_pc, rec_dict)
 
     verified_config = None
-    if dataset_id and client is not None:
+    if is_demo:
+        await asyncio.sleep(0.35)
+        remote_synced = True
+        verified_config = {
+            "chunk_method": target_method,
+            "layout_recognize": rec_dict["layout_recognize"],
+            "chunk_token_num": int(rec_dict["chunk_token_num"]),
+            "overlapped_percent": int(rec_dict["overlapped_percent"]),
+            "table_context_size": int(rec_dict["table_context_size"]),
+        }
+    elif dataset_id and client is not None:
         try:
             await client.update_dataset(
                 dataset_id=dataset_id,

@@ -458,6 +458,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
 
 
 def get_current_account_key() -> str:
+    if get_bool_setting("demo_mode", False):
+        return "__demo__"
     base_url = get_setting("ragflow_base_url", "").strip().rstrip("/").lower()
     api_key = get_setting("ragflow_api_key", "").strip()
     if not base_url and not api_key:

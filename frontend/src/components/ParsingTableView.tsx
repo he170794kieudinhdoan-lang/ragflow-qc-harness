@@ -776,13 +776,28 @@ export const ParsingTableView: React.FC<Props> = ({
                         </td>
                         <td className={`${cellBorder} px-2 py-1.5 font-mono text-[11px] text-[#475569] whitespace-nowrap`}>
                           {u.matched_chunks && u.matched_chunks.length > 0 ? (
-                            <span>
-                              {u.matched_chunks
-                                .slice(0, 2)
-                                .map((c) => `#${c.chunk_index}`)
-                                .join(', ')}{' '}
-                              <span className="text-[#94a3b8]">({simPct}%)</span>
-                            </span>
+                            <div className="flex flex-col gap-0.5">
+                              {u.matched_chunks.slice(0, 2).map((c) => {
+                                const fullId = c.ragflow_chunk_id || '';
+                                const shortId = fullId ? `${fullId.slice(0, 10)}…` : '';
+                                return (
+                                  <span
+                                    key={fullId || c.chunk_index}
+                                    onClick={(e) => {
+                                      if (!fullId) return;
+                                      e.stopPropagation();
+                                      navigator.clipboard?.writeText(fullId).catch(() => {});
+                                    }}
+                                    title={fullId ? `Chunk #${c.chunk_index} · ID: ${fullId} (nhấn để copy ID)` : `Chunk #${c.chunk_index}`}
+                                    className="inline-flex items-center gap-1 cursor-pointer hover:text-[#03aa5c] transition-colors"
+                                  >
+                                    <span className="font-semibold text-[#18181b]">#{c.chunk_index}</span>
+                                    {shortId && <span className="text-[10px] text-[#64748b]">{shortId}</span>}
+                                  </span>
+                                );
+                              })}
+                              <span className="text-[10px] text-[#94a3b8]">Khớp {simPct}%</span>
+                            </div>
                           ) : (
                             <span className="text-[#991b1b] font-semibold">Không khớp</span>
                           )}

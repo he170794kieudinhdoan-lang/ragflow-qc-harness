@@ -14,6 +14,7 @@ import {
   Layers,
   Lock,
   Plus,
+  RefreshCw,
   Search,
   Settings,
   X,
@@ -205,6 +206,7 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showGlossary, setShowGlossary] = useState(false);
   const [showCreateDataset, setShowCreateDataset] = useState(false);
+  const [syncingHeader, setSyncingHeader] = useState(false);
   const [settingDefaults, setSettingDefaults] = useState<Record<string, string>>({});
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
   const sessionMenuRef = useRef<HTMLDivElement | null>(null);
@@ -520,7 +522,31 @@ export default function App() {
                     })
                   )}
                 </div>
-                <div className="border-t border-[#ededeb] bg-[#fafaf9] p-1.5">
+                <div className="border-t border-[#ededeb] bg-[#fafaf9] p-1.5 space-y-1">
+                  <button
+                    type="button"
+                    disabled={syncingHeader}
+                    onClick={async () => {
+                      setSyncingHeader(true);
+                      try {
+                        const res = await api.syncDatasetsFromRagflow();
+                        invalidateApiCache();
+                        await loadRuns();
+                        setRefreshKey((k) => k + 1);
+                        toast.success(
+                          `Đã đồng bộ danh sách Datasets (${res.total_remote ?? 0} trên RAGFlow · thêm ${res.added ?? 0}, xóa ${res.removed ?? 0}).`
+                        );
+                      } catch (err: any) {
+                        toast.error(err?.message || 'Không đồng bộ được danh sách Datasets.');
+                      } finally {
+                        setSyncingHeader(false);
+                      }
+                    }}
+                    className="w-full px-2.5 py-1.5 rounded-[3px] text-xs font-medium text-[#161616] hover:bg-[#ededeb] flex items-center gap-1.5 transition-colors disabled:opacity-50"
+                  >
+                    <RefreshCw className={`size-3.5 text-[#03aa5c] ${syncingHeader ? 'animate-spin' : ''}`} />
+                    {syncingHeader ? 'Đang đồng bộ danh sách...' : 'Đồng bộ danh sách Datasets'}
+                  </button>
                   <button
                     type="button"
                     onClick={() => {

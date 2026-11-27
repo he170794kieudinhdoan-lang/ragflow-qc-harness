@@ -179,12 +179,12 @@ export const ChunkExplorer: React.FC<Props> = ({ runId, flagLabels }) => {
     <div className="flex-1 flex flex-col min-h-0 bg-white">
       {/* Filter & Search Bar */}
       <div className="px-5 py-2.5 border-b border-[#e8e8e6] bg-[#fafaf9] flex flex-wrap items-center gap-2 shrink-0">
-        <div className="relative flex-1 min-w-[220px] max-w-[360px]">
-          <Search className="size-3.5 text-[#71717a] absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+        <div className="relative flex-1 min-w-[220px] max-w-[360px] flex items-center rounded-md border border-[#dcdcd8] bg-white px-2.5 focus-within:border-[#03aa5c] transition-colors">
+          <Search className="size-3.5 text-[#71717a] shrink-0 mr-2 pointer-events-none" />
           <input
             type="text"
-            className="ts-input w-full pl-8 pr-7 py-1.5 text-xs rounded-md bg-white"
-            placeholder="Tìm từ khóa trong nội dung chunk, keyword, tên file..."
+            className="w-full py-1.5 text-xs bg-transparent text-[#18181b] placeholder:text-[#a1a1aa] focus:outline-none"
+            placeholder="Tìm theo Chunk ID, #số chunk, nội dung, keyword, tên file..."
             value={queryInput}
             onChange={(e) => setQueryInput(e.target.value)}
           />
@@ -192,7 +192,7 @@ export const ChunkExplorer: React.FC<Props> = ({ runId, flagLabels }) => {
             <button
               type="button"
               onClick={() => setQueryInput('')}
-              className="absolute right-2 top-1/2 -translate-y-1/2 text-[#71717a] hover:text-[#18181b]"
+              className="ml-1.5 text-[#71717a] hover:text-[#18181b] shrink-0"
             >
               <X className="size-3.5" />
             </button>
@@ -234,33 +234,6 @@ export const ChunkExplorer: React.FC<Props> = ({ runId, flagLabels }) => {
               </option>
             ))}
         </select>
-
-        <div className="inline-flex items-center gap-1 text-xs text-[#71717a]">
-          <SlidersHorizontal className="size-3" />
-          <input
-            type="number"
-            min={0}
-            placeholder="Min tok"
-            className="ts-input py-1 px-2 text-xs rounded-md bg-white w-[74px]"
-            value={minTokens}
-            onChange={(e) => {
-              setMinTokens(e.target.value);
-              setPage(0);
-            }}
-          />
-          <span>–</span>
-          <input
-            type="number"
-            min={0}
-            placeholder="Max tok"
-            className="ts-input py-1 px-2 text-xs rounded-md bg-white w-[74px]"
-            value={maxTokens}
-            onChange={(e) => {
-              setMaxTokens(e.target.value);
-              setPage(0);
-            }}
-          />
-        </div>
 
         <select
           className="ts-input py-1.5 px-2.5 text-xs rounded-md bg-white"
@@ -360,6 +333,14 @@ export const ChunkExplorer: React.FC<Props> = ({ runId, flagLabels }) => {
                       <span className="font-mono text-xs font-semibold text-[#18181b]">{c.doc_code}</span>
                       <span className="font-mono text-[11px] text-[#71717a]">#{c.chunk_index}</span>
                       <span className="text-[11px] text-[#a1a1aa]">p.{c.page_num}</span>
+                      {c.ragflow_chunk_id && (
+                        <span
+                          className="font-mono text-[10px] text-[#8a8a8e] truncate max-w-[84px]"
+                          title={`Chunk ID: ${c.ragflow_chunk_id}`}
+                        >
+                          {c.ragflow_chunk_id.slice(0, 8)}…
+                        </span>
+                      )}
                       {c.is_sampled && (
                         <span className="text-[10px] px-1.5 py-0.5 rounded bg-[#eff6ff] text-[#1d4ed8] border border-[#bfdbfe]">
                           Mẫu QC

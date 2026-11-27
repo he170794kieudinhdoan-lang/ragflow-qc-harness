@@ -683,7 +683,9 @@ async def _execute_clone_pipeline(job_id: int, cancel_event: asyncio.Event) -> N
             fail_cnt = 0
             total_prog = 0.0
             for rd in rdocs:
-                st, prog, _cc, _tc, _dur = _extract_remote_doc_meta(rd)
+                meta = _extract_remote_doc_meta(rd)
+                st = meta["status"]
+                prog = float(meta["progress"] or 0.0)
                 if st == "DONE":
                     done_cnt += 1
                     total_prog += 1.0

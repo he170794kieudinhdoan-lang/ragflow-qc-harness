@@ -1029,18 +1029,6 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
                 {bulkApproving ? 'Đang duyệt...' : `Duyệt nhanh ô đỏ (${unratedRedUnits.length})`}
               </button>
             )}
-            {pendingOcrCount > 0 && (
-              <button
-                type="button"
-                onClick={handleBatchVisionOcr}
-                disabled={batchOcrRunning}
-                className="ml-1 inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium bg-[#f2fbf6] text-[#027a42] border border-[#03aa5c]/35 hover:bg-[#03aa5c] hover:text-white transition-colors disabled:opacity-45"
-                title="Dùng Vision LLM đọc toàn bộ trang scan / ảnh chưa có bản chuẩn"
-              >
-                {batchOcrRunning ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5" />}
-                {batchOcrRunning ? 'Đang Vision OCR...' : `Vision OCR ảnh/scan (${pendingOcrCount})`}
-              </button>
-            )}
           </div>
         </div>
 
@@ -1377,8 +1365,8 @@ export const ParsingPage: React.FC<Props> = ({ activeRun, errorCatalog, isActive
                             title={`${item.code} — ${item.name}`}
                             className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-[#faf9f6] border border-[#e6e4de] text-[11px] cursor-help"
                           >
-                            <span className="font-mono font-semibold text-[#18181b]">{item.code}</span>
-                            <span className="font-mono text-[#b91c1c] font-medium">{item.count}</span>
+                            <span className="font-medium text-[#18181b]">{item.name}</span>
+                            <span className="font-mono text-[#b91c1c] font-semibold tabular-nums">{item.count}</span>
                           </span>
                         ))}
                       </div>
